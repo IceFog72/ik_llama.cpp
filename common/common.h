@@ -436,8 +436,6 @@ struct gpt_params {
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
-    int   moe_passes       = 1;    // B pinned-route MoE: refinement passes per layer (1 = stock)
-    float moe_alpha        = 1.0f; // residual scale per MoE pass (B2 uses 2 passes x 0.5)
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
     bool ignore_eos        = false; // ignore generated EOS tokens

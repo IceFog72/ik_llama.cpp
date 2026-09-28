@@ -2007,24 +2007,6 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
-    if (arg == "-mps" || arg == "--moe-passes") {
-        CHECK_ARG
-        params.moe_passes = std::stoi(argv[i]);
-        if (params.moe_passes < 1) {
-            fprintf(stderr, "error: Invalid value for --moe-passes: %d (must be >= 1)\n", params.moe_passes);
-            invalid_param = true;
-        }
-        return true;
-    }
-    if (arg == "-mal" || arg == "--moe-alpha") {
-        CHECK_ARG
-        params.moe_alpha = std::stof(argv[i]);
-        if (!(params.moe_alpha > 0.0f) || params.moe_alpha > 1.0f) {
-            fprintf(stderr, "error: Invalid value for --moe-alpha: %f (must be in (0, 1])\n", (double) params.moe_alpha);
-            invalid_param = true;
-        }
-        return true;
-    }
     if (arg == "-co" || arg == "--color") {
         params.use_color = true;
         return true;
@@ -3132,8 +3114,6 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-gr, --graph-reuse",            "enable graph reuse (default: %s)", params.graph_reuse ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-gr, --no-graph-reuse",      "disable graph reuse (default: %s)", !params.graph_reuse ? "enabled" : "disabled" });
     options.push_back({ "*",         "-ser,  --smart-expert-reduction", "experts reduction (default: %d,%g)", params.min_experts, params.thresh_experts});
-    options.push_back({ "*",         "-mps,  --moe-passes N", "pinned-route MoE refinement passes per layer (default: %d, 1 = stock)", params.moe_passes});
-    options.push_back({ "*",         "-mal,  --moe-alpha F", "residual scale per MoE pass (default: %g; B2 uses 2 passes x 0.5)", (double) params.moe_alpha});
     options.push_back({ "*",         "-mqkv,  --merge-qkv",            "merge Q,K,V (default: %d)", params.merge_qkv});
     options.push_back({ "*",         "-muge,  --merge-up-gate-experts","merge ffn_up/gate_exps (default: %d)", params.merge_up_gate_exps});
     options.push_back({ "*",         "-khad,  --k-cache-hadamard",     "Use Hadamard transform for K-cache (default: %d)", params.k_cache_hadamard});
@@ -4430,8 +4410,6 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.scheduler_async   = params.scheduler_async;
     cparams.min_experts       = params.min_experts;
     cparams.thresh_experts    = params.thresh_experts;
-    cparams.moe_passes        = params.moe_passes;
-    cparams.moe_alpha         = params.moe_alpha;
     cparams.only_active_experts = params.only_active_exps;
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
@@ -5479,8 +5457,6 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "reduce_type: %s # default f16\n", params.reduce_type.c_str());
     fprintf(stream, "scheduler_async: %s # default: false\n", params.scheduler_async ? "true" : "false");
     fprintf(stream, "ser: %d,%g # default: -1,0\n", params.min_experts, params.thresh_experts);
-    fprintf(stream, "moe_passes: %d # default: 1\n", params.moe_passes);
-    fprintf(stream, "moe_alpha: %g # default: 1.0\n", (double) params.moe_alpha);
     fprintf(stream, "temp: %f # default: 0.8\n", sparams.temp);
 
     const std::vector<float> tensor_split_vector(params.tensor_split, params.tensor_split + llama_max_devices());

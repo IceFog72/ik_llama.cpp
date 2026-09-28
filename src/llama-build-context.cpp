@@ -1456,92 +1456,6 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     return cur;
 }
 
-// B pinned-route MoE: single routed+shared expert pass over already-normed input.
-// File-static helper (lambdas inside member fns cannot easily call the
-// llm_build_* static members unqualified). Caller owns residual + renorm.
-static ggml_tensor * build_b_moe_delta_impl(ggml_context * ctx, llama_context & lctx,
-     ggml_tensor * normed,
-     ggml_tensor * gate_inp, ggml_tensor * gate_inp_b,
-     ggml_tensor * up_exps, ggml_tensor * up_exps_b,
-     ggml_tensor * gate_exps, ggml_tensor * gate_exps_b,
-     ggml_tensor * down_exps, ggml_tensor * down_exps_b,
-     ggml_tensor * up_shexp, ggml_tensor * up_b_shexp,
-     ggml_tensor * gate_shexp, ggml_tensor * gate_b_shexp,
-     ggml_tensor * down_shexp, ggml_tensor * down_b_shexp,
-     int64_t n_expert, int64_t n_expert_used,
-     llm_ffn_op_type type_op, bool norm_w, bool scale_w, float w_scale,
-     llm_expert_gating_func_type gating_op, llm_ffn_op_type type_op_shexp,
-     ggml_tensor * up_gate_exps, ggml_tensor * up_gate_exps_b, ggml_tensor * shexp_gate,
-     ggml_tensor * pinned_logits, ggml_tensor * pinned_selected,
-     ggml_tensor ** out_logits, ggml_tensor ** out_selected,
-     const llm_build_cb & cb, int il, ggml_cgraph * graph) {
-    // Single-device B path; -sm graph split callers hit the assert below.
-    auto has_split = [](ggml_tensor * t) {
-        return t && t->extra && ((ggml_split_tensor_t *) t->extra)->n_device > 1;
-    };
-    GGML_ASSERT(!has_split(gate_inp) && !has_split(up_exps) && !has_split(gate_exps) &&
-                !has_split(down_exps) && !has_split(up_shexp) &&
-                "B pinned-route passes need the -sm graph split path (not wired yet)");
-    ggml_tensor * cur = normed;
-    if (cur->type != GGML_TYPE_F32) {
-        cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
-    }
-    ggml_tensor * routed_out = nullptr;
-    if (pinned_logits == nullptr) {
-        routed_out = llm_build_context::llm_build_moe_ffn(ctx, lctx, cur,
-                gate_inp, gate_inp_b, up_exps, up_exps_b, gate_exps, gate_exps_b,
-                down_exps, down_exps_b, nullptr, n_expert, n_expert_used,
-                type_op, norm_w, scale_w, w_scale, gating_op,
-                cb, il, graph, false, up_gate_exps, up_gate_exps_b);
-        if (out_logits || out_selected) {
-            // Publish router state for pinning: re-run only the router
-            // matmul + topk on the same normed input (cheap, no experts).
-            ggml_tensor * rl = llm_build_context::llm_build_lora_mm(lctx, ctx, gate_inp, cur);
-            ggml_tensor * probs = rl;
-            if (gating_op == LLM_EXPERT_GATING_FUNC_SOFTMAX) {
-                probs = ggml_soft_max(ctx, rl);
-            } else if (gating_op == LLM_EXPERT_GATING_FUNC_SIGMOID) {
-                probs = ggml_sigmoid(ctx, rl);
-            }
-            ggml_tensor * sel = ggml_top_k(ctx, probs, n_expert_used);
-            if (out_logits)   *out_logits   = rl;
-            if (out_selected) *out_selected = sel;
-            cb(rl,  "b_moe_pinned_logits", il);
-            cb(sel, "b_moe_pinned_topk", il);
-        }
-    } else {
-        // Frozen route: gate_inp=nullptr selects the input_logits path,
-        // pinned_selected skips the topk.
-        routed_out = llm_build_context::llm_build_moe_ffn(ctx, lctx, cur,
-                nullptr, nullptr, up_exps, up_exps_b, gate_exps, gate_exps_b,
-                down_exps, down_exps_b, nullptr, n_expert, n_expert_used,
-                type_op, norm_w, scale_w, w_scale, gating_op,
-                cb, il, graph, false, up_gate_exps, up_gate_exps_b,
-                pinned_logits, nullptr, pinned_selected);
-    }
-    cb(routed_out, "b_moe_routed_out", il);
-    ggml_build_forward_expand(graph, routed_out);
-    if (up_shexp && gate_shexp && down_shexp) {
-        auto shared_out = llm_build_context::llm_build_ffn(ctx, lctx, nullptr, cur,
-                up_shexp, up_b_shexp, nullptr, gate_shexp, gate_b_shexp, nullptr,
-                down_shexp, down_b_shexp, nullptr,
-                nullptr, type_op_shexp, LLM_FFN_PAR, cb, il, graph);
-        cb(shared_out, "b_moe_shexp_out", il);
-        if (shexp_gate) {
-            auto shared_gate = llm_build_context::llm_build_lora_mm(lctx, ctx, shexp_gate, cur);
-            cb(shared_gate, "b_moe_shared_expert_gate", il);
-            shared_gate = ggml_sigmoid(ctx, shared_gate);
-            shared_out = ggml_mul(ctx, shared_out, shared_gate);
-            cb(shared_out, "b_moe_shexp_gated", il);
-        }
-        auto out = ggml_add(ctx, routed_out, shared_out);
-        cb(out, "b_moe_delta", il);
-        ggml_build_forward_expand(graph, out);
-        return out;
-    }
-    return routed_out;
-}
-
 ggml_tensor * llm_build_context::llm_build_moe_ffn(
         ggml_context * ctx,
        llama_context & lctx,
@@ -1845,51 +1759,6 @@ llm_expert_gating_func_type   gating_op,
     auto split_down_b_shexp = down_b_shexp ? (ggml_split_tensor_t *)down_b_shexp : nullptr;
     auto split_up_gate_exps = up_gate_exps ? (ggml_split_tensor_t *)up_gate_exps->extra : nullptr;
     if (!split_up_exps && !split_gate_exps && !split_up_gate_exps && !split_down_exps) {
-        // B pinned-route MoE (qwen35moe path): route once, refine N times.
-        // moe_passes==1 keeps exact stock behavior (single full-strength pass).
-        const int b_passes = lctx.cparams.moe_passes;
-        const float b_alpha = lctx.cparams.moe_alpha;
-        if (b_passes > 1 && gate_inp && !gate_inp_b && !exp_probs_b && type_op_shexp == LLM_FFN_SILU &&
-            (gating_op == LLM_EXPERT_GATING_FUNC_SOFTMAX || gating_op == LLM_EXPERT_GATING_FUNC_SIGMOID)) {
-            GGML_ASSERT(b_passes >= 2 && b_alpha > 0.0f && b_alpha <= 1.0f);
-            auto the_ffn_norm = ffn_norm->extra ? ((ggml_split_tensor_t *)ffn_norm->extra)->splits[lctx.model.main_gpu] : ffn_norm;
-            GGML_ASSERT(the_ffn_norm);
-            ggml_tensor * h = input;
-            ggml_tensor * pin_logits = nullptr;
-            ggml_tensor * pin_sel = nullptr;
-            for (int b = 0; b < b_passes; ++b) {
-                ggml_tensor * z = llm_build_norm(ctx, h, lctx.model.hparams, the_ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
-                cb(z, b == 0 ? "b_moe_z0" : "b_moe_zN", il);
-                ggml_tensor * delta = build_b_moe_delta_impl(ctx, lctx, z,
-                        gate_inp, gate_inp_b, up_exps, up_exps_b, gate_exps, gate_exps_b,
-                        down_exps, down_exps_b, up_shexp, up_b_shexp, gate_shexp, gate_b_shexp,
-                        down_shexp, down_b_shexp, n_expert, n_expert_used,
-                        type_op, norm_w, scale_w, w_scale, gating_op, type_op_shexp,
-                        up_gate_exps, up_gate_exps_b, shexp_gate,
-                        pin_logits, pin_sel,
-                        (b == 0) ? &pin_logits : nullptr, (b == 0) ? &pin_sel : nullptr,
-                        cb, il, graph);
-                if (std::abs(b_alpha - 1.0f) > 1e-6f) {
-                    delta = ggml_scale(ctx, delta, b_alpha);
-                    cb(delta, "b_moe_delta_scaled", il);
-                }
-                h = ggml_add(ctx, h, delta);
-                cb(h, "b_moe_h", il);
-            }
-            ggml_tensor * b_out = h;
-            // NOTE: h already starts from `input`, so the residual is included.
-            // Do NOT add `input` again here (that double-counts it and blows
-            // up the residual stream ~2x per layer). Stock adds it because its
-            // routed_out carries no residual yet; ours does.
-            GGML_ASSERT(add_input && "B path assumes stock add_input=true callers");
-            ggml_build_forward_expand(graph, b_out);
-            if (add_extra) {
-                b_out = ggml_add(ctx, b_out, add_extra);
-                cb(b_out, "ffn_with_extra", il);
-            }
-            ggml_build_forward_expand(graph, b_out);
-            return b_out;
-        }
         auto cur = input;
         if (ffn_norm) {
             auto the_ffn_norm = ffn_norm->extra ? ((ggml_split_tensor_t *)ffn_norm->extra)->splits[lctx.model.main_gpu] : ffn_norm;
@@ -2025,7 +1894,6 @@ llm_expert_gating_func_type   gating_op,
         }
         return cur;
     }
-
     GGML_ASSERT(((split_up_exps && split_gate_exps) || split_up_gate_exps) && split_down_exps);
     int n_device = split_down_exps->n_device;
     if (split_up_gate_exps) {
