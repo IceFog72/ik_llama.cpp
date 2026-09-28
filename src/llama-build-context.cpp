@@ -1877,10 +1877,11 @@ llm_expert_gating_func_type   gating_op,
                 cb(h, "b_moe_h", il);
             }
             ggml_tensor * b_out = h;
-            if (add_input) {
-                b_out = ggml_add(ctx, b_out, input);
-                cb(b_out, "b_moe_with_inp", il);
-            }
+            // NOTE: h already starts from `input`, so the residual is included.
+            // Do NOT add `input` again here (that double-counts it and blows
+            // up the residual stream ~2x per layer). Stock adds it because its
+            // routed_out carries no residual yet; ours does.
+            GGML_ASSERT(add_input && "B path assumes stock add_input=true callers");
             ggml_build_forward_expand(graph, b_out);
             if (add_extra) {
                 b_out = ggml_add(ctx, b_out, add_extra);
