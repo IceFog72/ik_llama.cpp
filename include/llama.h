@@ -504,6 +504,8 @@ extern "C" {
         int  dsa_top_k;         // DSA top-k override (<0 => model's configured indexer_top_k) [EXPERIMENTAL]
         int  min_experts;
         float thresh_experts;
+        int   moe_passes;  // pinned-route MoE refinement passes per layer (1 = stock)
+        float moe_alpha;   // residual scale per MoE pass
         bool only_active_experts;
         bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
         int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)

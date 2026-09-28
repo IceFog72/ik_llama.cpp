@@ -53,6 +53,8 @@ struct llama_cparams {
     bool scheduler_async;
     int  min_experts;
     float thresh_experts;
+    int   moe_passes;  // pinned-route MoE refinement passes per layer (1 = stock)
+    float moe_alpha;   // residual scale per MoE pass
     bool mtp;
     int  worst_graph_tokens;
     int  dflash_query_capacity = 0; // internal DFlash query capacity override
