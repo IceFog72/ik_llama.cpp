@@ -5513,6 +5513,13 @@ GGML_CALL bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
 }
 
+GGML_CALL int ggml_backend_cuda_get_device(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    return static_cast<const ggml_backend_cuda_context *>(backend->context)->device;
+}
+
 GGML_CALL int ggml_backend_cuda_get_device_count() {
     return ggml_cuda_info().device_count;
 }

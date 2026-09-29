@@ -532,6 +532,7 @@ bool llama_prepare_dflash_graph_inputs(
 
         lctx.dflash.kv.cache_sched = ggml_backend_sched_new(lctx.backends.data(), backend_buft.data(), lctx.backends.size(), max_nodes, false);
         if (lctx.dflash.kv.cache_sched != nullptr) {
+            ggml_backend_sched_set_moe_resident_layers(lctx.dflash.kv.cache_sched, lctx.model.hparams.n_layer);
             ggml_backend_sched_set_moe_resident(lctx.dflash.kv.cache_sched, lctx.cparams.moe_resident);
         }
         const bool reserved = lctx.dflash.kv.cache_sched != nullptr && ggml_backend_sched_reserve(lctx.dflash.kv.cache_sched, gf_reserve);

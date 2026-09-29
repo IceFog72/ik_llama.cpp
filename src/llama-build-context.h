@@ -93,7 +93,6 @@ struct llm_build_context {
     const bool split_mode_graph_scheduling;
     const int  min_experts;
     const float thresh_experts;
-    const int  moe_resident; // FT slice B (0 = disabled)
 
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
@@ -472,14 +471,6 @@ struct llm_build_context {
 
     static ggml_tensor * llm_build_lora_mm_id(llama_context & lctx, ggml_context * ctx0,
           ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids);
-
-    // FT slice B: rewrite one expert-bank src of a MUL_MAT_ID-family node to its
-    // resident-device copy. Returns substitute tensor (or src unchanged when the
-    // cache is off / src is not a host expert bank / bank unsupported). Pure graph
-    // edit: no copies, no sync. Must be called for every expert-bank src with the
-    // layer index and the node's ids tensor.
-    static ggml_tensor * ft_resident_bank(ggml_context * ctx, llama_context & lctx,
-          ggml_tensor * src, ggml_tensor * ids, int il, const char * tag);
 
     static ggml_tensor * llm_build_inp_embd(ggml_context * ctx, llama_context & lctx,
         const llama_hparams & hparams,

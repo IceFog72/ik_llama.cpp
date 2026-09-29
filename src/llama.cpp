@@ -424,16 +424,6 @@ llama_model::~llama_model() {
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
-    // FT slice B: resident expert cache owns its buffer + slot view ctx
-    moe_slot_tensors.clear(); // views into moe_resident_buf, no per-tensor free
-    if (moe_slot_ctx) {
-        ggml_free(moe_slot_ctx);
-        moe_slot_ctx = nullptr;
-    }
-    if (moe_resident_buf) {
-        ggml_backend_buffer_free(moe_resident_buf);
-        moe_resident_buf = nullptr;
-    }
     for (ggml_backend_buffer_t buf : bufs) {
 #ifdef GGML_USE_CUDA
         if (ggml_backend_buffer_get_type(buf) == ggml_backend_cpu_buffer_type()) {
@@ -9319,8 +9309,9 @@ struct llama_context * llama_init_from_model(
     LLAMA_LOG_INFO("%s: reduce_type   = %s\n",     __func__, ggml_type_name(cparams.reduce_type));
     LLAMA_LOG_INFO("%s: sched_async   = %d\n",     __func__, cparams.scheduler_async);
     LLAMA_LOG_INFO("%s: ser           = %d, %g\n", __func__, cparams.min_experts, cparams.thresh_experts);
-    if (cparams.moe_resident > 0) {
-        LLAMA_LOG_INFO("%s: moe_resident = %d slots\n", __func__, cparams.moe_resident);
+    if (cparams.moe_resident != 0) {
+        LLAMA_LOG_INFO("%s: moe_resident = %s\n", __func__,
+                cparams.moe_resident < 0 ? "auto" : format("%d slots per bank pool", cparams.moe_resident).c_str());
     }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n",   __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",     __func__, cparams.rope_freq_scale);
@@ -9665,6 +9656,7 @@ struct llama_context * llama_init_from_model(
             pipeline_parallel = false;
 #endif
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
+            ggml_backend_sched_set_moe_resident_layers(ctx->sched, model->hparams.n_layer);
             ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
 
             if (pipeline_parallel) {
@@ -9694,6 +9686,7 @@ struct llama_context * llama_init_from_model(
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    ggml_backend_sched_set_moe_resident_layers(ctx->sched, model->hparams.n_layer);
                     ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }
