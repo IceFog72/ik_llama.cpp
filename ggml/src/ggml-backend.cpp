@@ -3,13 +3,18 @@
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
 #include "ggml-moe-prefetch.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <cassert>
 #include <climits>
+#include <cstdint>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 #include <set>
@@ -1142,6 +1147,38 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+struct ggml_backend_sched_moe_resident_entry {
+    const ggml_tensor * bank;
+    const void * data;
+    int32_t expert;
+    size_t expert_bytes;
+    size_t copy_bytes;
+};
+
+struct ggml_backend_sched_moe_resident_pool {
+    ggml_backend_buffer_type_t buft;
+    ggml_backend_buffer_t buffer;
+    void * base;
+    size_t key_slot_bytes;
+    size_t slot_bytes;
+    int slots;
+    uint64_t clock;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t host_bytes;
+    uint64_t device_bytes;
+    ggml_backend_sched_moe_resident_entry * entries;
+    uint64_t * last_used;
+    bool disabled;
+};
+
+struct ggml_backend_sched_moe_resident_pools {
+    ggml_backend_sched_moe_resident_pool * pools;
+    int n_pools;
+    int capacity;
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1199,6 +1236,8 @@ struct ggml_backend_sched {
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
 
     bool only_active_experts;
+    int moe_resident_slots;
+    ggml_backend_sched_moe_resident_pools moe_resident[GGML_SCHED_MAX_BACKENDS];
     bool split_mode_graph;
     bool is_async = false;
     bool debug;
@@ -1225,6 +1264,11 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+void ggml_backend_sched_set_moe_resident(ggml_backend_sched_t sched, int slots) {
+    if (!sched) return;
+    sched->moe_resident_slots = std::max(0, slots);
 }
 
 void ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async) {
@@ -2013,6 +2057,303 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static void ggml_backend_sched_moe_resident_clear_storage(ggml_backend_sched_moe_resident_pool * pool) {
+    if (pool->buffer != nullptr) {
+        ggml_backend_buffer_free(pool->buffer);
+    }
+    free(pool->entries);
+    free(pool->last_used);
+    pool->buffer = nullptr;
+    pool->base = nullptr;
+    pool->slot_bytes = 0;
+    pool->slots = 0;
+    pool->clock = 0;
+    pool->entries = nullptr;
+    pool->last_used = nullptr;
+}
+
+static ggml_backend_sched_moe_resident_pool * ggml_backend_sched_moe_resident_get_pool(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        ggml_backend_buffer_type_t buft,
+        size_t key_slot_bytes) {
+    auto & pools = sched->moe_resident[backend_id];
+    for (int i = 0; i < pools.n_pools; ++i) {
+        if (pools.pools[i].buft == buft && pools.pools[i].key_slot_bytes == key_slot_bytes) {
+            return &pools.pools[i];
+        }
+    }
+
+    if (pools.n_pools == pools.capacity) {
+        if (pools.capacity > INT_MAX / 2) {
+            return nullptr;
+        }
+        const int new_capacity = pools.capacity == 0 ? 4 : pools.capacity * 2;
+        if (new_capacity <= pools.capacity ||
+                static_cast<size_t>(new_capacity) > SIZE_MAX / sizeof(pools.pools[0])) {
+            return nullptr;
+        }
+        auto * new_pools = static_cast<ggml_backend_sched_moe_resident_pool *>(
+                realloc(pools.pools, static_cast<size_t>(new_capacity) * sizeof(pools.pools[0])));
+        if (new_pools == nullptr) {
+            return nullptr;
+        }
+        std::memset(new_pools + pools.capacity, 0,
+                static_cast<size_t>(new_capacity - pools.capacity) * sizeof(new_pools[0]));
+        pools.pools = new_pools;
+        pools.capacity = new_capacity;
+    }
+
+    auto * pool = &pools.pools[pools.n_pools++];
+    pool->buft = buft;
+    pool->key_slot_bytes = key_slot_bytes;
+    return pool;
+}
+
+static bool ggml_backend_sched_moe_resident_prepare(
+        ggml_backend_sched_moe_resident_pool * pool,
+        ggml_backend_t backend,
+        ggml_backend_buffer_type_t buft,
+        int slots,
+        size_t slot_bytes) {
+    if (pool->disabled || slots <= 0 || slot_bytes == 0) {
+        return false;
+    }
+
+    if (pool->buffer != nullptr && pool->slots == slots && pool->slot_bytes >= slot_bytes) {
+        return true;
+    }
+
+    if (slot_bytes > SIZE_MAX / static_cast<size_t>(slots)) {
+        pool->disabled = true;
+        return false;
+    }
+
+    const size_t total_bytes = slot_bytes * static_cast<size_t>(slots);
+    const size_t max_bytes = ggml_backend_buft_get_max_size(buft);
+    if (max_bytes != SIZE_MAX && total_bytes > max_bytes) {
+        pool->disabled = true;
+        return false;
+    }
+
+    // A larger expert geometry invalidates all resident entries.  The scheduler
+    // already synchronizes the destination before overwriting its copy inputs;
+    // synchronize here as well because this buffer is not part of the graph.
+    if (pool->buffer != nullptr) {
+        ggml_backend_synchronize(backend);
+        ggml_backend_sched_moe_resident_clear_storage(pool);
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, total_bytes);
+    if (buffer == nullptr) {
+        pool->disabled = true;
+        return false;
+    }
+
+    auto * entries = static_cast<ggml_backend_sched_moe_resident_entry *>(
+            calloc(static_cast<size_t>(slots), sizeof(ggml_backend_sched_moe_resident_entry)));
+    auto * last_used = static_cast<uint64_t *>(calloc(static_cast<size_t>(slots), sizeof(uint64_t)));
+    if (entries == nullptr || last_used == nullptr) {
+        free(entries);
+        free(last_used);
+        ggml_backend_buffer_free(buffer);
+        pool->disabled = true;
+        return false;
+    }
+
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    void * base = ggml_backend_buffer_get_base(buffer);
+    if (base == nullptr) {
+        free(entries);
+        free(last_used);
+        ggml_backend_buffer_free(buffer);
+        pool->disabled = true;
+        return false;
+    }
+    pool->buffer = buffer;
+    pool->base = base;
+    pool->slot_bytes = slot_bytes;
+    pool->slots = slots;
+    pool->clock = 0;
+    pool->entries = entries;
+    pool->last_used = last_used;
+    return true;
+}
+
+static bool ggml_backend_sched_moe_resident_is_cuda(ggml_backend_t backend) {
+#ifdef GGML_USE_CUDA
+    return ggml_backend_is_cuda(backend);
+#else
+    GGML_UNUSED(backend);
+    return false;
+#endif
+}
+
+static ggml_tensor ggml_backend_sched_moe_resident_byte_tensor(
+        ggml_backend_buffer_t buffer, void * data, size_t bytes) {
+    ggml_tensor tensor = {};
+    tensor.type = GGML_TYPE_I8;
+    tensor.buffer = buffer;
+    tensor.data = data;
+    tensor.ne[0] = bytes;
+    tensor.ne[1] = 1;
+    tensor.ne[2] = 1;
+    tensor.ne[3] = 1;
+    tensor.nb[0] = 1;
+    tensor.nb[1] = bytes;
+    tensor.nb[2] = bytes;
+    tensor.nb[3] = bytes;
+    return tensor;
+}
+
+static uint64_t ggml_backend_sched_moe_resident_next_clock(ggml_backend_sched_moe_resident_pool * pool) {
+    if (pool->clock == std::numeric_limits<uint64_t>::max()) {
+        std::memset(pool->last_used, 0, static_cast<size_t>(pool->slots) * sizeof(pool->last_used[0]));
+        pool->clock = 1;
+        return pool->clock;
+    }
+    return ++pool->clock;
+}
+
+static bool ggml_backend_sched_moe_resident_entry_matches(
+        const ggml_backend_sched_moe_resident_entry & entry,
+        const ggml_tensor * bank,
+        const void * data,
+        int32_t expert,
+        size_t expert_bytes,
+        size_t copy_bytes) {
+    return entry.bank == bank && entry.data == data && entry.expert == expert &&
+           entry.expert_bytes == expert_bytes && entry.copy_bytes == copy_bytes;
+}
+
+static bool ggml_backend_sched_moe_resident_copy(
+        ggml_backend_sched_t sched,
+        ggml_backend_t split_backend,
+        ggml_tensor * input,
+        ggml_tensor * input_cpy,
+        ggml_backend_buffer_t input_cpy_buffer,
+        const std::vector<uint32_t> & unique_ids,
+        int n_expert,
+        size_t expert_size) {
+    if (sched->moe_resident_slots <= 0 || input->data == nullptr || input_cpy->data == nullptr ||
+            input_cpy_buffer == nullptr || ggml_backend_buffer_is_host(input_cpy_buffer) ||
+            !ggml_backend_sched_moe_resident_is_cuda(split_backend) || expert_size == 0) {
+        return false;
+    }
+
+    const size_t padding = std::min<size_t>(expert_size, 512);
+    if (expert_size > SIZE_MAX - padding) {
+        return false;
+    }
+    const size_t slot_bytes = expert_size + padding;
+    const int backend_id = ggml_backend_sched_backend_id(sched, split_backend);
+    if (backend_id < 0 || backend_id >= GGML_SCHED_MAX_BACKENDS) {
+        return false;
+    }
+    const auto buft = ggml_backend_buffer_get_type(input_cpy_buffer);
+    auto * pool_ptr = ggml_backend_sched_moe_resident_get_pool(sched, backend_id, buft, slot_bytes);
+    if (pool_ptr == nullptr) {
+        return false;
+    }
+    auto & pool = *pool_ptr;
+    if (!ggml_backend_sched_moe_resident_prepare(&pool, split_backend, buft,
+            sched->moe_resident_slots, slot_bytes)) {
+        return false;
+    }
+
+    // Validate every active range before queueing a partial cache fill.  This
+    // mirrors the bounds used by the existing contiguous expert-copy path.
+    for (int32_t id = 0; id < n_expert; ++id) {
+        if ((unique_ids[id >> 5] & (1u << (id & 31))) == 0) {
+            continue;
+        }
+        const size_t copy_bytes = id < n_expert - 1 ? slot_bytes : expert_size;
+        if (static_cast<size_t>(id) > (SIZE_MAX - copy_bytes) / expert_size) {
+            return false;
+        }
+        const size_t offset = static_cast<size_t>(id) * expert_size;
+        if (offset + copy_bytes > ggml_nbytes(input_cpy)) {
+            return false;
+        }
+    }
+
+    for (int32_t id = 0; id < n_expert; ++id) {
+        if ((unique_ids[id >> 5] & (1u << (id & 31))) == 0) {
+            continue;
+        }
+
+        const size_t copy_bytes = id < n_expert - 1 ? slot_bytes : expert_size;
+        const size_t offset = static_cast<size_t>(id) * expert_size;
+        const auto entry = ggml_backend_sched_moe_resident_entry {
+            input, input->data, id, expert_size, copy_bytes
+        };
+
+        int slot = -1;
+        for (int i = 0; i < pool.slots; ++i) {
+            if (ggml_backend_sched_moe_resident_entry_matches(pool.entries[i],
+                    entry.bank, entry.data, entry.expert, entry.expert_bytes, entry.copy_bytes)) {
+                slot = i;
+                break;
+            }
+        }
+
+        const bool hit = slot >= 0;
+        auto * slot_data = static_cast<uint8_t *>(pool.base) +
+                static_cast<size_t>(slot < 0 ? 0 : slot) * pool.slot_bytes;
+        if (hit) {
+            ++pool.hits;
+            ggml_tensor slot_copy = ggml_backend_sched_moe_resident_byte_tensor(
+                    pool.buffer, slot_data, copy_bytes);
+            ggml_tensor destination_copy = ggml_backend_sched_moe_resident_byte_tensor(
+                    input_cpy_buffer, static_cast<uint8_t *>(input_cpy->data) + offset, copy_bytes);
+            ggml_backend_tensor_copy_async(split_backend, split_backend, &slot_copy, &destination_copy);
+            pool.device_bytes += copy_bytes;
+        } else {
+            ++pool.misses;
+            uint64_t oldest = std::numeric_limits<uint64_t>::max();
+            for (int i = 0; i < pool.slots; ++i) {
+                if (pool.entries[i].bank == nullptr) {
+                    slot = i;
+                    break;
+                }
+                if (pool.last_used[i] < oldest) {
+                    oldest = pool.last_used[i];
+                    slot = i;
+                }
+            }
+            GGML_ASSERT(slot >= 0);
+            if (pool.entries[slot].bank != nullptr) {
+                // With pipeline copies, another copy stream may still be
+                // reading this slot.  Synchronize before reusing it; the
+                // normal single-copy build stays fully asynchronous.
+                if (sched->n_copies > 1) {
+                    ggml_backend_synchronize(split_backend);
+                }
+                ++pool.evictions;
+            }
+
+            slot_data = static_cast<uint8_t *>(pool.base) +
+                    static_cast<size_t>(slot) * pool.slot_bytes;
+            // Keep misses on the existing host-to-device input path.  The
+            // queued device copy only fills the resident slot after that input
+            // copy, so mixed hit/miss batches retain the original destination.
+            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                    static_cast<const uint8_t *>(input->data) + offset, offset, copy_bytes);
+            ggml_tensor destination_copy = ggml_backend_sched_moe_resident_byte_tensor(
+                    input_cpy_buffer, static_cast<uint8_t *>(input_cpy->data) + offset, copy_bytes);
+            ggml_tensor slot_copy = ggml_backend_sched_moe_resident_byte_tensor(
+                    pool.buffer, slot_data, copy_bytes);
+            ggml_backend_tensor_copy_async(split_backend, split_backend, &destination_copy, &slot_copy);
+            pool.host_bytes += copy_bytes;
+            pool.device_bytes += copy_bytes;
+            pool.entries[slot] = entry;
+        }
+        pool.last_used[slot] = ggml_backend_sched_moe_resident_next_clock(&pool);
+    }
+
+    return true;
+}
+
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
         std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
     if (split->n_inputs < 1) return;
@@ -2106,35 +2447,42 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 const size_t expert_size = input->ne[2] > 1 ? input->nb[2] : input->nb[1];
 
                 if (input->ne[2] > 1) {
+                    const ggml_backend_buffer_t input_cpy_buffer = input_cpy->view_src != nullptr ?
+                            input_cpy->view_src->buffer : input_cpy->buffer;
+                    const bool resident_copy = ggml_backend_sched_moe_resident_copy(
+                            sched, split_backend, input, input_cpy, input_cpy_buffer,
+                            unique_ids, n_expert, expert_size);
 
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                        const size_t padding = 512;
-                        const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
+                    if (!resident_copy) {
+                        auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                            const size_t expert_offset = first_id * expert_size;
+                            const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                            const size_t padding = 512;
+                            const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
 
-                        ggml_backend_tensor_set_async(split_backend,
-                                input_cpy,
-                                (const uint8_t *)input->data + expert_offset, expert_offset,
-                                // copy a bit extra to ensure there are no NaNs in the padding
-                                expert_size_copy + padding_end);
+                            ggml_backend_tensor_set_async(split_backend,
+                                    input_cpy,
+                                    (const uint8_t *)input->data + expert_offset, expert_offset,
+                                    // copy a bit extra to ensure there are no NaNs in the padding
+                                    expert_size_copy + padding_end);
 
-                    };
+                        };
 
-                    auto next_on_id = [&unique_ids, n_expert] (int id) {
-                        while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
-                        return id;
-                    };
-                    auto next_off_id = [&unique_ids, n_expert] (int id) {
-                        while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
-                        return id;
-                    };
+                        auto next_on_id = [&unique_ids, n_expert] (int id) {
+                            while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
+                            return id;
+                        };
+                        auto next_off_id = [&unique_ids, n_expert] (int id) {
+                            while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
+                            return id;
+                        };
 
-                    int first_id = next_on_id(0);
-                    while (first_id < n_expert) {
-                        int last_id = next_off_id(first_id+1);
-                        copy_experts(first_id, last_id-1);
-                        first_id = next_on_id(last_id);
+                        int first_id = next_on_id(0);
+                        while (first_id < n_expert) {
+                            int last_id = next_off_id(first_id+1);
+                            copy_experts(first_id, last_id-1);
+                            first_id = next_on_id(last_id);
+                        }
                     }
 
                 } else {
@@ -2614,6 +2962,29 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        auto & pools = sched->moe_resident[b];
+        for (int i = 0; i < pools.n_pools; ++i) {
+            auto & pool = pools.pools[i];
+            if (pool.buffer != nullptr) {
+                ggml_backend_synchronize(sched->backends[b]);
+            }
+            if (sched->moe_resident_slots > 0 &&
+                    (pool.buffer != nullptr || pool.hits != 0 || pool.misses != 0 || pool.disabled)) {
+                fprintf(stderr,
+                        "ggml_backend_sched: moe-resident backend=%s slots=%d slot_bytes=%zu hits=%llu misses=%llu evictions=%llu h2d=%llu d2d=%llu disabled=%s\n",
+                        ggml_backend_name(sched->backends[b]), pool.slots, pool.key_slot_bytes,
+                        static_cast<unsigned long long>(pool.hits),
+                        static_cast<unsigned long long>(pool.misses),
+                        static_cast<unsigned long long>(pool.evictions),
+                        static_cast<unsigned long long>(pool.host_bytes),
+                        static_cast<unsigned long long>(pool.device_bytes),
+                        pool.disabled ? "yes" : "no");
+            }
+            ggml_backend_sched_moe_resident_clear_storage(&pool);
+        }
+        free(pools.pools);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
