@@ -424,6 +424,16 @@ llama_model::~llama_model() {
     for (struct ggml_context * ctx : ctxs) {
         ggml_free(ctx);
     }
+    // FT slice B: resident expert cache owns its buffer + slot view ctx
+    moe_slot_tensors.clear(); // views into moe_resident_buf, no per-tensor free
+    if (moe_slot_ctx) {
+        ggml_free(moe_slot_ctx);
+        moe_slot_ctx = nullptr;
+    }
+    if (moe_resident_buf) {
+        ggml_backend_buffer_free(moe_resident_buf);
+        moe_resident_buf = nullptr;
+    }
     for (ggml_backend_buffer_t buf : bufs) {
 #ifdef GGML_USE_CUDA
         if (ggml_backend_buffer_get_type(buf) == ggml_backend_cpu_buffer_type()) {
@@ -8615,6 +8625,7 @@ struct llama_context_params llama_context_default_params() {
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
         /*.only_active_experts         =*/ false,
+        /*.moe_resident                =*/ 0,
         /*.prefetch_experts            =*/ false,
         /*.prefetch_experts_threads    =*/ 0,
         /*.k_cache_hadamard            =*/ false,
@@ -9142,6 +9153,7 @@ struct llama_context * llama_init_from_model(
     cparams.scheduler_async  = params.scheduler_async;
     cparams.min_experts      = params.min_experts;
     cparams.thresh_experts   = params.thresh_experts;
+    cparams.moe_resident     = params.moe_resident;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.worst_graph_tokens = params.worst_case_tokens;
@@ -9307,6 +9319,9 @@ struct llama_context * llama_init_from_model(
     LLAMA_LOG_INFO("%s: reduce_type   = %s\n",     __func__, ggml_type_name(cparams.reduce_type));
     LLAMA_LOG_INFO("%s: sched_async   = %d\n",     __func__, cparams.scheduler_async);
     LLAMA_LOG_INFO("%s: ser           = %d, %g\n", __func__, cparams.min_experts, cparams.thresh_experts);
+    if (cparams.moe_resident > 0) {
+        LLAMA_LOG_INFO("%s: moe_resident = %d slots\n", __func__, cparams.moe_resident);
+    }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n",   __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",     __func__, cparams.rope_freq_scale);
     if (cparams.cuda_params) {

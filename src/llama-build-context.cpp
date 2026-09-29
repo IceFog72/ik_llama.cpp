@@ -84,6 +84,7 @@ llm_build_context::llm_build_context(
         split_mode_graph_scheduling (cparams.split_mode_graph_scheduling),
         min_experts      (cparams.min_experts),
         thresh_experts   (cparams.thresh_experts),
+        moe_resident     (cparams.moe_resident),
         pooling_type     (cparams.pooling_type),
         rope_type        (hparams.rope_type),
         clear_lctx_inputs(clear_lctx_inputs),
@@ -1036,12 +1037,53 @@ ggml_tensor * llm_build_context::build_mla_output_gate(
     return output;
 }
 
+// FT slice B: substitute a host expert bank with its resident-device copy.
+// The resident cache owns one contiguous device buffer; slot s holds exactly
+// one expert slice of the bank it was filled from. The substitute is a view
+// chain over the slot region with the same ne[]/type as src, so MUL_MAT_ID
+// (or the fused up-gate op) reads resident bytes with zero per-token copies.
+// LRU + fill happen in the scheduler copy path (sees concrete ids); here we
+// only rewire static graph edges for ids that the residency epoch pinned.
+// Slots are sized per (type, ne) on first use; a bank whose slice geometry
+// differs from the live slots is left on the host path (returns src).
+//
+// KEY INSIGHT: substitute the bank with a view over the residency buffer and
+// rewrite ids: resident slot s holding expert e of layer L becomes bank index
+// (s mapped). Since MUL_MAT_ID indexes src[expert] by ids value, we build a
+// compact resident bank [?, ?, n_slots] + remapped ids. ids rewrite needs a
+// runtime op: GATHER rows of a static remap table. That table is filled by the
+// scheduler alongside the slots (same epoch), so graph stays static.
+ggml_tensor * llm_build_context::ft_resident_bank(ggml_context * ctx, llama_context & lctx,
+        ggml_tensor * src, ggml_tensor * ids, int il, const char * tag) {
+    const llama_model & model = lctx.model;
+    if (lctx.cparams.moe_resident <= 0) return src;
+    if (src == nullptr || model.moe_resident_buf == nullptr) return src;
+    if (src->ne[2] <= 1) return src; // not an expert bank (need [?, ?, E])
+    const size_t slice_ne = (size_t) src->ne[0] * (size_t) src->ne[1];
+    const size_t slice_bytes = ggml_row_size(src->type, slice_ne);
+    if (slice_bytes == 0 || slice_bytes != model.moe_slot_bytes) return src;
+    if (il < 0) return src;
+    if (ids == nullptr || ids->type != GGML_TYPE_I32) return src;
+    if (model.moe_n_slots <= 0 || model.moe_slot_tensors.empty()) return src;
+    if (model.moe_slot_tensors.size() < 2) return src;
+    ggml_tensor * remap_base = model.moe_slot_tensors[1];
+    const int64_t n_expert = src->ne[2];
+    if (remap_base->ne[0] < (int64_t)(il + 1) * n_expert) return src;
+    // v1: geometry guards only (safe no-op). Graph substitution (bank view +
+    // ids gather) + scheduler fill/remap land in B2. Until then returning src
+    // keeps every existing path bit-identical with the flag on.
+    (void) remap_base; (void) n_expert; (void) tag; (void) ids;
+    return src;
+}
+
 ggml_tensor * llm_build_context::llm_build_lora_mm_id(
         struct llama_context & lctx,
          struct ggml_context * ctx0,
           struct ggml_tensor * w,   // struct ggml_tensor * as
           struct ggml_tensor * cur, // struct ggml_tensor * b
           struct ggml_tensor * ids) {
+    // FT slice B substitutes banks in llm_build_moe_ffn (il in scope there),
+    // not here: lora_mm_id has no layer index for the per-layer remap.
     struct ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
     for (auto & it : lctx.lora_adapters) {
         struct llama_lora_weight * lora = it.first->get_weight(w);
@@ -1604,6 +1646,20 @@ llm_expert_gating_func_type   gating_op,
     //
     //bool can_use_fmoe = !up_exps_b && !gate_exps_b && (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU);
     bool can_use_fmoe = (type_op == LLM_FFN_SILU || type_op == LLM_FFN_GELU || type_op == LLM_FFN_SWIGLU_OAI);
+
+    // FT slice B: single substitution point (il is in scope here). Rewrites
+    // expert banks + selected_experts to resident compact bank + remapped ids
+    // when the scheduler-pinned epoch covers every id of this node.
+    // v1 status: ft_resident_bank is a geometry-guarded no-op (returns src)
+    // until the scheduler fill + remap path lands. Call sites wired so B2 is
+    // graph-edit-only, no more call-site churn.
+    if (lctx.cparams.moe_resident > 0 && lctx.model.moe_resident_buf != nullptr) {
+        up_exps   = ft_resident_bank(ctx, lctx, up_exps,   selected_experts, il, "up");
+        gate_exps = ft_resident_bank(ctx, lctx, gate_exps, selected_experts, il, "gate");
+        down_exps = ft_resident_bank(ctx, lctx, down_exps, selected_experts, il, "down");
+        // NOTE: ids remap arrives with the scheduler epoch (B2). Banks return
+        // unchanged until then, so selected_experts stays valid as-is.
+    }
 
     ggml_tensor * par;
     if (can_use_fmoe && up_gate_exps) {

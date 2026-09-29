@@ -628,6 +628,24 @@ struct llama_model {
     // the model memory buffers for the tensor data
     std::vector<ggml_backend_buffer_t> bufs;
 
+    // FT slice B: resident expert cache (GPU copies of hot (layer,expert)
+    // slices). Allocated lazily on first decode when cparams.moe_resident > 0.
+    // slot_key[s] = int64 key (layer<<32 | expert) or -1 = empty.
+    // slot_order = LRU order, front = most-recently-used.
+    // moe_slot_ctx owns metadata tensors (bank view, remap rows);
+    // slot_tensors[s] = device tensor view into slot storage (same type/shape
+    // as one expert slice of the source bank). slot_bytes = bytes per slot.
+    // hits/misses = lifetime counters for --verbose stats.
+    ggml_backend_buffer_t moe_resident_buf = nullptr;
+    struct ggml_context * moe_slot_ctx = nullptr;
+    std::vector<int64_t>  moe_slot_key;
+    std::vector<int>      moe_slot_order;
+    std::vector<struct ggml_tensor *> moe_slot_tensors;
+    size_t moe_slot_bytes = 0;
+    int    moe_n_slots = 0;
+    uint64_t moe_hits = 0;
+    uint64_t moe_misses = 0;
+
     // model memory mapped files
     llama_mmaps mappings;
 
