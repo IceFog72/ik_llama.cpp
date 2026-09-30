@@ -18517,7 +18517,7 @@ static void ggml_compute_forward_mul_mat_id(
     };
 
     int64_t * matrix_row_counts = (int64_t *) (wdata_src1_end); // [n_as]
-    struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][ne11]
+    struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][n_tokens * n_ids]
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
@@ -18540,7 +18540,7 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
+#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12*n_ids + (i1)]
 
     GGML_ASSERT(ids->ne[1] == dst->ne[2]);
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
@@ -18611,7 +18611,7 @@ static void ggml_compute_forward_mul_mat_id(
                         src0->type, src0_cur, nb01,
                         vec_dot_type, (const char *)wdata_mm, row_size_mm,
                         (float *)dst->data, nb1, nb2,
-                        matrix_rows + cur_a*ne12, local_chunk, chunks_per_expert)) goto IQK_MulMat_Not_Available0;
+                        matrix_rows + cur_a*ne12*n_ids, local_chunk, chunks_per_expert)) goto IQK_MulMat_Not_Available0;
 
             chunk_id = atomic_fetch_add(&params->shared->current_chunk, 1);
         }
@@ -18649,7 +18649,7 @@ IQK_MulMat_Not_Available0:;
                        src0->type, (const char *)src0_cur, nb01, ///ggml_type_size(src0->type),
                        vec_dot_type, (const char *)wdata, row_size, ///ggml_type_size(vec_dot_type),
                        (float *)dst->data, nb1, nb2,
-                       matrix_rows + cur_a*ne12, ith, nth)) goto IQK_MulMat_Not_Available;
+                       matrix_rows + cur_a*ne12*n_ids, ith, nth)) goto IQK_MulMat_Not_Available;
                 continue;
         }
 IQK_MulMat_Not_Available:;
@@ -18843,7 +18843,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     };
 
     int64_t * matrix_row_counts = (int64_t *) (wdata_src1_end); // [n_as]
-    struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][ne11]
+    struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][n_tokens * n_ids]
 
     if (src1->type != vec_dot_type) {
 
@@ -18869,7 +18869,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
         }
     }
 
-#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12 + (i1)]
+#define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ne12*n_ids + (i1)]
 
     GGML_ASSERT(ids->ne[1] == dst->ne[2]);
     for (int64_t iid1 = ith; iid1 < ids->ne[1]; iid1 += nth) {
@@ -18963,7 +18963,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             vec_dot_type, (const char *)wdata_ug, row_size_ug,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, local_chunk, chunks_per_expert_ug)) GGML_ABORT("fatal error");
+                            matrix_rows + cur_a*ne12*n_ids, limit, local_chunk, chunks_per_expert_ug)) GGML_ABORT("fatal error");
 
         chunk_id_ug = atomic_fetch_add(&params->shared->current_chunk, 1);
     }
@@ -19011,7 +19011,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                             vec_dot_type, (const char *)wdata, row_size,
                             up_b_cur, gate_b_cur,
                             (float *)dst->data, nb1, nb2,
-                            matrix_rows + cur_a*ne12, limit, ith, nth)) GGML_ABORT("fatal error");
+                            matrix_rows + cur_a*ne12*n_ids, limit, ith, nth)) GGML_ABORT("fatal error");
 
     }
 #endif
@@ -29226,22 +29226,21 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     const int n_as = src0->ne[2];
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
-                    cur += n_as * src1->ne[2] * sizeof(int64_t); // matrix_rows
+                    cur += n_as * src1->ne[2] * node->src[2]->ne[0] * sizeof(int64_t); // matrix_rows, including repeated IDs
                 } break;
             case GGML_OP_MOE_FUSED_UP_GATE:
                 {
                     cur = 0;
                     const struct ggml_tensor * src0 = node->src[0];
-                    const struct ggml_tensor * src1 = node->src[1];
                     const struct ggml_tensor * src2 = node->src[2];
                     const enum ggml_type vec_dot_type = type_traits[src0->type].vec_dot_type;
-                    if (src1 && src1->type != vec_dot_type) {
+                    if (src2->type != vec_dot_type) {
                         cur += ggml_row_size(vec_dot_type, src2->ne[0]) * ggml_nrows(src2);
                     }
                     const int n_as = src0->ne[2];
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
-                    cur += n_as * src2->ne[2] * sizeof(int64_t); // matrix_rows
+                    cur += n_as * src2->ne[2] * node->src[3]->ne[0] * sizeof(int64_t); // matrix_rows, including repeated IDs
                 } break;
             case GGML_OP_FUSED_UP_GATE:
                 {

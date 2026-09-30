@@ -3120,7 +3120,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
-    options.push_back({ "*",           "       --moe-resident N|auto",   "enable CUDA active-expert execution with an adaptive per-layer LRU (N slots per bank pool; auto uses free VRAM; default: %d, 0 = disabled)", params.moe_resident });
+    options.push_back({ "*",           "       --moe-resident N|auto",   "cache experts on CUDA (N slots per bank pool; auto shares complete experts across layers and splits fused single-GPU decode between CPU/CUDA; default: %d, 0 = disabled)", params.moe_resident });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fug, --no-fused-up-gate",   "disable fused up-gate (default: %s)", params.fused_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-mmad, --no-fused-mul-multiadd", "disable fused mul-multi_add (default: %s)", params.fused_mmad ? "enabled" : "disabled" });

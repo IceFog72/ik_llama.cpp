@@ -567,6 +567,7 @@ bool llama_prepare_dflash_graph_inputs(
         lctx.dflash.kv.cache_update_rows = update_rows;
         ggml_cgraph * gf_kv = nullptr;
         const bool can_reuse_kv_graph = lctx.dflash.kv.cache_graph != nullptr &&
+                !ggml_backend_sched_moe_resident_needs_rebuild(lctx.dflash.kv.cache_sched) &&
                 lctx.dflash.kv.cache_graph_rows == update_rows &&
                 (lctx.model.hparams.dflash_dsv4 ||
                  lctx.dflash.kv.cache_graph_write_pos == lctx.dflash.kv.cache_write_pos);
