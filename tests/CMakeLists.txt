@@ -146,6 +146,14 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 if (NOT WIN32)
+    # White-box scheduler policy checks, with an opt-in real CUDA copy test:
+    # test-moe-resident --cuda. No model or GPU is needed for the default test.
+    find_package(Threads REQUIRED)
+    add_executable(test-moe-resident test-moe-resident.cpp)
+    target_compile_definitions(test-moe-resident PRIVATE GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
+    target_link_libraries(test-moe-resident PRIVATE ggml Threads::Threads)
+    llama_test(test-moe-resident)
+
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API
     #llama_target_and_test(test-sampling.cpp)
     #llama_target_and_test(test-grammar-parser.cpp)

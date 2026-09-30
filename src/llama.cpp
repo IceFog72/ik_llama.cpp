@@ -9656,7 +9656,8 @@ struct llama_context * llama_init_from_model(
             pipeline_parallel = false;
 #endif
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
-            ggml_backend_sched_set_moe_resident_layers(ctx->sched, model->hparams.n_layer);
+            ggml_backend_sched_set_moe_resident_model_info(ctx->sched,
+                    model->hparams.n_layer, model->hparams.n_expert, model->hparams.n_expert_used);
             ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
 
             if (pipeline_parallel) {
@@ -9686,7 +9687,8 @@ struct llama_context * llama_init_from_model(
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
-                    ggml_backend_sched_set_moe_resident_layers(ctx->sched, model->hparams.n_layer);
+                    ggml_backend_sched_set_moe_resident_model_info(ctx->sched,
+                            model->hparams.n_layer, model->hparams.n_expert, model->hparams.n_expert_used);
                     ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }

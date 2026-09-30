@@ -215,6 +215,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off);
     GGML_API void                 ggml_backend_sched_set_moe_resident(ggml_backend_sched_t sched, int slots);
     GGML_API void                 ggml_backend_sched_set_moe_resident_layers(ggml_backend_sched_t sched, int n_layers);
+    GGML_API void                 ggml_backend_sched_set_moe_resident_model_info(ggml_backend_sched_t sched,
+            int n_layers, int n_expert, int n_expert_used);
     GGML_API void                 ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async);
     GGML_API void                 ggml_backend_sched_set_max_extra_alloc(ggml_backend_sched_t sched, int extra_alloc_MiB);
 
