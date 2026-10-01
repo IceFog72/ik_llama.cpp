@@ -1646,8 +1646,14 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
                 }
             }
         }
-        if (json_value(data, "ignore_eos", false) && has_eos_token) {
-            slot.sparams.logit_bias[llama_token_eos(model)] = -INFINITY;
+        if (json_value(data, "ignore_eos", false)) {
+            // Stopping checks recognize every EOG token, including EOT/EOM.
+            // Suppress the same set rather than only the designated EOS token.
+            for (llama_token tok = 0; tok < llama_vocab_n_tokens(vocab); ++tok) {
+                if (llama_vocab_is_eog(vocab, tok)) {
+                    slot.sparams.logit_bias[tok] = -INFINITY;
+                }
+            }
         }
 
     }
