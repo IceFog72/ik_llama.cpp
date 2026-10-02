@@ -1463,6 +1463,38 @@ struct ggml_backend_sched {
     int moe_resident_hybrid_target_slots;
     bool moe_resident_hybrid_plan_ready;
     bool moe_resident_replan_required;
+    // Why a layer did not qualify for the complete-FFN path. Reported once so a
+    // model or flag combination that falls off the fast path is visible. Kept
+    // deliberately fine-grained: a coarse bucket makes the common case (prefill
+    // batch graphs) indistinguishable from a real incompatibility.
+    enum { MOE_FFN_R_GUARD,        // scan declined entirely (wrong backend shape, disabled)
+           MOE_FFN_R_OP_NOT_PAIR,  // node after up is not MUL_MAT_ID, or srcs unwired
+           MOE_FFN_R_OP_WIRING,    // up used by >1 node, is graph output, or has extra src4/5
+           MOE_FFN_R_OP_LAYOUT,    // up/down not F32 or not contiguous
+           MOE_FFN_R_PLACEMENT,    // tensor assigned to a non-default backend
+           MOE_FFN_R_ACT_IDS_NULL, // activation or routing metadata missing
+           MOE_FFN_R_ACT_IDS_DTYPE,// activation not F32, or ids not I32
+           MOE_FFN_R_ACT_BATCH,    // activation batch dim != 1 (prefill)
+           MOE_FFN_R_IDS_BATCH,    // ids batch dim != 1 (prefill)
+           MOE_FFN_R_IDS_WIDTH,    // ids width != n_expert_used
+           MOE_FFN_R_ACT_IDS_LAYOUT,
+           MOE_FFN_R_BANK_NULL,
+           MOE_FFN_R_BANK_NOT_HOST,// weights not in host memory (fully offloaded)
+           MOE_FFN_R_BANK_USAGE,   // buffer is not a weights buffer
+           MOE_FFN_R_BANK_UNQUANT, // bank is not quantized
+           MOE_FFN_R_BANK_LAYOUT,  // bank not contiguous
+           MOE_FFN_R_BANK_WIDTH,   // bank ne[2] != n_expert or ne[3] != 1
+           MOE_FFN_R_BANK_LAYER_ID,// layer id unparseable, or banks disagree
+           MOE_FFN_R_UNSUPPORTED,  // backend does not support the op
+           MOE_FFN_R_REPEATED,     // same layer seen twice in one graph
+           MOE_FFN_R_SCRATCH,      // pinned scratch buffers could not be allocated
+           MOE_FFN_R_COUNT };
+    uint64_t moe_ffn_reject_n[MOE_FFN_R_COUNT] = {};
+    uint64_t moe_ffn_candidates = 0, moe_ffn_qualified_events = 0, moe_ffn_qualified_layers = 0;
+    // Which layers qualified on the decode graph. Lets a porting check name the
+    // layers that fell off the fast path instead of only counting them.
+    std::vector<uint8_t> moe_ffn_qualified_layer;
+    bool moe_ffn_scan_reported = false;
     ggml_backend_sched_moe_decode * moe_decode;
     ggml_backend_sched_moe_ffn * moe_ffn;
     uint32_t * moe_resident_route_use_counts;
@@ -4327,6 +4359,44 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
                 (unsigned long long)f.host_bytes, (unsigned long long)f.result_bytes);
         delete sched->moe_ffn;
         sched->moe_ffn = nullptr;
+    }
+    if (sched->moe_ffn_candidates || sched->moe_ffn_reject_n[sched->MOE_FFN_R_GUARD]) {
+        static const char * const reject_names[] = {
+            "scan-guard", "op-not-pair", "op-wiring", "op-layout", "placement",
+            "act-ids-null", "act-ids-dtype", "act-batch", "ids-batch", "ids-width",
+            "act-ids-layout", "bank-null", "bank-not-host", "bank-usage",
+            "bank-unquantized", "bank-layout", "bank-width", "bank-layer-id",
+            "unsupported", "repeated", "scratch",
+        };
+        fprintf(stderr, "ggml_backend_sched: moe-resident scan candidate-nodes=%llu qualified-layers=%llu qualified-events=%llu",
+                (unsigned long long)sched->moe_ffn_candidates,
+                (unsigned long long)sched->moe_ffn_qualified_layers,
+                (unsigned long long)sched->moe_ffn_qualified_events);
+        bool any_reject = false;
+        for (int r = 0; r < sched->MOE_FFN_R_COUNT; ++r) {
+            if (sched->moe_ffn_reject_n[r]) any_reject = true;
+        }
+        fprintf(stderr, "%s", any_reject ? " rejected:" : " rejected:none");
+        for (int r = 0; r < sched->MOE_FFN_R_COUNT; ++r) {
+            if (sched->moe_ffn_reject_n[r]) {
+                fprintf(stderr, " %s=%llu", reject_names[r],
+                        (unsigned long long)sched->moe_ffn_reject_n[r]);
+            }
+        }
+        fprintf(stderr, "\n");
+        if (!sched->moe_ffn_qualified_layer.empty()) {
+            std::string missing;
+            for (size_t l = 0; l < sched->moe_ffn_qualified_layer.size(); ++l) {
+                if (!sched->moe_ffn_qualified_layer[l]) {
+                    missing += missing.empty() ? std::to_string(l) : ("," + std::to_string(l));
+                }
+            }
+            if (!missing.empty()) {
+                fprintf(stderr, "ggml_backend_sched: moe-resident layers without complete-FFN coverage: %s%s\n",
+                        missing.c_str(),
+                        sched->moe_ffn_qualified_layers == 0 ? " (none qualified)" : "");
+            }
+        }
     }
     for (int b = 0; b < sched->n_backends; b++) {
         if (sched->moe_resident_slots != 0 && sched->moe_resident_budget[b].initialized) {

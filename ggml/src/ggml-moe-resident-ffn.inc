@@ -39,30 +39,50 @@ static void ggml_backend_sched_moe_ffn_scan(ggml_backend_sched_t sched, const gg
         sched->moe_ffn->wait_io();
         sched->moe_ffn->graph_tasks.clear();
     }
+auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
+
 #ifdef GGML_USE_CUDA
     if (sched->moe_resident_slots >= 0 || sched->n_backends != 2 || sched->n_copies != 1 ||
             sched->callback_eval || sched->split_mode_graph || !ggml_backend_is_cuda(sched->backends[0]) ||
             !ggml_backend_is_cpu(sched->backends[1]) ||
             !ggml_backend_sched_moe_resident_requested(sched, sched->backends[0]) ||
-            (sched->moe_ffn && sched->moe_ffn->disabled)) return;
+            (sched->moe_ffn && sched->moe_ffn->disabled)) {
+        note(sched->MOE_FFN_R_GUARD);
+        return;
+    }
     std::unordered_map<const ggml_tensor *, int> uses;
     std::set<int> repeated_layers;
     for (int i = 0; i < graph->n_nodes; ++i)
         for (auto * src : graph->nodes[i]->src) if (src) ++uses[src];
     for (int i = 0; i + 1 < graph->n_nodes; ++i) {
         auto * up = graph->nodes[i], * down = graph->nodes[i + 1];
-        if (up->op != GGML_OP_MOE_FUSED_UP_GATE || down->op != GGML_OP_MUL_MAT_ID ||
-                down->src[1] != up || down->src[2] != up->src[3] || uses[up] != 1 ||
-                (up->flags & GGML_TENSOR_FLAG_OUTPUT) || up->src[4] || up->src[5] ||
-                up->type != GGML_TYPE_F32 || down->type != GGML_TYPE_F32 ||
-                !ggml_is_contiguous(up) || !ggml_is_contiguous(down) ||
-                (tensor_backend_id(up) >= 0 && tensor_backend_id(up) != 0) ||
-                (tensor_backend_id(down) >= 0 && tensor_backend_id(down) != 0)) continue;
+        if (up->op != GGML_OP_MOE_FUSED_UP_GATE) continue;
+        ++sched->moe_ffn_candidates;
+        if (down->op != GGML_OP_MUL_MAT_ID || down->src[1] != up || down->src[2] != up->src[3]) {
+            note(sched->MOE_FFN_R_OP_NOT_PAIR); continue;
+        }
+        if (uses[up] != 1 || (up->flags & GGML_TENSOR_FLAG_OUTPUT) || up->src[4] || up->src[5]) {
+            note(sched->MOE_FFN_R_OP_WIRING); continue;
+        }
+        if (up->type != GGML_TYPE_F32 || down->type != GGML_TYPE_F32 ||
+                !ggml_is_contiguous(up) || !ggml_is_contiguous(down)) {
+            note(sched->MOE_FFN_R_OP_LAYOUT); continue;
+        }
+        if ((tensor_backend_id(up) >= 0 && tensor_backend_id(up) != 0) ||
+                (tensor_backend_id(down) >= 0 && tensor_backend_id(down) != 0)) { note(sched->MOE_FFN_R_PLACEMENT); continue; }
         auto * act = up->src[2], * ids = up->src[3];
-        if (!act || !ids || act->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
-                act->ne[2] != 1 || act->ne[3] != 1 || ids->ne[1] != 1 ||
-                ids->ne[0] != sched->moe_resident_n_expert_used || ids->ne[0] <= 0 ||
-                !ggml_is_contiguous(act) || !ggml_is_contiguous(ids)) continue;
+        if (!act || !ids) { note(sched->MOE_FFN_R_ACT_IDS_NULL); continue; }
+        if (act->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+            note(sched->MOE_FFN_R_ACT_IDS_DTYPE); continue;
+        }
+        if (act->ne[2] != 1 || act->ne[3] != 1) { note(sched->MOE_FFN_R_ACT_BATCH); continue; }
+        if (ids->ne[1] != 1) { note(sched->MOE_FFN_R_IDS_BATCH); continue; }
+        if (ids->ne[0] != sched->moe_resident_n_expert_used || ids->ne[0] <= 0) {
+            note(sched->MOE_FFN_R_IDS_WIDTH); continue;
+        }
+        if (!ggml_is_contiguous(act) || !ggml_is_contiguous(ids)) {
+            note(sched->MOE_FFN_R_ACT_IDS_LAYOUT); continue;
+        }
         ggml_tensor * banks[] = {up->src[0], up->src[1], down->src[0]};
         int layer = -1;
         bool supported = true;
@@ -70,25 +90,48 @@ static void ggml_backend_sched_moe_ffn_scan(ggml_backend_sched_t sched, const gg
             auto * bank = banks[b];
             if (!bank && b == 1) continue;
             int bank_layer = -1;
-            if (!bank || !bank->buffer || !ggml_backend_buffer_is_host(bank->buffer) ||
-                    ggml_backend_buffer_get_usage(bank->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
-                    !ggml_is_quantized(bank->type) || !ggml_is_contiguous(bank) ||
-                    bank->ne[2] != sched->moe_resident_n_expert || bank->ne[3] != 1 ||
-                    !ggml_backend_sched_moe_parse_layer_id(bank, sched->moe_resident_layers, bank_layer) ||
-                    (layer >= 0 && layer != bank_layer)) { supported = false; break; }
+            if (!bank) { note(sched->MOE_FFN_R_BANK_NULL); supported = false; break; }
+            if (!bank->buffer || !ggml_backend_buffer_is_host(bank->buffer)) {
+                note(sched->MOE_FFN_R_BANK_NOT_HOST); supported = false; break;
+            }
+            if (ggml_backend_buffer_get_usage(bank->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                note(sched->MOE_FFN_R_BANK_USAGE); supported = false; break;
+            }
+            if (!ggml_is_quantized(bank->type)) { note(sched->MOE_FFN_R_BANK_UNQUANT); supported = false; break; }
+            if (!ggml_is_contiguous(bank)) { note(sched->MOE_FFN_R_BANK_LAYOUT); supported = false; break; }
+            if (bank->ne[2] != sched->moe_resident_n_expert || bank->ne[3] != 1) {
+                note(sched->MOE_FFN_R_BANK_WIDTH); supported = false; break;
+            }
+            if (!ggml_backend_sched_moe_parse_layer_id(bank, sched->moe_resident_layers, bank_layer) ||
+                    (layer >= 0 && layer != bank_layer)) {
+                note(sched->MOE_FFN_R_BANK_LAYER_ID); supported = false; break;
+            }
             layer = bank_layer;
         }
-        if (!supported || layer < 0 ||
-                !ggml_backend_supports_op(sched->backends[0], up) ||
+        if (!supported) continue;
+        if (!ggml_backend_supports_op(sched->backends[0], up) ||
                 !ggml_backend_supports_op(sched->backends[0], down) ||
                 !ggml_backend_supports_op(sched->backends[1], up) ||
-                !ggml_backend_supports_op(sched->backends[1], down)) continue;
+                !ggml_backend_supports_op(sched->backends[1], down)) {
+            note(sched->MOE_FFN_R_UNSUPPORTED); continue;
+        }
+        ++sched->moe_ffn_qualified_events;
+        if (sched->moe_ffn_qualified_layer.empty()) {
+            // Only indexable layers exist; a dense layer has no expert bank and
+            // must not be reported as missing.
+            sched->moe_ffn_qualified_layer.resize(size_t(sched->moe_resident_layers), 0);
+        }
+        if (layer >= 0 && size_t(layer) < sched->moe_ffn_qualified_layer.size()) {
+            if (!sched->moe_ffn_qualified_layer[size_t(layer)]++) {
+                ++sched->moe_ffn_qualified_layers;
+            }
+        }
         if (!sched->moe_ffn) sched->moe_ffn = new ggml_backend_sched_moe_ffn;
         auto & f = *sched->moe_ffn;
-        if (repeated_layers.count(layer)) continue;
+        if (repeated_layers.count(layer)) { note(sched->MOE_FFN_R_REPEATED); continue; }
         if (size_t(layer) < f.tasks.size() && f.tasks[layer] && f.graph_tasks.count(f.tasks[layer]->up)) {
             f.graph_tasks.erase(f.tasks[layer]->up); f.graph_tasks.erase(f.tasks[layer]->down);
-            repeated_layers.insert(layer); continue;
+            repeated_layers.insert(layer); note(sched->MOE_FFN_R_REPEATED); continue;
         }
         bool changed = false;
         for (int b = 0; b < 3; ++b) {
@@ -111,7 +154,7 @@ static void ggml_backend_sched_moe_ffn_scan(ggml_backend_sched_t sched, const gg
             ggml_backend_buffer_free(f.cache);
             f.cache = nullptr; f.slots.clear(); f.slot_index.clear(); f.allocation_bytes = 0;
         }
-        if (!ggml_backend_sched_moe_ffn_scratch(sched, up, down)) continue;
+        if (!ggml_backend_sched_moe_ffn_scratch(sched, up, down)) { note(sched->MOE_FFN_R_SCRATCH); continue; }
         if (size_t(layer) >= f.tasks.size()) f.tasks.resize(size_t(layer) + 1);
         if (!f.tasks[layer]) f.tasks[layer] = std::make_unique<ggml_backend_sched_moe_ffn::task>();
         auto & t = *f.tasks[layer];
