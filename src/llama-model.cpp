@@ -2062,6 +2062,7 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_ATTN_Q,          "blk.%d.attn_q" },
             { LLM_TENSOR_ATTN_K,          "blk.%d.attn_k" },
             { LLM_TENSOR_ATTN_V,          "blk.%d.attn_v" },
+            { LLM_TENSOR_ATTN_QKV,        "blk.%d.attn_qkv" },
             { LLM_TENSOR_ATTN_SINKS,      "blk.%d.attn_sinks" },
             { LLM_TENSOR_ATTN_OUT,        "blk.%d.attn_output" },
             { LLM_TENSOR_FFN_NORM,        "blk.%d.ffn_norm" },
@@ -2073,6 +2074,10 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_DOWN_EXPS,   "blk.%d.ffn_down_exps" },
             { LLM_TENSOR_FFN_UP_EXPS,     "blk.%d.ffn_up_exps" },
             { LLM_TENSOR_FFN_GATE_UP_EXPS,"blk.%d.ffn_gate_up_exps" },
+            { LLM_TENSOR_NEXTN_EH_PROJ,      "blk.%d.nextn.eh_proj" },
+            { LLM_TENSOR_NEXTN_ENORM,        "blk.%d.nextn.enorm" },
+            { LLM_TENSOR_NEXTN_HNORM,        "blk.%d.nextn.hnorm" },
+            { LLM_TENSOR_LAYER_OUT_NORM,     "blk.%d.layer_output_norm" },
 	        { LLM_TENSOR_FFN_EXP_PROBS_B, "blk.%d.exp_probs_b" },
         },
     },
@@ -2437,6 +2442,8 @@ std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_XS:   return "IQ3_XS - 3.3 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_XXS:  return "IQ3_XXS - 3.0625 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ1_KT:   return "IQ1_KT - 1.75 bpw";
+        case LLAMA_FTYPE_MOSTLY_PQ2_0:    return "PQ2_0 - 2.13 bpw ternary (Prism)";
+        case LLAMA_FTYPE_MOSTLY_PTQ1_0:   return "PTQ1_0 - 1.75 bpw ternary (Prism)";
         case LLAMA_FTYPE_MOSTLY_IQ2_KT:   return "IQ2_KT - 2.125 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_KT:   return "IQ3_KT - 3.125 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ4_KT:   return "IQ4_KT - 4.0 bpw";
@@ -2893,4 +2900,12 @@ size_t llama_model::cache_size(int il, ggml_type type_k, ggml_type type_v, ggml_
         k_size += hparams.n_embd_ple_conv(il) * (size_t) state_sots * sizeof(float);
     }
     return k_size + v_size;
+}
+
+const llama_hadamard_transform * llama_model::hadamard_rotation(const struct ggml_tensor * t) const {
+    if (!t || arch != LLM_ARCH_QWEN35) {
+        return nullptr;
+    }
+    const auto it = hadamard_map.find(t->name);
+    return it != hadamard_map.end() && it->second.block_size > 0 ? &it->second : nullptr;
 }

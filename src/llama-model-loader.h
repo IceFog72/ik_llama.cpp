@@ -144,6 +144,9 @@ struct llama_model_loader {
                     get_tensor_meta("selector_hidden.weight") != nullptr) {
                 resolved_arch = LLM_ARCH_DFLASH2;
             }
+            if (resolved_arch == LLM_ARCH_GLM5NEXT_DASHED) {
+                resolved_arch = LLM_ARCH_GLM5NEXT;
+            }
             arch_resolved = true;
         }
         return resolved_arch;
@@ -220,6 +223,9 @@ struct llama_model_loader {
 void llm_load_arch(llama_model_loader & ml, llama_model & model);
 
 void llm_load_hparams(llama_model_loader & ml, llama_model & model, bool ignore_vocab = false);
+
+// Prism ternary Hadamard rotations; no-op unless the GGUF declares them
+void llm_load_hadamard(llama_model_loader & ml, llama_model & model);
 
 struct create_tensors_helper_interface {
     virtual ~create_tensors_helper_interface() = default;
