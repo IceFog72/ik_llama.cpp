@@ -857,7 +857,7 @@ static void test_cuda_copy() {
 #endif
 
 #ifdef GGML_USE_CUDA
-static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false) {
+static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false) {
     constexpr int width = 256, hidden = 512, experts = 16, top_k = 8, layers = 3;
     auto * cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
     check(cuda != nullptr, "complete FFN CUDA backend initializes");
@@ -1000,7 +1000,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                 f.slots.resize(capacity); f.allocation_bytes = bytes;
                 for (auto & task : f.tasks) if (task) {
                     auto & timing = ggml_backend_sched_moe_ffn_timing(f, *task, top_k);
-                    for (size_t m = 1; m < timing.misses.size(); ++m) for (size_t q = 1; q <= m; ++q) {
+                    for (size_t m = 1; m < timing.misses.size(); ++m) for (size_t q = 0; q <= m; ++q) {
                         timing.misses[m][q].count = 3;
                         timing.misses[m][q].us = q == std::min<size_t>(2, m) ? 1.0 : 10.0;
                     }
@@ -1008,12 +1008,45 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             }
             injected = true;
         }
+        const bool prefer_zero = zero_fill && (r == 1 || r == 2);
+        if (zero_fill && !fail_cache) {
+            for (auto & timing : sched->moe_ffn->timings) {
+                for (size_t m = 1; m < timing.misses.size(); ++m) for (size_t q = 0; q <= m; ++q) {
+                    timing.misses[m][q].count = 3;
+                    // Keep zero preferred even after a periodic real measurement
+                    // replaces its synthetic timing during this controlled test.
+                    timing.misses[m][q].us = q == (prefer_zero ? 0 : std::min<size_t>(2, m))
+                            ? 1.0 : prefer_zero ? 1e12 : 10.0;
+                }
+                // The first periodic recheck must also exercise zero fills.
+                if (r == 2) timing.visits = 255;
+            }
+        }
+        auto & state = *sched->moe_ffn;
+        const auto old_fills = state.fills, old_evictions = state.evictions, old_weights = state.host_bytes;
+        const auto old_gpu_refs = state.gpu_refs, old_cpu_refs = state.cpu_refs;
+        uint64_t old_zero_samples = 0;
+        for (const auto & timing : state.timings)
+            for (const auto & samples : timing.misses) old_zero_samples += samples[0].count;
         check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
                 "complete FFN graph computes with masks and downstream weighting");
+        if (prefer_zero) {
+            check(state.fills == old_fills && state.evictions == old_evictions && state.host_bytes == old_weights,
+                    "zero fills preserves cache entries and uploads no expert weights");
+            check(state.cpu_refs > old_cpu_refs, "zero fills executes misses on CPU");
+            if (r == 1) check(state.gpu_refs == old_gpu_refs, "all-miss zero-fill route executes entirely on CPU");
+            if (r == 2) {
+                check(state.gpu_refs > old_gpu_refs, "zero fills still executes existing cache hits on GPU");
+                uint64_t zero_samples = 0;
+                for (const auto & timing : state.timings)
+                    for (const auto & samples : timing.misses) zero_samples += samples[0].count;
+                check(zero_samples > old_zero_samples, "periodic recheck measures the zero-fill candidate");
+            }
+        }
         sched->bufts[0] = original_buft;
         if (!fail_cache && r == 5) check(sched->moe_ffn->allocation_bytes > old_cache_bytes,
                 "larger geometry allocates complete slots with the new strides");
-        if (r == 0 && !fail_cache) {
+        if (r == 0 && !fail_cache && !zero_fill) {
             for (int layer = 0; layer < layers; ++layer) {
                 expected_cpu[layer] = native(cpu, layer, routes[1]);
                 expected_gpu[layer] = native(cuda, layer, routes[1]);
@@ -1103,6 +1136,7 @@ int main(int argc, char ** argv) {
         test_complete_ffn(true, false);
         test_complete_ffn(false, true);
         test_complete_ffn(false, false, true);
+        test_complete_ffn(false, false, false, true);
 #else
         check(false, "CUDA test requires a CUDA build");
 #endif
