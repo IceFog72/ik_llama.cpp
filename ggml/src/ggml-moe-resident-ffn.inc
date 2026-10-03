@@ -184,7 +184,8 @@ static bool ggml_backend_sched_moe_ffn_cache(ggml_backend_sched_t sched, ggml_ba
     size_t free_bytes = 0, total_bytes = 0;
     ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device(gpu), &free_bytes, &total_bytes);
     f.reserve_bytes = std::max<size_t>(256 * 1024 * 1024, free_bytes / 8);
-    f.budget_bytes = free_bytes > f.reserve_bytes ? free_bytes - f.reserve_bytes : 0;
+    f.budget_bytes = ggml_backend_sched_moe_resident_cap_budget(sched,
+            free_bytes > f.reserve_bytes ? free_bytes - f.reserve_bytes : 0);
     size_t expert_bytes = 0;
     for (size_t stride : f.strides) {
         if (stride > SIZE_MAX - expert_bytes) { f.disabled = true; return false; }

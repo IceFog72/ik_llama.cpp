@@ -8,6 +8,7 @@
 #include "ggml-cuda/moe-resident.h"
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cctype>
 #include <climits>
@@ -1468,6 +1469,7 @@ struct ggml_backend_sched {
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
 
     bool only_active_experts;
+    size_t moe_resident_cap_bytes;
     int moe_resident_slots;
     int moe_resident_layers;
     int moe_resident_n_expert;
@@ -1557,6 +1559,16 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+void ggml_backend_sched_set_moe_resident_budget(ggml_backend_sched_t sched, size_t bytes) {
+    if (!sched) return;
+    GGML_ASSERT(!sched->is_alloc);
+    sched->moe_resident_cap_bytes = bytes;
+}
+
+static size_t ggml_backend_sched_moe_resident_cap_budget(ggml_backend_sched_t sched, size_t bytes) {
+    return sched->moe_resident_cap_bytes ? std::min(bytes, sched->moe_resident_cap_bytes) : bytes;
 }
 
 void ggml_backend_sched_set_moe_resident(ggml_backend_sched_t sched, int slots) {
@@ -2567,7 +2579,7 @@ static bool ggml_backend_sched_moe_resident_init_auto_budget(
         budget.unavailable = true;
     } else {
         budget.initial_free_bytes = free_bytes;
-        budget.budget_bytes = free_bytes / 10;
+        budget.budget_bytes = ggml_backend_sched_moe_resident_cap_budget(sched, free_bytes / 10);
         budget.safety_reserve_bytes = free_bytes - budget.budget_bytes;
         budget.unavailable = budget.budget_bytes == 0;
         if (!budget.unavailable) {

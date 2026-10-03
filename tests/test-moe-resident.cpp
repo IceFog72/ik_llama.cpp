@@ -1054,6 +1054,40 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
 }
 #endif
 
+#ifdef GGML_USE_CUDA
+static void test_cuda_budget_cap() {
+    auto * cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
+    check(cuda != nullptr, "budget cap CUDA backend initializes");
+    if (!cuda) return;
+    auto * cpu = ggml_backend_cpu_init();
+    ggml_backend_t backends[] = {cuda, cpu};
+    const size_t mib = 1024 * 1024;
+    for (size_t cap : {4 * mib, mib}) {
+        auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 64, false);
+        ggml_backend_sched_set_moe_resident_model_info(sched, 4, 8, 1);
+        ggml_backend_sched_set_moe_resident_budget(sched, cap);
+        ggml_backend_sched_set_moe_resident(sched, -1);
+        check(sched->moe_resident_budget[0].budget_bytes <= cap,
+                "legacy auto budget respects the explicit cap");
+        sched->moe_ffn = new ggml_backend_sched_moe_ffn;
+        // Three one-MiB projections form one complete expert. A four-MiB
+        // cap must allocate one slot, while one MiB must fall back to CPU.
+        for (auto & stride : sched->moe_ffn->strides) stride = mib;
+        const bool allocated = ggml_backend_sched_moe_ffn_cache(sched, cuda);
+        check(allocated == (cap == 4 * mib), "cap controls real complete-cache allocation");
+        check(sched->moe_ffn->allocation_bytes <= cap,
+                "device expert-cache allocation stays within the cap");
+        if (allocated) check(sched->moe_ffn->slots.size() == 1,
+                "capped allocation rounds down to complete expert slots");
+        else check(sched->moe_ffn->disabled && ggml_backend_sched_moe_resident_needs_rebuild(sched),
+                "insufficient cap safely requests CPU fallback and a fresh graph");
+        ggml_backend_sched_free(sched);
+    }
+    ggml_backend_free(cpu);
+    ggml_backend_free(cuda);
+}
+#endif
+
 int main(int argc, char ** argv) {
     test_history();
     test_history_boundaries();
@@ -1063,6 +1097,7 @@ int main(int argc, char ** argv) {
     test_cpu_quantized_masked_rows();
     if (argc > 1 && strcmp(argv[1], "--cuda") == 0) {
 #ifdef GGML_USE_CUDA
+        test_cuda_budget_cap();
         test_cuda_copy();
         test_complete_ffn(false, false);
         test_complete_ffn(true, false);

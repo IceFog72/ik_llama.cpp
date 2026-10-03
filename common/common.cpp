@@ -897,6 +897,10 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         }
     }
 
+    if (params.moe_resident_mib > 0 && params.moe_resident != -1) {
+        throw std::invalid_argument("error: --moe-resident-mib requires --moe-resident auto\n");
+    }
+
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
@@ -2176,6 +2180,24 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--moe-resident-mib") {
+        CHECK_ARG
+        if (strcmp(argv[i], "auto") == 0) {
+            params.moe_resident_mib = 0;
+            return true;
+        }
+        try {
+            size_t end = 0;
+            params.moe_resident_mib = std::stoi(argv[i], &end);
+            invalid_param = params.moe_resident_mib < 0 || argv[i][end] != '\0';
+        } catch (const std::exception &) {
+            invalid_param = true;
+        }
+        if (invalid_param) {
+            fprintf(stderr, "error: --moe-resident-mib must be auto or a positive integer within the supported range\n");
+        }
+        return true;
+    }
     if (arg == "--moe-resident") {
         CHECK_ARG
         if (strcmp(argv[i], "auto") == 0) {
@@ -3315,6 +3337,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "       --moe-resident N|auto",   "cache experts on CUDA (N slots per bank pool; auto shares complete experts across layers and splits fused single-GPU decode between CPU/CUDA; default: %d, 0 = disabled)", params.moe_resident });
+    options.push_back({ "*",           "       --moe-resident-mib N|auto", "cap auto expert cache per CUDA backend in MiB (N requires --moe-resident auto; auto = automatic budget; default: %s)", params.moe_resident_mib == 0 ? "auto" : std::to_string(params.moe_resident_mib).c_str() });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fug, --no-fused-up-gate",   "disable fused up-gate (default: %s)", params.fused_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-mmad, --no-fused-mul-multiadd", "disable fused mul-multi_add (default: %s)", params.fused_mmad ? "enabled" : "disabled" });
@@ -4633,6 +4656,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.min_experts       = params.min_experts;
     cparams.thresh_experts    = params.thresh_experts;
     cparams.moe_resident      = params.moe_resident;
+    cparams.moe_resident_mib  = params.moe_resident_mib;
     cparams.only_active_experts = params.only_active_exps;
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
@@ -5681,6 +5705,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "scheduler_async: %s # default: false\n", params.scheduler_async ? "true" : "false");
     fprintf(stream, "ser: %d,%g # default: -1,0\n", params.min_experts, params.thresh_experts);
     fprintf(stream, "moe_resident: %d # default: 0 (FT slice B LRU slots)\n", params.moe_resident);
+    fprintf(stream, "moe_resident_mib: %d # default: 0 (automatic budget)\n", params.moe_resident_mib);
     fprintf(stream, "temp: %f # default: 0.8\n", sparams.temp);
 
     const std::vector<float> tensor_split_vector(params.tensor_split, params.tensor_split + llama_max_devices());

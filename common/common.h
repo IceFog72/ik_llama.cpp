@@ -466,6 +466,7 @@ struct gpt_params {
     bool validate_quants   = false; // if true, check for NaNs while loading the model
     bool only_active_exps  = true;  // if true, offload only active experts (relevant only for hybrid CPU/GPU)
     int  moe_resident      = 0;     // B3: adaptive per-layer active-expert LRU slots per bank pool in VRAM (0 = disabled, -1 = auto)
+    int  moe_resident_mib = 0; // auto cache cap per CUDA backend in MiB (0 = existing automatic budget)
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor
     bool defer_experts     = false; // if true, defer expert mmap residency to speed up model loading (Linux only)
