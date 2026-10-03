@@ -164,6 +164,6 @@ a.out.*
 .github
 
 docs/fork-improvements.md
-examples/ft-bench-bw1/
-bench_baseline1.sh
 GATES1.md
+examples/ft-bench-bw/
+bench_baseline.sh
