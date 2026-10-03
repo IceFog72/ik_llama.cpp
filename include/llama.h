@@ -508,6 +508,7 @@ extern "C" {
         int  min_experts;
         float thresh_experts;
         bool only_active_experts;
+        int  moe_resident;        // FT slice B: resident (layer,expert) LRU slots per bank pool (0 = disabled, -1 = auto)
         bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
         int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)
         bool k_cache_hadamard;  // if true, apply Hadamard transform to K-cache

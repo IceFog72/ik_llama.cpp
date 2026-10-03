@@ -666,6 +666,7 @@ static void why_not_reuse_previous(const llama_batch & u_batch, const llama_cont
 
 bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fingerprint, uint64_t model_state_hash) {
     if (!cparams.graph_reuse) return false;
+    if (ggml_backend_sched_moe_resident_needs_rebuild(sched)) return false;
     if (qsa_pooled_stale) return false; // the rebuild needs a graph with the full pooling window
     auto the_prev = cparams.mtp_op_type == MTP_OP_NONE ? prev.get() : prev_mtp.get();
     if (!the_prev || !the_prev->graph) return false;
@@ -8620,6 +8621,7 @@ struct llama_context_params llama_context_default_params() {
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
         /*.only_active_experts         =*/ false,
+        /*.moe_resident                =*/ 0,
         /*.prefetch_experts            =*/ false,
         /*.prefetch_experts_threads    =*/ 0,
         /*.k_cache_hadamard            =*/ false,
@@ -9150,6 +9152,7 @@ struct llama_context * llama_init_from_model(
     cparams.scheduler_async  = params.scheduler_async;
     cparams.min_experts      = params.min_experts;
     cparams.thresh_experts   = params.thresh_experts;
+    cparams.moe_resident     = params.moe_resident;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.worst_graph_tokens = params.worst_case_tokens;
@@ -9316,6 +9319,10 @@ struct llama_context * llama_init_from_model(
     LLAMA_LOG_INFO("%s: reduce_type   = %s\n",     __func__, ggml_type_name(cparams.reduce_type));
     LLAMA_LOG_INFO("%s: sched_async   = %d\n",     __func__, cparams.scheduler_async);
     LLAMA_LOG_INFO("%s: ser           = %d, %g\n", __func__, cparams.min_experts, cparams.thresh_experts);
+    if (cparams.moe_resident != 0) {
+        LLAMA_LOG_INFO("%s: moe_resident = %s\n", __func__,
+                cparams.moe_resident < 0 ? "auto" : format("%d slots per bank pool", cparams.moe_resident).c_str());
+    }
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n",   __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",     __func__, cparams.rope_freq_scale);
     if (cparams.cuda_params) {
@@ -9663,6 +9670,9 @@ struct llama_context * llama_init_from_model(
             pipeline_parallel = false;
 #endif
             ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, pipeline_parallel);
+            ggml_backend_sched_set_moe_resident_model_info(ctx->sched,
+                    model->hparams.n_layer, model->hparams.n_expert, model->hparams.n_expert_used);
+            ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
 
             if (pipeline_parallel) {
                 LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->sched));
@@ -9691,6 +9701,9 @@ struct llama_context * llama_init_from_model(
                 if (pipeline_parallel) {
                     LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                     ctx->sched = ggml_backend_sched_new(ctx->backends.data(), backend_buft.data(), ctx->backends.size(), max_nodes, false);
+                    ggml_backend_sched_set_moe_resident_model_info(ctx->sched,
+                            model->hparams.n_layer, model->hparams.n_expert, model->hparams.n_expert_used);
+                    ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }
                 if (!gf_success) {

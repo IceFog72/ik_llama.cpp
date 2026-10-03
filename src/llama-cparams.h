@@ -53,6 +53,7 @@ struct llama_cparams {
     bool scheduler_async;
     int  min_experts;
     float thresh_experts;
+    int  moe_resident;   // FT slice B: resident (layer,expert) LRU slots per bank pool (0 = disabled, -1 = auto)
     bool mtp;
     int  worst_graph_tokens;
     int  dflash_query_capacity = 0; // internal DFlash query capacity override

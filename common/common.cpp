@@ -2176,6 +2176,19 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--moe-resident") {
+        CHECK_ARG
+        if (strcmp(argv[i], "auto") == 0) {
+            params.moe_resident = -1;
+        } else {
+            params.moe_resident = std::stoi(argv[i]);
+            if (params.moe_resident < 0) {
+                fprintf(stderr, "error: --moe-resident must be >= 0 or auto\n");
+                invalid_param = true;
+            }
+        }
+        return true;
+    }
     if (arg == "-co" || arg == "--color") {
         params.use_color = true;
         return true;
@@ -3301,6 +3314,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
+    options.push_back({ "*",           "       --moe-resident N|auto",   "cache experts on CUDA (N slots per bank pool; auto shares complete experts across layers and splits fused single-GPU decode between CPU/CUDA; default: %d, 0 = disabled)", params.moe_resident });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fug, --no-fused-up-gate",   "disable fused up-gate (default: %s)", params.fused_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-mmad, --no-fused-mul-multiadd", "disable fused mul-multi_add (default: %s)", params.fused_mmad ? "enabled" : "disabled" });
@@ -4618,6 +4632,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.scheduler_async   = params.scheduler_async;
     cparams.min_experts       = params.min_experts;
     cparams.thresh_experts    = params.thresh_experts;
+    cparams.moe_resident      = params.moe_resident;
     cparams.only_active_experts = params.only_active_exps;
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
@@ -5665,6 +5680,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "reduce_type: %s # default f16\n", params.reduce_type.c_str());
     fprintf(stream, "scheduler_async: %s # default: false\n", params.scheduler_async ? "true" : "false");
     fprintf(stream, "ser: %d,%g # default: -1,0\n", params.min_experts, params.thresh_experts);
+    fprintf(stream, "moe_resident: %d # default: 0 (FT slice B LRU slots)\n", params.moe_resident);
     fprintf(stream, "temp: %f # default: 0.8\n", sparams.temp);
 
     const std::vector<float> tensor_split_vector(params.tensor_split, params.tensor_split + llama_max_devices());

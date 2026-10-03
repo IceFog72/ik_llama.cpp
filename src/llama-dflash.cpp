@@ -531,6 +531,11 @@ bool llama_prepare_dflash_graph_inputs(
         }
 
         lctx.dflash.kv.cache_sched = ggml_backend_sched_new(lctx.backends.data(), backend_buft.data(), lctx.backends.size(), max_nodes, false);
+        if (lctx.dflash.kv.cache_sched != nullptr) {
+            ggml_backend_sched_set_moe_resident_model_info(lctx.dflash.kv.cache_sched,
+                    lctx.model.hparams.n_layer, lctx.model.hparams.n_expert, lctx.model.hparams.n_expert_used);
+            ggml_backend_sched_set_moe_resident(lctx.dflash.kv.cache_sched, lctx.cparams.moe_resident);
+        }
         const bool reserved = lctx.dflash.kv.cache_sched != nullptr && ggml_backend_sched_reserve(lctx.dflash.kv.cache_sched, gf_reserve);
         if (!reserved) {
             LLAMA_LOG_ERROR("%s: failed to initialize DFlash K/V scheduler\n", __func__);
@@ -562,6 +567,7 @@ bool llama_prepare_dflash_graph_inputs(
         lctx.dflash.kv.cache_update_rows = update_rows;
         ggml_cgraph * gf_kv = nullptr;
         const bool can_reuse_kv_graph = lctx.dflash.kv.cache_graph != nullptr &&
+                !ggml_backend_sched_moe_resident_needs_rebuild(lctx.dflash.kv.cache_sched) &&
                 lctx.dflash.kv.cache_graph_rows == update_rows &&
                 (lctx.model.hparams.dflash_dsv4 ||
                  lctx.dflash.kv.cache_graph_write_pos == lctx.dflash.kv.cache_write_pos);

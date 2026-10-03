@@ -3,20 +3,32 @@
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
 #include "ggml-moe-prefetch.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#include "ggml-cuda/moe-resident.h"
+#endif
 
 #include <cassert>
+#include <cctype>
 #include <climits>
+#include <cstdint>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <vector>
 #include <set>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <barrier>
 #include <thread>
+#include <condition_variable>
+#include <mutex>
+#include <memory>
+#include <unordered_map>
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -1165,6 +1177,240 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+enum ggml_backend_sched_moe_bank_role {
+    GGML_MOE_BANK_UNKNOWN = 0,
+    GGML_MOE_BANK_GATE_UP,
+    GGML_MOE_BANK_UP,
+    GGML_MOE_BANK_GATE,
+    GGML_MOE_BANK_DOWN,
+};
+
+static const char * ggml_backend_sched_moe_bank_role_name(
+        ggml_backend_sched_moe_bank_role role) {
+    switch (role) {
+        case GGML_MOE_BANK_GATE_UP: return "GATE_UP";
+        case GGML_MOE_BANK_UP:      return "UP";
+        case GGML_MOE_BANK_GATE:    return "GATE";
+        case GGML_MOE_BANK_DOWN:    return "DOWN";
+        case GGML_MOE_BANK_UNKNOWN: return "UNKNOWN";
+    }
+    return "UNKNOWN";
+}
+
+struct ggml_backend_sched_moe_resident_entry {
+    const ggml_tensor * bank;
+    const void * data;
+    int layer_id;
+    int32_t expert;
+    size_t expert_bytes;
+    size_t copy_bytes;
+};
+
+struct ggml_backend_sched_moe_resident_bank {
+    const ggml_tensor * bank;
+    const void * data;
+    int layer_id;
+};
+
+struct ggml_backend_sched_moe_route_state {
+    std::vector<int32_t> ids;
+    std::vector<uint32_t> unique_ids;
+    std::vector<int32_t> ordered_unique_ids;
+    std::vector<uint32_t> frequencies;
+    const ggml_tensor * last_ids_tensor = nullptr;
+    int n_expert = 0;
+    size_t tensor_reads = 0;
+    size_t tensor_syncs = 0;
+    size_t tensor_reuses = 0;
+    std::vector<int> history_layers;
+    const ggml_tensor * history_ids_tensor = nullptr;
+    int hybrid_layer = -1;
+    std::vector<int32_t> hybrid_route;
+    std::vector<int32_t> gpu_experts;
+    bool valid = true;
+    size_t invalid_ids = 0;
+};
+
+// Decode scratch is allocated lazily and reused across caller graphs.
+struct ggml_backend_sched_moe_decode {
+    ggml_backend_buffer_t activation = nullptr;
+    ggml_backend_buffer_t output = nullptr;
+    ggml_backend_buffer_t host_ids = nullptr;
+    ggml_backend_buffer_t device_ids = nullptr;
+    struct measurement {
+        ggml_type type;
+        ggml_op op;
+        int64_t columns, rows;
+        double transfer_to_host_ratio;
+    };
+    std::vector<measurement> measurements;
+    std::vector<int32_t> gpu_ids;
+    ggml_backend_sched_split * prepared_split = nullptr;
+    uint64_t cpu_refs = 0, gpu_refs = 0, avoided_bytes = 0, operators = 0;
+    ~ggml_backend_sched_moe_decode() {
+        ggml_backend_buffer_free(activation);
+        ggml_backend_buffer_free(output);
+        ggml_backend_buffer_free(host_ids);
+        ggml_backend_buffer_free(device_ids);
+    }
+};
+
+// One complete-expert slot mapping is shared by all projections and layers.
+// Task descriptors have scheduler lifetime. Host I/O has a single owner, and
+// its completion event is waited before reuse or destruction.
+struct ggml_backend_sched_moe_ffn {
+    struct task {
+        int layer = -1;
+        ggml_tensor * up = nullptr, * down = nullptr;
+        ggml_tensor * banks[3]{};
+        ggml_tensor host_act{}, host_ids{}, host_up{}, host_down{};
+        ggml_tensor device_ids{}, device_banks[3]{}, device_up{}, device_down{};
+        ggml_tensor device_cpu{};
+        ggml_tensor * host_nodes[2]{}, * device_nodes[2]{};
+        ggml_cgraph host_graph{}, device_graph{};
+        std::vector<int32_t> route_gpu;
+    };
+    struct slot {
+        int layer = -1, expert = -1;
+        const ggml_tensor * banks[3]{};
+        const void * data[3]{};
+        uint64_t used = 0;
+    };
+    struct timing {
+        ggml_type types[3]{};
+        int64_t columns = 0, rows = 0;
+        int32_t params[GGML_MAX_OP_PARAMS / sizeof(int32_t)]{};
+        struct sample { int count = 0; double us = 0; };
+        std::vector<std::vector<sample>> misses;
+        uint64_t visits = 0;
+    };
+    std::vector<std::unique_ptr<task>> tasks;
+    std::unordered_map<const ggml_tensor *, task *> graph_tasks;
+    std::vector<slot> slots;
+    std::unordered_map<uint64_t, int> slot_index;
+    std::vector<timing> timings;
+    size_t strides[3]{}, offsets[3]{}, allocation_bytes = 0;
+    ggml_backend_buffer_t cache = nullptr;
+    ggml_backend_buffer_t activation = nullptr, intermediate = nullptr, output = nullptr;
+    ggml_backend_buffer_t ids = nullptr, device_ids = nullptr, device_cpu = nullptr;
+    ggml_backend_event_t completion = nullptr;
+    bool pending = false, disabled = false;
+    uint64_t clock = 0, layers = 0, hits = 0, fills = 0, evictions = 0;
+    uint64_t cpu_refs = 0, gpu_refs = 0, host_bytes = 0, result_bytes = 0;
+    size_t budget_bytes = 0, reserve_bytes = 0;
+    std::vector<int32_t> gpu_ids, cpu_ids;
+    std::mutex mutex;
+    std::condition_variable wake, done;
+    std::thread worker;
+    ggml_backend_t cpu = nullptr;
+    task * job = nullptr;
+    bool stop = false, busy = false;
+    ggml_status status = GGML_STATUS_SUCCESS;
+
+    void wait_io() {
+        if (pending) { ggml_backend_event_synchronize(completion); pending = false; }
+    }
+    void submit(task & t) {
+        std::lock_guard<std::mutex> lock(mutex);
+        GGML_ASSERT(!busy);
+        job = &t; busy = true;
+        if (!worker.joinable()) {
+            worker = std::thread([this] {
+                std::unique_lock<std::mutex> lock(mutex);
+                for (;;) {
+                    wake.wait(lock, [this] { return stop || busy; });
+                    if (stop) break;
+                    auto * current = job;
+                    lock.unlock();
+                    auto result = ggml_backend_graph_compute(cpu, &current->host_graph);
+                    lock.lock();
+                    status = result; busy = false;
+                    done.notify_one();
+                }
+            });
+        }
+        wake.notify_one();
+    }
+    ggml_status finish() {
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [this] { return !busy; });
+        return status;
+    }
+    ~ggml_backend_sched_moe_ffn() {
+        finish();
+        { std::lock_guard<std::mutex> lock(mutex); stop = true; }
+        wake.notify_one();
+        if (worker.joinable()) worker.join();
+        wait_io();
+        ggml_backend_event_free(completion);
+        for (auto buffer : {cache, activation, intermediate, output, ids, device_ids, device_cpu})
+            ggml_backend_buffer_free(buffer);
+    }
+};
+
+static void ggml_backend_sched_moe_ffn_scan(ggml_backend_sched_t sched, const ggml_cgraph * graph);
+static bool ggml_backend_sched_moe_ffn_node(ggml_backend_sched_t sched, const ggml_tensor * node);
+static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched,
+        ggml_backend_sched_moe_ffn::task & task, ggml_backend_t gpu);
+
+struct ggml_backend_sched_moe_resident_pool {
+    ggml_backend_buffer_type_t buft;
+    ggml_backend_sched_moe_bank_role role;
+    ggml_backend_buffer_t buffer;
+    void * base;
+    size_t key_slot_bytes;
+    size_t slot_bytes;
+    size_t allocation_bytes;
+    int slots;
+    int layers;
+    int min_layer_slots;
+    int cached_layers;
+    int base_layer_slots;
+    int remainder_layer_slots;
+    int * layer_slots;
+    size_t * layer_begins;
+    uint64_t clock;
+    uint64_t lookups;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t admissions;
+    uint64_t evictions;
+    uint64_t bypasses;
+    uint64_t host_bytes;
+    uint64_t device_bytes;
+    ggml_backend_sched_moe_resident_entry * entries;
+    uint64_t * last_used;
+    ggml_backend_sched_moe_resident_bank * layer_banks;
+    bool auto_sized;
+    bool disabled;
+};
+
+struct ggml_backend_sched_moe_resident_pools {
+    ggml_backend_sched_moe_resident_pool * pools;
+    int n_pools;
+    int capacity;
+};
+
+struct ggml_backend_sched_moe_resident_budget {
+    bool initialized;
+    bool unavailable;
+    bool warning_printed;
+    size_t initial_free_bytes;
+    size_t safety_reserve_bytes;
+    size_t budget_bytes;
+    size_t allocated_bytes;
+};
+
+static bool ggml_backend_sched_moe_resident_init_auto_budget(
+        ggml_backend_sched_t sched, int backend_id, ggml_backend_t backend);
+
+// Defined below (after pool helpers); position-independent name parsing used
+// by both the placement gate above and the copy path below.
+static bool ggml_backend_sched_moe_parse_layer_id(
+        const ggml_tensor * tensor,
+        int n_layers,
+        int & layer_id);
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1222,6 +1468,69 @@ struct ggml_backend_sched {
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
 
     bool only_active_experts;
+    int moe_resident_slots;
+    int moe_resident_layers;
+    int moe_resident_n_expert;
+    int moe_resident_n_expert_used;
+    ggml_backend_sched_moe_resident_pools moe_resident[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_sched_moe_resident_budget moe_resident_budget[GGML_SCHED_MAX_BACKENDS];
+    // B4 hybrid placement: which blk.<N> layers force their MoE ops to CUDA.
+    // Planned from measured hit/miss traffic; POD manual-memory like the rest.
+    uint8_t * moe_resident_hybrid_gpu_layers;
+    int moe_resident_hybrid_layers;
+    // Static pre-split B4 plan geometry. Indexed as [layer * (GGML_MOE_BANK_DOWN + 1) + role],
+    // where role is one of GATE_UP..DOWN (UNKNOWN stays zero). The value is the
+    // resident slot size for that bank geometry. This breaks the cold-start cycle:
+    // placement is decided before copy_inputs() can observe resident hits.
+    size_t * moe_resident_hybrid_slot_bytes;
+    int moe_resident_hybrid_target_slots;
+    bool moe_resident_hybrid_plan_ready;
+    bool moe_resident_replan_required;
+    // Why a layer did not qualify for the complete-FFN path. Reported once so a
+    // model or flag combination that falls off the fast path is visible. Kept
+    // deliberately fine-grained: a coarse bucket makes the common case (prefill
+    // batch graphs) indistinguishable from a real incompatibility.
+    enum { MOE_FFN_R_GUARD,        // scan declined entirely (wrong backend shape, disabled)
+           MOE_FFN_R_OP_NOT_PAIR,  // node after up is not MUL_MAT_ID, or srcs unwired
+           MOE_FFN_R_OP_WIRING,    // up used by >1 node, is graph output, or has extra src4/5
+           MOE_FFN_R_OP_LAYOUT,    // up/down not F32 or not contiguous
+           MOE_FFN_R_PLACEMENT,    // tensor assigned to a non-default backend
+           MOE_FFN_R_ACT_IDS_NULL, // activation or routing metadata missing
+           MOE_FFN_R_ACT_IDS_DTYPE,// activation not F32, or ids not I32
+           MOE_FFN_R_ACT_BATCH,    // activation batch dim != 1 (prefill)
+           MOE_FFN_R_IDS_BATCH,    // ids batch dim != 1 (prefill)
+           MOE_FFN_R_IDS_WIDTH,    // ids width != n_expert_used
+           MOE_FFN_R_ACT_IDS_LAYOUT,
+           MOE_FFN_R_BANK_NULL,
+           MOE_FFN_R_BANK_NOT_HOST,// weights not in host memory (fully offloaded)
+           MOE_FFN_R_BANK_USAGE,   // buffer is not a weights buffer
+           MOE_FFN_R_BANK_UNQUANT, // bank is not quantized
+           MOE_FFN_R_BANK_LAYOUT,  // bank not contiguous
+           MOE_FFN_R_BANK_WIDTH,   // bank ne[2] != n_expert or ne[3] != 1
+           MOE_FFN_R_BANK_LAYER_ID,// layer id unparseable, or banks disagree
+           MOE_FFN_R_UNSUPPORTED,  // backend does not support the op
+           MOE_FFN_R_REPEATED,     // same layer seen twice in one graph
+           MOE_FFN_R_SCRATCH,      // pinned scratch buffers could not be allocated
+           MOE_FFN_R_COUNT };
+    uint64_t moe_ffn_reject_n[MOE_FFN_R_COUNT] = {};
+    uint64_t moe_ffn_candidates = 0, moe_ffn_qualified_events = 0, moe_ffn_qualified_layers = 0;
+    // Which layers qualified on the decode graph. Lets a porting check name the
+    // layers that fell off the fast path instead of only counting them.
+    std::vector<uint8_t> moe_ffn_qualified_layer;
+    bool moe_ffn_scan_reported = false;
+    ggml_backend_sched_moe_decode * moe_decode;
+    ggml_backend_sched_moe_ffn * moe_ffn;
+    uint32_t * moe_resident_route_use_counts;
+    uint64_t * moe_resident_route_last_seen;
+    int moe_resident_route_layers;
+    int moe_resident_route_experts;
+    uint64_t * moe_resident_route_layer_epochs;
+    uint64_t moe_route_reads;
+    uint64_t moe_route_syncs;
+    uint64_t moe_route_reuses;
+    uint64_t moe_route_active_references;
+    uint64_t moe_route_unique_experts;
+    uint64_t moe_route_invalid_ids;
     bool split_mode_graph;
     bool is_async = false;
     bool debug;
@@ -1248,6 +1557,55 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+void ggml_backend_sched_set_moe_resident(ggml_backend_sched_t sched, int slots) {
+    if (!sched) return;
+    const int next_slots = slots < -1 ? 0 : slots;
+    if (next_slots != sched->moe_resident_slots && sched->is_alloc) sched->moe_resident_replan_required = true;
+    sched->moe_resident_slots = next_slots;
+    if (sched->moe_resident_layers <= 0) {
+        sched->moe_resident_layers = 1;
+    }
+#ifdef GGML_USE_CUDA
+    if (sched->moe_resident_slots < 0) {
+        for (int i = 0; i < sched->n_backends; ++i) {
+            if (ggml_backend_is_cuda(sched->backends[i])) {
+                ggml_backend_sched_moe_resident_init_auto_budget(sched, i, sched->backends[i]);
+            }
+        }
+    }
+#endif
+}
+
+void ggml_backend_sched_set_moe_resident_layers(ggml_backend_sched_t sched, int n_layers) {
+    if (!sched) return;
+    sched->moe_resident_layers = std::max(1, n_layers);
+}
+
+bool ggml_backend_sched_moe_resident_needs_rebuild(ggml_backend_sched_t sched) {
+    return sched != nullptr && sched->moe_resident_replan_required;
+}
+
+void ggml_backend_sched_set_moe_resident_model_info(
+        ggml_backend_sched_t sched, int n_layers, int n_expert, int n_expert_used) {
+    if (!sched) return;
+    sched->moe_resident_layers = std::max(1, n_layers);
+    sched->moe_resident_n_expert = std::max(0, n_expert);
+    sched->moe_resident_n_expert_used = std::max(0, std::min(n_expert, n_expert_used));
+    // B4 hybrid plan follows model geometry, not pool encounter order. Any
+    // stale per-layer GPU/CPU intent from a previous geometry is dropped here
+    // so placement can never force a layer the new model does not own.
+    if (sched->moe_resident_hybrid_layers != sched->moe_resident_layers) {
+        free(sched->moe_resident_hybrid_gpu_layers);
+        free(sched->moe_resident_hybrid_slot_bytes);
+        sched->moe_resident_hybrid_gpu_layers = nullptr;
+        sched->moe_resident_hybrid_slot_bytes = nullptr;
+        sched->moe_resident_hybrid_layers = 0;
+        sched->moe_resident_hybrid_target_slots = 0;
+        sched->moe_resident_hybrid_plan_ready = false;
+        sched->moe_resident_replan_required = false;
+    }
 }
 
 void ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async) {
@@ -1333,6 +1691,71 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS*GGML_SCHED
 #define GET_CAUSE(node) ""
 #endif
 
+static bool ggml_backend_sched_moe_resident_requested(
+        ggml_backend_sched_t sched, ggml_backend_t backend) {
+#ifdef GGML_USE_CUDA
+    if (sched->moe_resident_slots == 0 || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    if (sched->moe_resident_slots > 0) {
+        return true;
+    }
+    const int backend_id = ggml_backend_sched_backend_id(sched, backend);
+    return backend_id >= 0 && backend_id < GGML_SCHED_MAX_BACKENDS &&
+            !sched->moe_resident_budget[backend_id].unavailable;
+#else
+    GGML_UNUSED(sched);
+    GGML_UNUSED(backend);
+    return false;
+#endif
+}
+
+static bool ggml_backend_sched_force_moe_offload(
+        ggml_backend_sched_t sched,
+        ggml_backend_t backend,
+        const ggml_tensor * tensor) {
+#ifdef GGML_USE_CUDA
+    if (!ggml_backend_sched_moe_resident_requested(sched, backend) ||
+            (tensor->op != GGML_OP_MUL_MAT_ID && tensor->op != GGML_OP_MOE_FUSED_UP_GATE)) {
+        return false;
+    }
+    if (ggml_backend_sched_moe_ffn_node(sched, tensor)) return true;
+    // Positive N keeps the pre-B4 meaning: the user explicitly requested a
+    // resident pool size, so every supported MoE op may be offloaded. Only
+    // `auto` uses the CPU/GPU hybrid layer plan below.
+    if (sched->moe_resident_slots > 0) {
+        return true;
+    }
+    // B4 hybrid placement: only layers the planner marked GPU-bound move to
+    // CUDA. Every other layer keeps the baseline path (CPU MoE compute under
+    // -cmoe), so the cache accelerates hot layers instead of streaming cold
+    // weights over PCIe. An empty plan means "no evidence yet", which is
+    // also baseline placement -- never a global force.
+    if (sched->moe_resident_hybrid_gpu_layers == nullptr || sched->moe_resident_hybrid_layers <= 0) {
+        return false;
+    }
+    // The MoE op node itself is named like ffn_moe_down-N, which carries no
+    // layer identity. The expert bank in its sources does (blk.<N>.ffn_*).
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        const ggml_tensor * src = tensor->src[i];
+        if (src == nullptr) {
+            continue;
+        }
+        int layer_id = -1;
+        if (ggml_backend_sched_moe_parse_layer_id(src, sched->moe_resident_hybrid_layers, layer_id) &&
+                layer_id >= 0 && layer_id < sched->moe_resident_hybrid_layers) {
+            return sched->moe_resident_hybrid_gpu_layers[layer_id] != 0;
+        }
+    }
+    return false;
+#else
+    GGML_UNUSED(sched);
+    GGML_UNUSED(backend);
+    GGML_UNUSED(tensor);
+    return false;
+#endif
+}
+
 // returns the backend that should be used for the node based on the current locations
 static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, struct ggml_tensor * tensor) {
     // TODO: use supports_op to check if the backend supports the op
@@ -1372,8 +1795,10 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             // check if a backend with higher prio wants to offload the op
             if (offload_enabled && src_backend_id == sched->n_backends - 1) {
                 for (int b = 0; b < src_backend_id; b++) {
-                    if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
-                        SET_CAUSE(tensor, "1.off");
+                    if (ggml_backend_supports_op(sched->backends[b], tensor) &&
+                            (ggml_backend_sched_force_moe_offload(sched, sched->backends[b], tensor) ||
+                             ggml_backend_offload_op(sched->backends[b], tensor))) {
+                        SET_CAUSE(tensor, ggml_backend_sched_force_moe_offload(sched, sched->backends[b], tensor) ? "1.moe-resident" : "1.off");
                         return b;
                     }
                 }
@@ -1776,10 +2201,13 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
 
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
+            const bool ffn_boundary = ggml_backend_sched_moe_ffn_node(sched, node) ||
+                    (i > 0 && ggml_backend_sched_moe_ffn_node(sched, graph->nodes[i - 1]));
             if (node->op == GGML_OP_REDUCE) {
                 sched->has_reduce = true;
             }
-            if ((node->op == GGML_OP_ADD && node->op_params[0] == 0xff) ||
+            if ((ffn_boundary && split->i_start < i) ||
+                (node->op == GGML_OP_ADD && node->op_params[0] == 0xff) ||
                  node->op == GGML_OP_REDUCE ||
                  node->op == GGML_OP_FAKE_CPY ||
                  node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == 0xff) {
@@ -1866,6 +2294,11 @@ static void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct gg
                     }
                 }
 
+                // Complete-FFN decode reads host banks on CPU and compact
+                // resident banks on CUDA. Do not allocate full-bank staging.
+                if (ggml_backend_sched_moe_ffn_node(sched, node) && src->buffer &&
+                        ggml_backend_buffer_is_host(src->buffer) &&
+                        ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) continue;
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
@@ -2036,9 +2469,1229 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split, std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
-        std::vector<int32_t> & ids, std::vector<uint32_t> & unique_ids, ggml_tensor * last_ids_tensor) {
+static void ggml_backend_sched_moe_resident_clear_storage(
+        ggml_backend_sched_moe_resident_pool * pool,
+        ggml_backend_sched_moe_resident_budget * budget = nullptr) {
+    if (budget != nullptr && pool->allocation_bytes <= budget->allocated_bytes) {
+        budget->allocated_bytes -= pool->allocation_bytes;
+    }
+    if (pool->buffer != nullptr) {
+        ggml_backend_buffer_free(pool->buffer);
+    }
+    free(pool->entries);
+    free(pool->last_used);
+    free(pool->layer_banks);
+    free(pool->layer_slots);
+    free(pool->layer_begins);
+    pool->buffer = nullptr;
+    pool->base = nullptr;
+    pool->slot_bytes = 0;
+    pool->allocation_bytes = 0;
+    pool->slots = 0;
+    pool->layers = 0;
+    pool->min_layer_slots = 0;
+    pool->cached_layers = 0;
+    pool->base_layer_slots = 0;
+    pool->remainder_layer_slots = 0;
+    pool->layer_slots = nullptr;
+    pool->layer_begins = nullptr;
+    pool->clock = 0;
+    pool->entries = nullptr;
+    pool->last_used = nullptr;
+    pool->layer_banks = nullptr;
+    pool->auto_sized = false;
+}
+
+static ggml_backend_sched_moe_resident_pool * ggml_backend_sched_moe_resident_get_pool(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        ggml_backend_buffer_type_t buft,
+        ggml_backend_sched_moe_bank_role role,
+        size_t key_slot_bytes) {
+    if (role == GGML_MOE_BANK_UNKNOWN) {
+        return nullptr;
+    }
+    auto & pools = sched->moe_resident[backend_id];
+    for (int i = 0; i < pools.n_pools; ++i) {
+        if (pools.pools[i].buft == buft && pools.pools[i].role == role &&
+                pools.pools[i].key_slot_bytes == key_slot_bytes) {
+            return &pools.pools[i];
+        }
+    }
+
+    if (pools.n_pools == pools.capacity) {
+        if (pools.capacity > INT_MAX / 2) {
+            return nullptr;
+        }
+        const int new_capacity = pools.capacity == 0 ? 4 : pools.capacity * 2;
+        if (new_capacity <= pools.capacity ||
+                static_cast<size_t>(new_capacity) > SIZE_MAX / sizeof(pools.pools[0])) {
+            return nullptr;
+        }
+        auto * new_pools = static_cast<ggml_backend_sched_moe_resident_pool *>(
+                realloc(pools.pools, static_cast<size_t>(new_capacity) * sizeof(pools.pools[0])));
+        if (new_pools == nullptr) {
+            return nullptr;
+        }
+        std::memset(new_pools + pools.capacity, 0,
+                static_cast<size_t>(new_capacity - pools.capacity) * sizeof(new_pools[0]));
+        pools.pools = new_pools;
+        pools.capacity = new_capacity;
+    }
+
+    auto * pool = &pools.pools[pools.n_pools++];
+    pool->buft = buft;
+    pool->role = role;
+    pool->key_slot_bytes = key_slot_bytes;
+    return pool;
+}
+
+static bool ggml_backend_sched_moe_resident_init_auto_budget(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        ggml_backend_t backend) {
+    auto & budget = sched->moe_resident_budget[backend_id];
+    if (budget.initialized) {
+        return !budget.unavailable;
+    }
+    budget.initialized = true;
+
+#ifdef GGML_USE_CUDA
+    const int device = ggml_backend_cuda_get_device(backend);
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (device >= 0) {
+        ggml_backend_cuda_get_device_memory(device, &free_bytes, &total_bytes);
+    }
+    if (free_bytes == 0) {
+        budget.unavailable = true;
+    } else {
+        budget.initial_free_bytes = free_bytes;
+        budget.budget_bytes = free_bytes / 10;
+        budget.safety_reserve_bytes = free_bytes - budget.budget_bytes;
+        budget.unavailable = budget.budget_bytes == 0;
+        if (!budget.unavailable) {
+            fprintf(stderr,
+                    "ggml_backend_sched: moe-resident auto budget backend=%s initial_free=%zu MiB budget=%zu MiB reserve=%zu MiB\n",
+                    ggml_backend_name(backend), budget.initial_free_bytes / (1024 * 1024),
+                    budget.budget_bytes / (1024 * 1024), budget.safety_reserve_bytes / (1024 * 1024));
+        }
+    }
+    GGML_UNUSED(total_bytes);
+#else
+    GGML_UNUSED(backend);
+    budget.unavailable = true;
+#endif
+
+    if (budget.unavailable && !budget.warning_printed) {
+        fprintf(stderr, "ggml_backend_sched: moe-resident auto unavailable; using normal expert placement\n");
+        budget.warning_printed = true;
+    }
+    return !budget.unavailable;
+}
+
+static int ggml_backend_sched_moe_resident_auto_slots(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        size_t slot_bytes,
+        int layers,
+        int min_layer_slots) {
+    auto & budget = sched->moe_resident_budget[backend_id];
+    if (slot_bytes == 0 || budget.unavailable || budget.budget_bytes <= budget.allocated_bytes) {
+        return 0;
+    }
+
+    constexpr int pool_reserve = 4;
+    const int pool_index = std::max(0, sched->moe_resident[backend_id].n_pools - 1);
+    const int shares = std::max(1, pool_reserve - std::min(pool_index, pool_reserve - 1));
+    const size_t remaining = budget.budget_bytes - budget.allocated_bytes;
+    const size_t pool_budget = remaining / static_cast<size_t>(shares);
+    size_t slots = pool_budget / slot_bytes;
+    slots = std::min(slots, static_cast<size_t>(std::max(1, layers)) * 32);
+    if (slots < static_cast<size_t>(std::max(1, min_layer_slots)) || slots > static_cast<size_t>(INT_MAX)) {
+        return 0;
+    }
+    return static_cast<int>(slots);
+}
+
+static void ggml_backend_sched_moe_resident_disable_auto(
+        ggml_backend_sched_moe_resident_budget * budget, const char * reason) {
+    if (budget == nullptr) {
+        return;
+    }
+    budget->unavailable = true;
+    if (!budget->warning_printed) {
+        fprintf(stderr, "ggml_backend_sched: moe-resident auto disabled: %s; using uncached expert copies (existing graph placement retained)\n", reason);
+        budget->warning_printed = true;
+    }
+}
+
+static bool ggml_backend_sched_moe_resident_prepare(
+        ggml_backend_sched_moe_resident_pool * pool,
+        ggml_backend_t backend,
+        ggml_backend_buffer_type_t buft,
+        int slots,
+        int layers,
+        int min_layer_slots,
+        size_t slot_bytes,
+        ggml_backend_sched_moe_resident_budget * budget,
+        ggml_backend_sched_t sched = nullptr) {
+    if (pool->disabled || slots <= 0 || layers <= 0 || min_layer_slots <= 0 || slot_bytes == 0) {
+        ggml_backend_sched_moe_resident_disable_auto(budget, "invalid pool geometry");
+        return false;
+    }
+
+    const int per_layer_limit = sched && sched->moe_resident_slots < 0
+            ? std::max(32, sched->moe_resident_hybrid_target_slots) : 32;
+    const size_t max_slots = size_t(std::max(1, layers)) * size_t(per_layer_limit);
+    slots = int(std::min(size_t(slots), std::min(max_slots, size_t(INT_MAX))));
+
+    // In B4 auto mode, quota is assigned only to layers that the pre-split
+    // hybrid planner selected *and* whose bank geometry matches this pool.
+    // This prevents the old "first N layers" quota from reserving VRAM for
+    // layers that can never look up this role/geometry (the 80 MiB DOWN waste).
+    const bool hybrid_auto = budget != nullptr && sched != nullptr &&
+            sched->moe_resident_slots < 0 && sched->moe_resident_hybrid_plan_ready &&
+            sched->moe_resident_hybrid_gpu_layers != nullptr &&
+            sched->moe_resident_hybrid_slot_bytes != nullptr &&
+            sched->moe_resident_hybrid_layers == layers &&
+            sched->moe_resident_hybrid_target_slots >= min_layer_slots;
+    int hybrid_eligible_layers = 0;
+    if (hybrid_auto) {
+        for (int layer = 0; layer < layers; ++layer) {
+            const size_t planned_slot = sched->moe_resident_hybrid_slot_bytes[
+                    static_cast<size_t>(layer) * (GGML_MOE_BANK_DOWN + 1) + pool->role];
+            if (sched->moe_resident_hybrid_gpu_layers[layer] != 0 && planned_slot == slot_bytes) {
+                ++hybrid_eligible_layers;
+            }
+        }
+        const size_t planned_slots = static_cast<size_t>(hybrid_eligible_layers) *
+                static_cast<size_t>(sched->moe_resident_hybrid_target_slots);
+        if (planned_slots == 0 || planned_slots > static_cast<size_t>(INT_MAX)) {
+            return false;
+        }
+        slots = std::min(slots, static_cast<int>(planned_slots));
+    }
+
+    const int cached_layers = hybrid_auto ? hybrid_eligible_layers :
+            std::min(layers, slots / min_layer_slots);
+    if (cached_layers <= 0) {
+        ggml_backend_sched_moe_resident_disable_auto(budget, "resident budget cannot hold one layer");
+        return false;
+    }
+
+    if (pool->buffer != nullptr && pool->slots == slots && pool->layers == layers &&
+            pool->min_layer_slots == min_layer_slots && pool->slot_bytes >= slot_bytes) {
+        return true;
+    }
+
+    if (slot_bytes > SIZE_MAX / static_cast<size_t>(slots)) {
+        pool->disabled = true;
+        ggml_backend_sched_moe_resident_disable_auto(budget, "resident size overflow");
+        return false;
+    }
+
+    const size_t total_bytes = slot_bytes * static_cast<size_t>(slots);
+    const size_t max_bytes = ggml_backend_buft_get_max_size(buft);
+    if (max_bytes != SIZE_MAX && total_bytes > max_bytes) {
+        pool->disabled = true;
+        ggml_backend_sched_moe_resident_disable_auto(budget, "backend buffer limit");
+        return false;
+    }
+    if (budget != nullptr) {
+        const size_t reusable_bytes = std::min(pool->allocation_bytes, budget->allocated_bytes);
+        const size_t available_bytes = budget->budget_bytes - budget->allocated_bytes + reusable_bytes;
+        if (total_bytes > available_bytes) {
+            pool->disabled = true;
+            fprintf(stderr, "ggml_backend_sched: resident pool exceeds auto budget (%zu > %zu bytes)\n",
+                    total_bytes, available_bytes);
+            ggml_backend_sched_moe_resident_disable_auto(budget, "pool exceeds backend-wide budget");
+            return false;
+        }
+    }
+
+    // A larger expert geometry invalidates all resident entries.  The scheduler
+    // already synchronizes the destination before overwriting its copy inputs;
+    // synchronize here as well because this buffer is not part of the graph.
+    if (pool->buffer != nullptr) {
+        ggml_backend_synchronize(backend);
+        ggml_backend_sched_moe_resident_clear_storage(pool, budget);
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, total_bytes);
+    if (buffer == nullptr) {
+        pool->disabled = true;
+        ggml_backend_sched_moe_resident_disable_auto(budget, "device allocation failed");
+        return false;
+    }
+
+    auto * entries = static_cast<ggml_backend_sched_moe_resident_entry *>(
+            calloc(static_cast<size_t>(slots), sizeof(ggml_backend_sched_moe_resident_entry)));
+    auto * last_used = static_cast<uint64_t *>(calloc(static_cast<size_t>(slots), sizeof(uint64_t)));
+    auto * layer_banks = static_cast<ggml_backend_sched_moe_resident_bank *>(
+            calloc(static_cast<size_t>(layers), sizeof(ggml_backend_sched_moe_resident_bank)));
+    auto * layer_slots = static_cast<int *>(calloc(static_cast<size_t>(layers), sizeof(int)));
+    auto * layer_begins = static_cast<size_t *>(calloc(static_cast<size_t>(layers), sizeof(size_t)));
+    if (entries == nullptr || last_used == nullptr || layer_banks == nullptr ||
+            layer_slots == nullptr || layer_begins == nullptr) {
+        free(entries);
+        free(last_used);
+        free(layer_banks);
+        free(layer_slots);
+        free(layer_begins);
+        ggml_backend_buffer_free(buffer);
+        pool->disabled = true;
+        ggml_backend_sched_moe_resident_disable_auto(budget, "resident metadata allocation failed");
+        return false;
+    }
+
+    int remaining_slots = slots;
+    if (hybrid_auto) {
+        for (int layer = 0; layer < layers; ++layer) {
+            const size_t planned_slot = sched->moe_resident_hybrid_slot_bytes[
+                    static_cast<size_t>(layer) * (GGML_MOE_BANK_DOWN + 1) + pool->role];
+            if (sched->moe_resident_hybrid_gpu_layers[layer] == 0 || planned_slot != slot_bytes) {
+                continue;
+            }
+            const int give = std::min(remaining_slots, sched->moe_resident_hybrid_target_slots);
+            layer_slots[layer] = give;
+            remaining_slots -= give;
+            if (remaining_slots == 0) {
+                break;
+            }
+        }
+    } else {
+        for (int layer = 0; layer < cached_layers; ++layer) {
+            layer_slots[layer] = min_layer_slots;
+            remaining_slots -= min_layer_slots;
+        }
+        for (int layer = 0; remaining_slots > 0; --remaining_slots) {
+            ++layer_slots[layer % cached_layers];
+            ++layer;
+        }
+    }
+    size_t layer_begin = 0;
+    for (int layer = 0; layer < layers; ++layer) {
+        layer_begins[layer] = layer_begin;
+        layer_begin += static_cast<size_t>(layer_slots[layer]);
+    }
+
+    ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+    void * base = ggml_backend_buffer_get_base(buffer);
+    if (base == nullptr) {
+        free(entries);
+        free(last_used);
+        free(layer_banks);
+        free(layer_slots);
+        free(layer_begins);
+        ggml_backend_buffer_free(buffer);
+        pool->disabled = true;
+        ggml_backend_sched_moe_resident_disable_auto(budget, "resident buffer has no address");
+        return false;
+    }
+    pool->buffer = buffer;
+    pool->base = base;
+    pool->slot_bytes = slot_bytes;
+    pool->allocation_bytes = total_bytes;
+    pool->slots = slots;
+    pool->layers = layers;
+    pool->min_layer_slots = min_layer_slots;
+    pool->cached_layers = cached_layers;
+    pool->base_layer_slots = min_layer_slots;
+    pool->remainder_layer_slots = slots - cached_layers * min_layer_slots;
+    pool->layer_slots = layer_slots;
+    pool->layer_begins = layer_begins;
+    pool->clock = 0;
+    pool->entries = entries;
+    pool->last_used = last_used;
+    pool->layer_banks = layer_banks;
+    if (budget != nullptr) {
+        budget->allocated_bytes += total_bytes;
+    }
+    return true;
+}
+
+static int ggml_backend_sched_moe_resident_layer_slots(
+        const ggml_backend_sched_moe_resident_pool * pool,
+        int layer) {
+    return layer >= 0 && layer < pool->layers ? pool->layer_slots[layer] : 0;
+}
+
+// B4 hybrid planner: mark one blk.<N> layer GPU-bound (force its MoE ops to
+// CUDA) or CPU-bound (baseline placement). Grows the plan once model info is
+// known; POD manual-memory, cleared on free. Returns false on bad layer or
+// allocation failure (caller keeps previous plan state).
+static bool ggml_backend_sched_moe_resident_hybrid_set_layer(
+        ggml_backend_sched_t sched, int layer, bool gpu) {
+    if (sched == nullptr || layer < 0) {
+        return false;
+    }
+    if (sched->moe_resident_layers <= 0) {
+        return false;
+    }
+    if (sched->moe_resident_hybrid_gpu_layers == nullptr ||
+            sched->moe_resident_hybrid_layers != sched->moe_resident_layers) {
+        free(sched->moe_resident_hybrid_gpu_layers);
+        sched->moe_resident_hybrid_gpu_layers = static_cast<uint8_t *>(
+                calloc(static_cast<size_t>(sched->moe_resident_layers), sizeof(uint8_t)));
+        if (sched->moe_resident_hybrid_gpu_layers == nullptr) {
+            sched->moe_resident_hybrid_layers = 0;
+            return false;
+        }
+        sched->moe_resident_hybrid_layers = sched->moe_resident_layers;
+    }
+    if (layer >= sched->moe_resident_hybrid_layers) {
+        return false;
+    }
+    const uint8_t next = gpu ? 1 : 0;
+    if (sched->moe_resident_hybrid_gpu_layers[layer] != next) {
+        sched->moe_resident_hybrid_gpu_layers[layer] = next;
+        if (sched->is_alloc && sched->moe_resident_hybrid_plan_ready) {
+            sched->moe_resident_replan_required = true;
+        }
+    }
+    return true;
+}
+
+static size_t ggml_backend_sched_moe_resident_layer_begin(
+        const ggml_backend_sched_moe_resident_pool * pool,
+        int layer) {
+    return layer >= 0 && layer < pool->layers ? pool->layer_begins[layer] : 0;
+}
+
+static bool ggml_backend_sched_moe_parse_layer_id(
+        const ggml_tensor * tensor,
+        int n_layers,
+        int & layer_id) {
+    const char * name = ggml_get_name(tensor);
+    if (name == nullptr || strncmp(name, "blk.", 4) != 0) {
+        return false;
+    }
+
+    const char * cursor = name + 4;
+    if (!std::isdigit(static_cast<unsigned char>(*cursor))) {
+        return false;
+    }
+
+    int64_t parsed = 0;
+    while (std::isdigit(static_cast<unsigned char>(*cursor))) {
+        const int digit = *cursor - '0';
+        if (parsed > (INT_MAX - digit) / 10) {
+            return false;
+        }
+        parsed = parsed * 10 + digit;
+        ++cursor;
+    }
+    if (strncmp(cursor, ".ffn_", 5) != 0 || parsed < 0 || parsed >= n_layers) {
+        return false;
+    }
+
+    layer_id = static_cast<int>(parsed);
+    return true;
+}
+
+static ggml_backend_sched_moe_bank_role ggml_backend_sched_moe_bank_role_from_tensor(
+        const ggml_tensor * tensor) {
+    const char * name = ggml_get_name(tensor);
+    if (name == nullptr) {
+        return GGML_MOE_BANK_UNKNOWN;
+    }
+    if (strstr(name, ".ffn_gate_up_exps") != nullptr) {
+        return GGML_MOE_BANK_GATE_UP;
+    }
+    if (strstr(name, ".ffn_up_exps") != nullptr) {
+        return GGML_MOE_BANK_UP;
+    }
+    if (strstr(name, ".ffn_gate_exps") != nullptr) {
+        return GGML_MOE_BANK_GATE;
+    }
+    if (strstr(name, ".ffn_down_exps") != nullptr) {
+        return GGML_MOE_BANK_DOWN;
+    }
+    return GGML_MOE_BANK_UNKNOWN;
+}
+
+// Build the initial `auto` CPU/GPU placement plan before split_graph().
+// The previous hit-driven-only B4 scheme could never bootstrap: CPU-placed
+// layers never enter the CUDA resident-copy path, therefore they can never
+// generate the resident hit required to promote themselves.
+static bool ggml_backend_sched_moe_resident_hybrid_plan_graph(
+        ggml_backend_sched_t sched,
+        const ggml_cgraph * graph) {
+    if (sched == nullptr || graph == nullptr || sched->moe_resident_slots >= 0 ||
+            sched->moe_resident_layers <= 0 || sched->moe_resident_n_expert_used <= 0) {
+        return false;
+    }
+    if (sched->moe_resident_hybrid_plan_ready) {
+        return true;
+    }
+
+    int cuda_backend_id = -1;
+    for (int b = 0; b < sched->n_backends; ++b) {
+#ifdef GGML_USE_CUDA
+        if (!ggml_backend_is_cuda(sched->backends[b])) {
+            continue;
+        }
+#else
+        continue;
+#endif
+        if (ggml_backend_sched_moe_resident_init_auto_budget(sched, b, sched->backends[b])) {
+            cuda_backend_id = b;
+            break;
+        }
+    }
+    if (cuda_backend_id < 0) {
+        return false;
+    }
+
+    const int layers = sched->moe_resident_layers;
+    const size_t geometry_count = static_cast<size_t>(layers) * (GGML_MOE_BANK_DOWN + 1);
+    auto * gpu_layers = static_cast<uint8_t *>(calloc(static_cast<size_t>(layers), sizeof(uint8_t)));
+    auto * slot_bytes = static_cast<size_t *>(calloc(geometry_count, sizeof(size_t)));
+    if (gpu_layers == nullptr || slot_bytes == nullptr) {
+        free(gpu_layers);
+        free(slot_bytes);
+        return false;
+    }
+
+    // Scan the real graph rather than guessing model geometry. A source bank is
+    // recorded once per (layer, role); duplicate appearances are harmless.
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node == nullptr || (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_MOE_FUSED_UP_GATE)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * bank = node->src[j];
+            if (bank == nullptr || bank->ne[2] <= 1) {
+                continue;
+            }
+            const auto role = ggml_backend_sched_moe_bank_role_from_tensor(bank);
+            if (role == GGML_MOE_BANK_UNKNOWN) {
+                continue;
+            }
+            int layer = -1;
+            if (!ggml_backend_sched_moe_parse_layer_id(bank, layers, layer)) {
+                continue;
+            }
+            const size_t expert_size = bank->nb[2];
+            if (expert_size == 0 || expert_size > SIZE_MAX - std::min<size_t>(expert_size, 512)) {
+                continue;
+            }
+            const size_t resident_slot = expert_size + std::min<size_t>(expert_size, 512);
+            const size_t gi = static_cast<size_t>(layer) * (GGML_MOE_BANK_DOWN + 1) + role;
+            if (slot_bytes[gi] == 0) {
+                slot_bytes[gi] = resident_slot;
+            } else if (slot_bytes[gi] != resident_slot) {
+                // Ambiguous geometry for the same role/layer is safer on CPU.
+                slot_bytes[gi] = SIZE_MAX;
+            }
+        }
+    }
+
+    // Keep two active expert working sets per GPU-routed layer. One set is just
+    // enough for the current route; two gives temporal reuse a chance before an
+    // eviction and is still bounded exactly by the auto VRAM budget.
+    constexpr int k_working_sets = 2;
+    const int target_slots = std::max(1, sched->moe_resident_n_expert_used) * k_working_sets;
+    const size_t budget_bytes = sched->moe_resident_budget[cuda_backend_id].budget_bytes;
+    size_t planned_bytes = 0;
+    int planned_layers = 0;
+
+    for (int layer = 0; layer < layers; ++layer) {
+        const auto geom = [&](ggml_backend_sched_moe_bank_role role) {
+            return slot_bytes[static_cast<size_t>(layer) * (GGML_MOE_BANK_DOWN + 1) + role];
+        };
+        const bool complete_layout = geom(GGML_MOE_BANK_DOWN) != 0 &&
+                (geom(GGML_MOE_BANK_GATE_UP) != 0 ||
+                 (geom(GGML_MOE_BANK_UP) != 0 && geom(GGML_MOE_BANK_GATE) != 0));
+        if (!complete_layout) {
+            continue;
+        }
+        size_t layer_bytes = 0;
+        bool valid = false;
+        for (int role = GGML_MOE_BANK_GATE_UP; role <= GGML_MOE_BANK_DOWN; ++role) {
+            const size_t sb = slot_bytes[static_cast<size_t>(layer) * (GGML_MOE_BANK_DOWN + 1) + role];
+            if (sb == 0) {
+                continue;
+            }
+            if (sb == SIZE_MAX || sb > SIZE_MAX / static_cast<size_t>(target_slots)) {
+                valid = false;
+                layer_bytes = SIZE_MAX;
+                break;
+            }
+            const size_t role_bytes = sb * static_cast<size_t>(target_slots);
+            if (layer_bytes > SIZE_MAX - role_bytes) {
+                valid = false;
+                layer_bytes = SIZE_MAX;
+                break;
+            }
+            layer_bytes += role_bytes;
+            valid = true;
+        }
+        if (!valid || layer_bytes == 0 || layer_bytes == SIZE_MAX) {
+            continue;
+        }
+        if (planned_bytes > budget_bytes || layer_bytes > budget_bytes - planned_bytes) {
+            continue;
+        }
+        gpu_layers[layer] = 1;
+        planned_bytes += layer_bytes;
+        ++planned_layers;
+    }
+
+    free(sched->moe_resident_hybrid_gpu_layers);
+    free(sched->moe_resident_hybrid_slot_bytes);
+    sched->moe_resident_hybrid_gpu_layers = gpu_layers;
+    sched->moe_resident_hybrid_slot_bytes = slot_bytes;
+    sched->moe_resident_hybrid_layers = layers;
+    sched->moe_resident_hybrid_target_slots = target_slots;
+    sched->moe_resident_hybrid_plan_ready = planned_layers > 0;
+    sched->moe_resident_replan_required = false;
+
+    fprintf(stderr,
+            "ggml_backend_sched: moe-resident hybrid plan gpu_layers=%d/%d target_slots=%d planned=%zu MiB budget=%zu MiB\n",
+            planned_layers, layers, target_slots, planned_bytes / (1024 * 1024), budget_bytes / (1024 * 1024));
+    if (sched->debug && planned_layers > 0) {
+        fprintf(stderr, "ggml_backend_sched: moe-resident hybrid GPU layers:");
+        for (int layer = 0; layer < layers; ++layer) {
+            if (gpu_layers[layer] != 0) {
+                fprintf(stderr, " %d", layer);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    return planned_layers > 0;
+}
+
+static int ggml_backend_sched_moe_resident_get_layer(
+        ggml_backend_sched_moe_resident_pool * pool,
+        const ggml_tensor * bank,
+        const void * data,
+        int layer_id) {
+    if (layer_id < 0 || layer_id >= pool->layers ||
+            ggml_backend_sched_moe_resident_layer_slots(pool, layer_id) <= 0) {
+        return -1;
+    }
+
+    auto & layer_bank = pool->layer_banks[layer_id];
+    if (layer_bank.bank == nullptr) {
+        layer_bank = { bank, data, layer_id };
+        return layer_id;
+    }
+    if (layer_bank.layer_id == layer_id && layer_bank.bank == bank && layer_bank.data == data) {
+        return layer_id;
+    }
+    return -1;
+}
+
+static bool ggml_backend_sched_moe_resident_is_cuda(ggml_backend_t backend) {
+#ifdef GGML_USE_CUDA
+    return ggml_backend_is_cuda(backend);
+#else
+    GGML_UNUSED(backend);
+    return false;
+#endif
+}
+
+static bool ggml_backend_sched_moe_resident_ensure_route_use_counts(
+        ggml_backend_sched_t sched, int layers, int n_expert) {
+    if (layers <= 0 || n_expert <= 0 ||
+            static_cast<size_t>(layers) > SIZE_MAX / static_cast<size_t>(n_expert)) {
+        return false;
+    }
+    if (sched->moe_resident_route_use_counts != nullptr && sched->moe_resident_route_last_seen != nullptr &&
+            sched->moe_resident_route_layer_epochs != nullptr && sched->moe_resident_route_layers == layers &&
+            sched->moe_resident_route_experts == n_expert) {
+        return true;
+    }
+
+    free(sched->moe_resident_route_use_counts);
+    free(sched->moe_resident_route_last_seen);
+    free(sched->moe_resident_route_layer_epochs);
+    const size_t count = static_cast<size_t>(layers) * static_cast<size_t>(n_expert);
+    sched->moe_resident_route_use_counts = static_cast<uint32_t *>(calloc(count, sizeof(uint32_t)));
+    sched->moe_resident_route_last_seen = static_cast<uint64_t *>(calloc(count, sizeof(uint64_t)));
+    sched->moe_resident_route_layer_epochs = static_cast<uint64_t *>(calloc(layers, sizeof(uint64_t)));
+    if (sched->moe_resident_route_use_counts == nullptr || sched->moe_resident_route_last_seen == nullptr ||
+            sched->moe_resident_route_layer_epochs == nullptr) {
+        free(sched->moe_resident_route_use_counts);
+        free(sched->moe_resident_route_last_seen);
+        free(sched->moe_resident_route_layer_epochs);
+        sched->moe_resident_route_use_counts = nullptr;
+        sched->moe_resident_route_last_seen = nullptr;
+        sched->moe_resident_route_layer_epochs = nullptr;
+        sched->moe_resident_route_layers = 0;
+        sched->moe_resident_route_experts = 0;
+        return false;
+    }
+    sched->moe_resident_route_layers = layers;
+    sched->moe_resident_route_experts = n_expert;
+    return true;
+}
+
+static void ggml_backend_sched_moe_resident_record_route(
+        ggml_backend_sched_t sched,
+        ggml_backend_sched_moe_route_state & route,
+        int layer) {
+    if (layer < 0 || layer >= sched->moe_resident_layers) {
+        return;
+    }
+    if (route.history_ids_tensor != route.last_ids_tensor) {
+        route.history_layers.clear();
+        route.history_ids_tensor = route.last_ids_tensor;
+    }
+    if (std::find(route.history_layers.begin(), route.history_layers.end(), layer) != route.history_layers.end()) {
+        return;
+    }
+    if (!ggml_backend_sched_moe_resident_ensure_route_use_counts(
+            sched, sched->moe_resident_layers, route.n_expert)) {
+        return;
+    }
+
+    constexpr uint64_t admission_window = 8;
+    const size_t base = static_cast<size_t>(layer) * static_cast<size_t>(sched->moe_resident_route_experts);
+    // Age experts by visits to their own layer, not route reads at other layers.
+    auto & epoch = sched->moe_resident_route_layer_epochs[layer];
+    if (epoch == std::numeric_limits<uint64_t>::max()) {
+        std::fill_n(sched->moe_resident_route_use_counts + base, sched->moe_resident_route_experts, 0);
+        std::fill_n(sched->moe_resident_route_last_seen + base, sched->moe_resident_route_experts, 0);
+        epoch = 0;
+    }
+    ++epoch;
+    for (const int32_t expert : route.ordered_unique_ids) {
+        if (expert < 0 || expert >= sched->moe_resident_route_experts) {
+            continue;
+        }
+        const size_t index = base + static_cast<size_t>(expert);
+        if (epoch - sched->moe_resident_route_last_seen[index] > admission_window) {
+            sched->moe_resident_route_use_counts[index] = 0;
+        }
+        // Token frequency within one batch is not evidence of temporal reuse.
+        // Admission only needs two distinct visits; saturating at two is enough.
+        const uint32_t previous = sched->moe_resident_route_use_counts[index];
+        sched->moe_resident_route_use_counts[index] = previous < 2 ? previous + 1 : 2;
+        sched->moe_resident_route_last_seen[index] = epoch;
+    }
+    route.history_layers.push_back(layer);
+}
+
+static bool ggml_backend_sched_moe_resident_expert_is_reused(
+        const ggml_backend_sched_t sched, int layer, int32_t expert) {
+    if (sched->moe_resident_route_use_counts == nullptr || sched->moe_resident_route_last_seen == nullptr ||
+            sched->moe_resident_route_layer_epochs == nullptr ||
+            layer < 0 || layer >= sched->moe_resident_route_layers ||
+            expert < 0 || expert >= sched->moe_resident_route_experts) {
+        return false;
+    }
+    const size_t index = static_cast<size_t>(layer) * static_cast<size_t>(sched->moe_resident_route_experts) +
+            static_cast<size_t>(expert);
+    const uint64_t epoch = sched->moe_resident_route_layer_epochs[layer];
+    return sched->moe_resident_route_use_counts[index] >= 2 &&
+            epoch >= sched->moe_resident_route_last_seen[index] &&
+            epoch - sched->moe_resident_route_last_seen[index] <= 8;
+}
+
+static ggml_tensor ggml_backend_sched_moe_resident_byte_tensor(
+        ggml_backend_buffer_t buffer, void * data, size_t bytes) {
+    ggml_tensor tensor = {};
+    tensor.type = GGML_TYPE_I8;
+    tensor.buffer = buffer;
+    tensor.data = data;
+    tensor.ne[0] = bytes;
+    tensor.ne[1] = 1;
+    tensor.ne[2] = 1;
+    tensor.ne[3] = 1;
+    tensor.nb[0] = 1;
+    tensor.nb[1] = bytes;
+    tensor.nb[2] = bytes;
+    tensor.nb[3] = bytes;
+    return tensor;
+}
+
+static uint64_t ggml_backend_sched_moe_resident_next_clock(ggml_backend_sched_moe_resident_pool * pool) {
+    if (pool->clock == std::numeric_limits<uint64_t>::max()) {
+        std::memset(pool->last_used, 0, static_cast<size_t>(pool->slots) * sizeof(pool->last_used[0]));
+        pool->clock = 1;
+        return pool->clock;
+    }
+    return ++pool->clock;
+}
+
+static bool ggml_backend_sched_moe_resident_entry_matches(
+        const ggml_backend_sched_moe_resident_entry & entry,
+        const ggml_tensor * bank,
+        const void * data,
+        int layer_id,
+        int32_t expert,
+        size_t expert_bytes,
+        size_t copy_bytes) {
+    return entry.bank == bank && entry.data == data && entry.layer_id == layer_id &&
+           entry.expert == expert && entry.expert_bytes == expert_bytes && entry.copy_bytes == copy_bytes;
+}
+
+static int ggml_backend_sched_moe_resident_hybrid_pool_slots(
+        const ggml_backend_sched * sched,
+        ggml_backend_sched_moe_bank_role role,
+        size_t slot_bytes) {
+    if (sched == nullptr || !sched->moe_resident_hybrid_plan_ready ||
+            sched->moe_resident_hybrid_gpu_layers == nullptr ||
+            sched->moe_resident_hybrid_slot_bytes == nullptr ||
+            sched->moe_resident_hybrid_target_slots <= 0 || role == GGML_MOE_BANK_UNKNOWN) {
+        return 0;
+    }
+    size_t slots = 0;
+    for (int layer = 0; layer < sched->moe_resident_hybrid_layers; ++layer) {
+        if (sched->moe_resident_hybrid_gpu_layers[layer] == 0) {
+            continue;
+        }
+        const size_t planned = sched->moe_resident_hybrid_slot_bytes[
+                static_cast<size_t>(layer) * (GGML_MOE_BANK_DOWN + 1) + role];
+        if (planned == slot_bytes) {
+            slots += static_cast<size_t>(sched->moe_resident_hybrid_target_slots);
+        }
+    }
+    return slots > static_cast<size_t>(INT_MAX) ? 0 : static_cast<int>(slots);
+}
+
+static bool ggml_backend_sched_moe_resident_copy(
+        ggml_backend_sched_t sched,
+        ggml_backend_t split_backend,
+        ggml_tensor * input,
+        ggml_tensor * input_cpy,
+        ggml_backend_buffer_t input_cpy_buffer,
+        ggml_backend_sched_moe_route_state & route,
+        size_t expert_size,
+        ggml_backend_sched_moe_bank_role bank_role,
+        bool force_admission = false) {
+    const int n_expert = route.n_expert;
+    if (sched->moe_resident_slots < 0 && sched->moe_ffn && sched->moe_ffn->cache) return false;
+    if (!route.valid || n_expert <= 0 || sched->moe_resident_slots == 0 || input->data == nullptr || input_cpy->data == nullptr ||
+            input_cpy_buffer == nullptr || ggml_backend_buffer_is_host(input_cpy_buffer) ||
+            !ggml_backend_sched_moe_resident_is_cuda(split_backend) || expert_size == 0) {
+        return false;
+    }
+
+    const size_t padding = std::min<size_t>(expert_size, 512);
+    if (expert_size > SIZE_MAX - padding) {
+        return false;
+    }
+    const size_t slot_bytes = expert_size + padding;
+    const int backend_id = ggml_backend_sched_backend_id(sched, split_backend);
+    if (backend_id < 0 || backend_id >= GGML_SCHED_MAX_BACKENDS) {
+        return false;
+    }
+    int layer_id = -1;
+    if (!ggml_backend_sched_moe_parse_layer_id(input, sched->moe_resident_layers, layer_id)) {
+        return false;
+    }
+
+    const auto buft = ggml_backend_buffer_get_type(input_cpy_buffer);
+    auto * pool_ptr = ggml_backend_sched_moe_resident_get_pool(sched, backend_id, buft, bank_role, slot_bytes);
+    if (pool_ptr == nullptr) {
+        return false;
+    }
+    auto & pool = *pool_ptr;
+    const bool auto_sized = sched->moe_resident_slots < 0;
+    auto * budget = auto_sized ? &sched->moe_resident_budget[backend_id] : nullptr;
+    if (auto_sized && !ggml_backend_sched_moe_resident_init_auto_budget(sched, backend_id, split_backend)) {
+        pool.disabled = true;
+        return false;
+    }
+    const int min_layer_slots = std::max(1, sched->moe_resident_n_expert_used);
+    const int planned_slots = auto_sized
+            ? ggml_backend_sched_moe_resident_hybrid_pool_slots(sched, bank_role, slot_bytes)
+            : 0;
+    const int resident_slots = auto_sized && pool.buffer != nullptr
+            ? pool.slots
+            : auto_sized && sched->moe_resident_hybrid_plan_ready
+                    ? planned_slots
+                    : auto_sized
+                            ? ggml_backend_sched_moe_resident_auto_slots(
+                                    sched, backend_id, slot_bytes, sched->moe_resident_layers, min_layer_slots)
+                            : sched->moe_resident_slots;
+    // B3R-G5: a runtime demotion can null the hybrid plan readiness between
+    // the slot calculation above and the prepare() call below. Snapshot
+    // readiness so an empty-pool fallback cannot re-enter hybrid quota code
+    // that assumes valid plan arrays; baseline-slot math handles zero exactly.
+    if (resident_slots <= 0) {
+        // A preplanned GPU layer whose actual runtime bank geometry was not in
+        // the reserve graph must immediately fall back to CPU on the next graph
+        // instead of streaming uncached weights forever.
+        if (auto_sized && sched->moe_resident_hybrid_plan_ready) {
+            ggml_backend_sched_moe_resident_hybrid_set_layer(sched, layer_id, false);
+            return false;
+        }
+        pool.disabled = true;
+        ggml_backend_sched_moe_resident_disable_auto(budget, "backend-wide budget has no resident slots");
+        return false;
+    }
+    pool.auto_sized = auto_sized;
+    if (!ggml_backend_sched_moe_resident_prepare(&pool, split_backend, buft,
+            resident_slots, sched->moe_resident_layers, min_layer_slots, slot_bytes, budget, sched)) {
+        if (auto_sized) {
+            ggml_backend_sched_moe_resident_hybrid_set_layer(sched, layer_id, false);
+            if (budget != nullptr && budget->unavailable) {
+                for (int l = 0; l < sched->moe_resident_hybrid_layers; ++l) {
+                    ggml_backend_sched_moe_resident_hybrid_set_layer(sched, l, false);
+                }
+            }
+        }
+        return false;
+    }
+    const int layer = ggml_backend_sched_moe_resident_get_layer(&pool, input, input->data, layer_id);
+    if (layer < 0) {
+        return false;
+    }
+    ggml_backend_sched_moe_resident_record_route(sched, route, layer);
+    const int layer_slots = ggml_backend_sched_moe_resident_layer_slots(&pool, layer);
+    const size_t layer_begin = ggml_backend_sched_moe_resident_layer_begin(&pool, layer);
+    const size_t layer_end = layer_begin + static_cast<size_t>(layer_slots);
+    if (sched->debug) {
+        fprintf(stderr, "ggml_backend_sched: resident route tensor=%s role=%s parsed_layer=%d pool_layer=%d layer_slots=%d active_ids=%zu\n",
+                input->name, ggml_backend_sched_moe_bank_role_name(bank_role), layer_id, layer, layer_slots,
+                route.ordered_unique_ids.size());
+    }
+    if (route.ordered_unique_ids.size() > static_cast<size_t>(layer_slots)) {
+        ++pool.bypasses;
+        return false;
+    }
+
+    // Validate every active range before queueing a partial cache fill.  This
+    // mirrors the bounds used by the existing contiguous expert-copy path.
+    for (const int32_t id : route.ordered_unique_ids) {
+        if (id < 0 || id >= n_expert) {
+            return false;
+        }
+        const size_t copy_bytes = id < n_expert - 1 ? slot_bytes : expert_size;
+        if (static_cast<size_t>(id) > (SIZE_MAX - copy_bytes) / expert_size) {
+            return false;
+        }
+        const size_t offset = static_cast<size_t>(id) * expert_size;
+        if (offset + copy_bytes > ggml_nbytes(input_cpy)) {
+            return false;
+        }
+    }
+
+    for (const int32_t id : route.ordered_unique_ids) {
+        const size_t copy_bytes = id < n_expert - 1 ? slot_bytes : expert_size;
+        const size_t offset = static_cast<size_t>(id) * expert_size;
+        ++pool.lookups;
+        const auto entry = ggml_backend_sched_moe_resident_entry {
+            input, input->data, layer, id, expert_size, copy_bytes
+        };
+
+        int slot = -1;
+        for (size_t i = layer_begin; i < layer_end; ++i) {
+            if (ggml_backend_sched_moe_resident_entry_matches(pool.entries[i],
+                    entry.bank, entry.data, entry.layer_id, entry.expert, entry.expert_bytes, entry.copy_bytes)) {
+                slot = static_cast<int>(i);
+                break;
+            }
+        }
+
+        const bool hit = slot >= 0;
+        auto * slot_data = static_cast<uint8_t *>(pool.base) +
+                static_cast<size_t>(slot < 0 ? 0 : slot) * pool.slot_bytes;
+        if (hit) {
+            ++pool.hits;
+            // Placement is preplanned before split_graph(). A hit confirms the
+            // plan but does not mutate placement here; doing so would couple a
+            // copy-path observation to an already allocated/reused graph.
+            ggml_tensor slot_copy = ggml_backend_sched_moe_resident_byte_tensor(
+                    pool.buffer, slot_data, copy_bytes);
+            ggml_tensor destination_copy = ggml_backend_sched_moe_resident_byte_tensor(
+                    input_cpy_buffer, static_cast<uint8_t *>(input_cpy->data) + offset, copy_bytes);
+            ggml_backend_tensor_copy_async(split_backend, split_backend, &slot_copy, &destination_copy);
+            pool.device_bytes += copy_bytes;
+        } else {
+            ++pool.misses;
+            bool free_slot = false;
+            uint64_t oldest = std::numeric_limits<uint64_t>::max();
+            for (size_t i = layer_begin; i < layer_end; ++i) {
+                if (pool.entries[i].bank == nullptr) {
+                    slot = static_cast<int>(i);
+                    free_slot = true;
+                    break;
+                }
+                const auto & candidate = pool.entries[i];
+                if (candidate.bank == input && candidate.data == input->data && candidate.layer_id == layer &&
+                        std::find(route.ordered_unique_ids.begin(), route.ordered_unique_ids.end(), candidate.expert) !=
+                                route.ordered_unique_ids.end()) {
+                    // Protect every active expert, including hits not touched
+                    // yet and admissions earlier in this route.
+                    continue;
+                }
+                if (pool.last_used[i] < oldest) {
+                    oldest = pool.last_used[i];
+                    slot = static_cast<int>(i);
+                }
+            }
+            if (slot < 0 || (!free_slot && !force_admission && !ggml_backend_sched_moe_resident_expert_is_reused(sched, layer, id))) {
+                // A cold expert would evict a resident entry without evidence
+                // that it will recur.  Keep this request on the baseline H2D
+                // path instead of turning the pool into a random-workload cache.
+                ggml_backend_tensor_set_async(split_backend, input_cpy,
+                        static_cast<const uint8_t *>(input->data) + offset, offset, copy_bytes);
+                pool.host_bytes += copy_bytes;
+                ++pool.bypasses;
+                continue;
+            }
+            if (!free_slot) {
+                // With pipeline copies, another copy stream may still be
+                // reading this slot.  Synchronize before reusing it; the
+                // normal single-copy build stays fully asynchronous.
+                if (sched->n_copies > 1) {
+                    ggml_backend_synchronize(split_backend);
+                }
+                ++pool.evictions;
+            }
+
+            slot_data = static_cast<uint8_t *>(pool.base) +
+                    static_cast<size_t>(slot) * pool.slot_bytes;
+            // Keep misses on the existing host-to-device input path.  The
+            // queued device copy only fills the resident slot after that input
+            // copy, so mixed hit/miss batches retain the original destination.
+            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                    static_cast<const uint8_t *>(input->data) + offset, offset, copy_bytes);
+            ggml_tensor destination_copy = ggml_backend_sched_moe_resident_byte_tensor(
+                    input_cpy_buffer, static_cast<uint8_t *>(input_cpy->data) + offset, copy_bytes);
+            ggml_tensor slot_copy = ggml_backend_sched_moe_resident_byte_tensor(
+                    pool.buffer, slot_data, copy_bytes);
+            ggml_backend_tensor_copy_async(split_backend, split_backend, &destination_copy, &slot_copy);
+            pool.host_bytes += copy_bytes;
+            pool.device_bytes += copy_bytes;
+            ++pool.admissions;
+            pool.entries[slot] = entry;
+        }
+        pool.last_used[slot] = ggml_backend_sched_moe_resident_next_clock(&pool);
+    }
+
+    return true;
+}
+
+// Restrict the mixed path to layouts whose rows can be merged directly. All
+// source banks must be host split inputs, including both banks of fused MoE.
+static bool ggml_backend_sched_moe_decode_sources(ggml_backend_sched_t sched,
+        ggml_backend_sched_split * split, ggml_tensor ** banks, int & layer) {
+    if (sched->moe_resident_slots >= 0 || sched->n_backends != 2 || sched->n_copies != 1 ||
+            sched->callback_eval || split->graph.n_nodes == 0 ||
+            !ggml_backend_sched_moe_resident_is_cuda(sched->backends[split->backend_id])) return false;
+    auto * node = split->graph.nodes[0];
+    const bool fused = node->op == GGML_OP_MOE_FUSED_UP_GATE;
+    if (!fused && node->op != GGML_OP_MUL_MAT_ID) return false;
+    auto * ids = node->src[fused ? 3 : 2];
+    auto * act = node->src[fused ? 2 : 1];
+    if (!ids || ids->type != GGML_TYPE_I32 || ids->ne[1] != 1 ||
+            ids->ne[0] != sched->moe_resident_n_expert_used || !ggml_is_contiguous(ids) ||
+            !act || act->type != GGML_TYPE_F32 || act->ne[2] != 1 || act->ne[3] != 1 ||
+            !ggml_is_contiguous(act) || node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) ||
+            (fused && (node->src[4] || node->src[5]))) return false;
+    for (int b = 0; b < (fused && node->src[1] ? 2 : 1); ++b) {
+        banks[b] = nullptr;
+        for (int j = 0; j < split->n_inputs; ++j) {
+            auto * input = split->inputs[j];
+            if (tensor_copy(input, split->backend_id, sched->cur_copy) == node->src[b]) banks[b] = input;
+        }
+        if (!banks[b] || !banks[b]->buffer || !ggml_backend_buffer_is_host(banks[b]->buffer) ||
+                ggml_backend_buffer_get_usage(banks[b]->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                !ggml_is_quantized(banks[b]->type) || !ggml_is_contiguous(banks[b]) ||
+                !ggml_backend_sched_moe_parse_layer_id(banks[b], sched->moe_resident_layers, layer)) return false;
+    }
+    return layer >= 0 && layer < sched->moe_resident_hybrid_layers &&
+            sched->moe_resident_hybrid_gpu_layers && sched->moe_resident_hybrid_gpu_layers[layer] != 0;
+}
+
+static bool ggml_backend_sched_moe_decode_buffer(ggml_backend_buffer_t & buffer,
+        ggml_backend_buffer_type_t buft, size_t bytes) {
+    if (buffer && ggml_backend_buffer_get_size(buffer) >= bytes) return true;
+    auto replacement = ggml_backend_buft_alloc_buffer(buft, bytes);
+    if (!replacement) return false;
+    ggml_backend_buffer_free(buffer);
+    buffer = replacement;
+    return true;
+}
+
+static bool ggml_backend_sched_moe_decode_prepare(ggml_backend_sched_t sched, ggml_backend_sched_split * split) {
+#ifdef GGML_USE_CUDA
+    if (!sched->moe_decode) sched->moe_decode = new ggml_backend_sched_moe_decode;
+    auto & work = *sched->moe_decode;
+    auto * node = split->graph.nodes[0];
+    const bool fused = node->op == GGML_OP_MOE_FUSED_UP_GATE;
+    const auto host = ggml_backend_cuda_host_buffer_type();
+    return ggml_backend_sched_moe_decode_buffer(work.activation, host, ggml_nbytes(node->src[fused ? 2 : 1])) &&
+           ggml_backend_sched_moe_decode_buffer(work.output, host, ggml_nbytes(node)) &&
+           ggml_backend_sched_moe_decode_buffer(work.host_ids, host, ggml_nbytes(node->src[fused ? 3 : 2])) &&
+           ggml_backend_sched_moe_decode_buffer(work.device_ids, sched->bufts[split->backend_id], ggml_nbytes(node->src[fused ? 3 : 2]));
+#else
+    GGML_UNUSED(sched); GGML_UNUSED(split);
+    return false;
+#endif
+}
+
+static bool ggml_backend_sched_moe_decode_hit(ggml_backend_sched_t sched, int backend, int layer, int32_t expert) {
+    // A logical expert is a hit only if every planned projection is resident.
+    auto & pools = sched->moe_resident[backend];
+    for (int role = GGML_MOE_BANK_GATE_UP; role <= GGML_MOE_BANK_DOWN; ++role) {
+        const size_t geometry = sched->moe_resident_hybrid_slot_bytes[
+                size_t(layer) * (GGML_MOE_BANK_DOWN + 1) + role];
+        if (!geometry) continue;
+        bool found = false;
+        for (int p = 0; p < pools.n_pools && !found; ++p) {
+            auto & pool = pools.pools[p];
+            if (pool.disabled || !pool.buffer || pool.role != role || pool.key_slot_bytes != geometry) continue;
+            for (int i = 0; i < pool.slots; ++i) {
+                const auto & entry = pool.entries[i];
+                if (entry.bank && entry.layer_id == layer && entry.expert == expert &&
+                        entry.data == entry.bank->data) { found = true; break; }
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+static ggml_status ggml_backend_sched_moe_decode_compute(ggml_backend_sched_t sched,
+        ggml_backend_sched_split * split, ggml_backend_sched_moe_route_state & route,
+        ggml_tensor ** banks, int layer) {
+    auto & work = *sched->moe_decode;
+    auto * gpu = sched->backends[split->backend_id];
+    auto * cpu = sched->backends[sched->n_backends - 1];
+    auto * node = split->graph.nodes[0];
+    const bool fused = node->op == GGML_OP_MOE_FUSED_UP_GATE;
+    const int ai = fused ? 2 : 1, ii = fused ? 3 : 2;
+    ggml_tensor host_act = *node->src[ai], host_ids = *node->src[ii], host_out = *node;
+    host_act.buffer = work.activation; host_act.data = ggml_backend_buffer_get_base(work.activation);
+    host_ids.buffer = work.host_ids; host_ids.data = ggml_backend_buffer_get_base(work.host_ids);
+    host_out.buffer = work.output; host_out.data = ggml_backend_buffer_get_base(work.output);
+    host_act.view_src = host_ids.view_src = host_out.view_src = nullptr;
+    host_act.extra = host_ids.extra = host_out.extra = nullptr;
+    host_out.src[0] = banks[0];
+    if (fused) host_out.src[1] = banks[1];
+    host_out.src[ai] = &host_act; host_out.src[ii] = &host_ids;
+    ggml_tensor * host_nodes[] = {&host_out};
+    ggml_cgraph host_graph = ggml_graph_view(&split->graph, 0, 1);
+    host_graph.nodes = host_nodes;
+    double ratio = 0;
+    for (const auto & m : work.measurements) {
+        if (m.type == banks[0]->type && m.op == node->op && m.columns == banks[0]->ne[0] && m.rows == banks[0]->ne[1]) {
+            ratio = m.transfer_to_host_ratio; break;
+        }
+    }
+    if (ratio == 0) {
+        ggml_backend_tensor_get_async(gpu, node->src[ai], host_act.data, 0, ggml_nbytes(&host_act));
+        ggml_backend_synchronize(gpu);
+        // Calibrate the deployed quantized kernel and actual expert transfers.
+        // The warmup also allocates the CPU backend's reusable work area.
+        std::memcpy(host_ids.data, route.ids.data(), ggml_nbytes(&host_ids));
+        auto status = ggml_backend_graph_compute(cpu, &host_graph);
+        if (status != GGML_STATUS_SUCCESS) return status;
+        int64_t t0 = ggml_time_us();
+        status = ggml_backend_graph_compute(cpu, &host_graph);
+        const int64_t host_us = std::max<int64_t>(1, ggml_time_us() - t0);
+        if (status != GGML_STATUS_SUCCESS) return status;
+        t0 = ggml_time_us();
+        for (int b = 0; b < (fused && banks[1] ? 2 : 1); ++b) {
+            ggml_backend_tensor_set_async(gpu, node->src[b], banks[b]->data, 0, banks[b]->nb[2]);
+        }
+        ggml_backend_synchronize(gpu);
+        const int64_t transfer_us = std::max<int64_t>(1, ggml_time_us() - t0);
+        ratio = double(host_us) / (double(transfer_us) * route.ordered_unique_ids.size());
+        work.measurements.push_back({banks[0]->type, node->op, banks[0]->ne[0], banks[0]->ne[1], ratio});
+        fprintf(stderr, "ggml_backend_sched: moe-resident decode calibration op=%s type=%s host_us=%lld transfer_us=%lld pcie/host=%.3f\n",
+                ggml_op_name(node->op), ggml_type_name(banks[0]->type), (long long)host_us, (long long)transfer_us, ratio);
+    }
+    if (route.hybrid_layer != layer || route.hybrid_route != route.ids) {
+        route.hybrid_layer = layer; route.hybrid_route = route.ids; route.gpu_experts.clear();
+        std::vector<int32_t> misses;
+        for (int32_t expert : route.ordered_unique_ids) {
+            if (ggml_backend_sched_moe_decode_hit(sched, split->backend_id, layer, expert)) route.gpu_experts.push_back(expert);
+            else misses.push_back(expert);
+        }
+        const size_t fills = ratio >= 1 ? misses.size() : std::min(misses.size(),
+                size_t(std::max(1.0, std::floor(misses.size() * ratio + 0.5))));
+        route.gpu_experts.insert(route.gpu_experts.end(), misses.begin(), misses.begin() + fills);
+    }
+    auto * cpu_ids = static_cast<int32_t *>(host_ids.data);
+    work.gpu_ids = route.ids;
+    size_t cpu_count = 0;
+    for (size_t i = 0; i < route.ids.size(); ++i) {
+        const bool on_gpu = std::find(route.gpu_experts.begin(), route.gpu_experts.end(), route.ids[i]) != route.gpu_experts.end();
+        cpu_ids[i] = on_gpu ? -1 : route.ids[i];
+        if (!on_gpu) { work.gpu_ids[i] = -1; ++cpu_count; }
+    }
+    if (cpu_count) {
+        ggml_backend_tensor_get_async(gpu, node->src[ai], host_act.data, 0, ggml_nbytes(&host_act));
+        ggml_backend_synchronize(gpu);
+    }
+    // Partition once per layer, retain the full route for history accounting.
+    ggml_backend_sched_moe_resident_record_route(sched, route, layer);
+    auto selected = route;
+    selected.ordered_unique_ids = route.gpu_experts;
+    for (int b = 0; b < (fused && banks[1] ? 2 : 1); ++b) {
+        auto * bank = banks[b];
+        ggml_moe_prefetch_wait(bank);
+        if (!ggml_backend_sched_moe_resident_copy(sched, gpu, bank, node->src[b], node->src[b]->buffer,
+                selected, bank->nb[2], ggml_backend_sched_moe_bank_role_from_tensor(bank), true)) {
+            // The existing graph retains CUDA placement on cache failure.
+            // Only the selected rows need weights, even without resident storage.
+            for (int32_t expert : route.gpu_experts) {
+                const size_t offset = size_t(expert) * bank->nb[2];
+                const size_t bytes = bank->nb[2] + (expert + 1 < bank->ne[2] ? std::min<size_t>(512, bank->nb[2]) : 0);
+                ggml_backend_tensor_set_async(gpu, node->src[b], static_cast<const uint8_t *>(bank->data) + offset, offset, bytes);
+            }
+        }
+        work.avoided_bytes += (route.ordered_unique_ids.size() - route.gpu_experts.size()) * bank->nb[2];
+    }
+    work.cpu_refs += cpu_count; work.gpu_refs += route.ids.size() - cpu_count; ++work.operators;
+    if (!cpu_count) return ggml_backend_graph_compute_async(gpu, &split->graph);
+    ggml_tensor device_ids = *node->src[ii], device_out = *node;
+    device_ids.buffer = work.device_ids; device_ids.data = ggml_backend_buffer_get_base(work.device_ids);
+    device_ids.view_src = nullptr; device_ids.extra = nullptr;
+    device_out.src[ii] = &device_ids;
+    ggml_backend_tensor_set_async(gpu, &device_ids, work.gpu_ids.data(), 0, ggml_nbytes(&device_ids));
+    ggml_tensor * device_nodes[] = {&device_out};
+    auto device_graph = ggml_graph_view(&split->graph, 0, 1);
+    device_graph.nodes = device_nodes;
+    auto status = ggml_backend_graph_compute_async(gpu, &device_graph);
+    if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }
+    if (cpu_count) {
+        // CUDA remains in flight while the CPU reads its expert weights in place.
+        status = ggml_backend_graph_compute(cpu, &host_graph);
+        if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }
+        for (size_t row = 0; row < route.ids.size(); ++row) {
+            if (cpu_ids[row] >= 0) {
+                ggml_backend_tensor_set_async(gpu, node, static_cast<const uint8_t *>(host_out.data) + row * node->nb[1],
+                        row * node->nb[1], node->nb[1]);
+            }
+        }
+    }
+    // Stack tensor descriptors must outlive CUDA graph inspection and uploads.
+    ggml_backend_synchronize(gpu);
+    if (split->graph.n_nodes > 1) {
+        auto tail = ggml_graph_view(&split->graph, 1, split->graph.n_nodes);
+        return ggml_backend_graph_compute_async(gpu, &tail);
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+#include "ggml-moe-resident-ffn.inc"
+
+static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split,
+        std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
+        ggml_backend_sched_moe_route_state & route) {
+    if (sched->moe_decode) sched->moe_decode->prepared_split = nullptr;
     if (split->n_inputs < 1) return;
+    ggml_tensor * hybrid_banks[2] = {};
+    int hybrid_layer = -1;
+    const bool hybrid_ready = ggml_backend_sched_moe_decode_sources(sched, split, hybrid_banks, hybrid_layer) &&
+            ggml_backend_sched_moe_decode_prepare(sched, split);
+
+    auto & ids = route.ids;
+    auto & unique_ids = route.unique_ids;
+    auto & ordered_unique_ids = route.ordered_unique_ids;
+    auto & frequencies = route.frequencies;
+    const ggml_tensor * & last_ids_tensor = route.last_ids_tensor;
     constexpr bool k_set_sync = false;
     int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2073,7 +3726,8 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
             }
 
             ggml_tensor * node = split->graph.nodes[0];
-            if (sched->only_active_experts && split->graph.n_nodes > 0 &&
+            const bool resident_requested = ggml_backend_sched_moe_resident_requested(sched, split_backend);
+            if ((sched->only_active_experts || resident_requested) && split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) &&
                     (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE)) {
@@ -2096,29 +3750,84 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     }
                 }
 
-                int n_expert = node->src[0]->ne[2];
+                const int64_t n_expert64 = node->src[0]->ne[2];
+                if (n_expert64 <= 0 || n_expert64 > INT_MAX) {
+                    route.valid = false;
+                    route.n_expert = 0;
+                }
+                const int n_expert = n_expert64 > 0 && n_expert64 <= INT_MAX ? static_cast<int>(n_expert64) : 0;
 
-                if (ids_tensor != last_ids_tensor) {
+                if (ids_tensor != last_ids_tensor || route.n_expert != n_expert) {
                     ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
 
                     ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                    ++route.tensor_reads;
+                    ++sched->moe_route_reads;
+
 
                     ggml_backend_synchronize(ids_backend);
+                    ++route.tensor_syncs;
+                    ++sched->moe_route_syncs;
+                    if (sched->debug) {
+                        fprintf(stderr, "ggml_backend_sched: MoE route tensor read=%zu sync=%zu name=%s\n",
+                                route.tensor_reads, route.tensor_syncs,
+                                ggml_get_name(ids_tensor) != nullptr ? ggml_get_name(ids_tensor) : "<unnamed>");
+                    }
                     if (auto id = tensor_backend_id(ids_tensor); id >= 0 && id < GGML_SCHED_MAX_BACKENDS) {
                         needs_sync[id] = k_set_sync;
                     }
-                    //needs_sync[tensor_backend_id(ids_tensor)] = k_set_sync;
 
-                    unique_ids.resize((n_expert + 31)/32);
-                    std::memset(unique_ids.data(), 0, unique_ids.size()*sizeof(uint32_t));
+                    route.n_expert = n_expert;
+                    route.valid = n_expert > 0;
+                    route.invalid_ids = 0;
+                    ordered_unique_ids.clear();
+                    const size_t valid_experts = static_cast<size_t>(std::max(n_expert, 0));
+                    frequencies.assign(valid_experts, 0);
+                    unique_ids.assign((valid_experts + 31) / 32, 0);
                     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
-                            int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                            unique_ids[id >> 5] |= (1u << (id & 31));
+                            const size_t index = static_cast<size_t>(i1) * ids_tensor->nb[1] / sizeof(int32_t) +
+                                    static_cast<size_t>(i0) * ids_tensor->nb[0] / sizeof(int32_t);
+                            if (index >= ids.size()) {
+                                route.valid = false;
+                                ++route.invalid_ids;
+                                continue;
+                            }
+                            const int32_t id = ids[index];
+                            if (id < 0 || id >= n_expert) {
+                                route.valid = false;
+                                ++route.invalid_ids;
+                                continue;
+                            }
+                            if (frequencies[id] == 0) {
+                                unique_ids[id >> 5] |= (1u << (id & 31));
+                                ordered_unique_ids.push_back(id);
+                            }
+                            if (frequencies[id] < std::numeric_limits<uint32_t>::max()) {
+                                ++frequencies[id];
+                            }
                         }
                     }
 
+                    uint64_t valid_references = 0;
+                    for (const uint32_t frequency : frequencies) {
+                        valid_references += frequency;
+                    }
+                    sched->moe_route_active_references += valid_references;
+                    sched->moe_route_unique_experts += ordered_unique_ids.size();
+                    sched->moe_route_invalid_ids += route.invalid_ids;
+                    if (!route.valid && sched->debug) {
+                        fprintf(stderr, "ggml_backend_sched: ignored %zu invalid MoE route IDs\n", route.invalid_ids);
+                    }
                     last_ids_tensor = ids_tensor;
+                } else {
+                    ++route.tensor_reuses;
+                    ++sched->moe_route_reuses;
+                }
+
+                if (route.valid && hybrid_ready && (input == hybrid_banks[0] || input == hybrid_banks[1])) {
+                    sched->moe_decode->prepared_split = split;
+                    continue;
                 }
 
                 // when the expert prefetch engine streamed this tensor ahead
@@ -2127,37 +3836,51 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 ggml_moe_prefetch_wait(input);
 
                 const size_t expert_size = input->ne[2] > 1 ? input->nb[2] : input->nb[1];
+                const auto bank_role = ggml_backend_sched_moe_bank_role_from_tensor(input);
+                if (bank_role == GGML_MOE_BANK_UNKNOWN && sched->debug) {
+                    fprintf(stderr, "ggml_backend_sched: bypassing resident cache for unknown MoE bank role name=%s\n",
+                            ggml_get_name(input));
+                }
 
                 if (input->ne[2] > 1) {
+                    const ggml_backend_buffer_t input_cpy_buffer = input_cpy->view_src != nullptr ?
+                            input_cpy->view_src->buffer : input_cpy->buffer;
+                    const bool resident_copy = route.valid && ggml_backend_sched_moe_resident_copy(
+                            sched, split_backend, input, input_cpy, input_cpy_buffer,
+                            route, expert_size, bank_role);
 
-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
-                        const size_t expert_offset = first_id * expert_size;
-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                        const size_t padding = 512;
-                        const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
+                    if (!resident_copy && !route.valid) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    } else if (!resident_copy) {
+                        auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                            const size_t expert_offset = first_id * expert_size;
+                            const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                            const size_t padding = 512;
+                            const size_t padding_end = last_id < n_expert - 1 ? std::min<size_t>(expert_size, padding) : 0;
 
-                        ggml_backend_tensor_set_async(split_backend,
-                                input_cpy,
-                                (const uint8_t *)input->data + expert_offset, expert_offset,
-                                // copy a bit extra to ensure there are no NaNs in the padding
-                                expert_size_copy + padding_end);
+                            ggml_backend_tensor_set_async(split_backend,
+                                    input_cpy,
+                                    (const uint8_t *)input->data + expert_offset, expert_offset,
+                                    // copy a bit extra to ensure there are no NaNs in the padding
+                                    expert_size_copy + padding_end);
 
-                    };
+                        };
 
-                    auto next_on_id = [&unique_ids, n_expert] (int id) {
-                        while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
-                        return id;
-                    };
-                    auto next_off_id = [&unique_ids, n_expert] (int id) {
-                        while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
-                        return id;
-                    };
+                        auto next_on_id = [&unique_ids, n_expert] (int id) {
+                            while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) == 0) ++id;
+                            return id;
+                        };
+                        auto next_off_id = [&unique_ids, n_expert] (int id) {
+                            while (id < n_expert && (unique_ids[id >> 5] & (1u << (id & 31))) != 0) ++id;
+                            return id;
+                        };
 
-                    int first_id = next_on_id(0);
-                    while (first_id < n_expert) {
-                        int last_id = next_off_id(first_id+1);
-                        copy_experts(first_id, last_id-1);
-                        first_id = next_on_id(last_id);
+                        int first_id = next_on_id(0);
+                        while (first_id < n_expert) {
+                            int last_id = next_off_id(first_id+1);
+                            copy_experts(first_id, last_id-1);
+                            first_id = next_on_id(last_id);
+                        }
                     }
 
                 } else {
@@ -2184,7 +3907,13 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     }
 }
 
-static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_backend_t split_backend, ggml_backend_sched_split * split) {
+static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_backend_t split_backend, ggml_backend_sched_split * split,
+        ggml_backend_sched_moe_route_state * route = nullptr) {
+    ggml_tensor * banks[2] = {};
+    int layer = -1;
+    if (route && route->valid && sched->moe_decode && sched->moe_decode->prepared_split == split && ggml_backend_sched_moe_decode_sources(sched, split, banks, layer)) {
+        return ggml_backend_sched_moe_decode_compute(sched, split, *route, banks, layer);
+    }
     if (!sched->callback_eval) {
 #if IK_PRINT_TIMING
         int64_t tim2 = ggml_time_us();
@@ -2283,9 +4012,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             struct ggml_backend_sched_split * splits = sched->splits;
 
-            std::vector<int32_t> ids;
-            std::vector<uint32_t> unique_ids;
-            ggml_tensor * last_ids_tensor = nullptr;
+            ggml_backend_sched_moe_route_state route;
 
             for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
@@ -2304,7 +4031,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (split->n_inputs > 0) {
                     int copy_thread = last_reduce >= 0 ? last_reduce : 0;
                     if (ith == copy_thread) {
-                        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+                        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, route);
                     }
                     #pragma omp barrier
                 }
@@ -2356,9 +4083,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             struct ggml_backend_sched_split * splits = sched->splits;
 
-            std::vector<int32_t> ids;
-            std::vector<uint32_t> unique_ids;
-            ggml_tensor * last_ids_tensor = nullptr;
+            ggml_backend_sched_moe_route_state route;
 
             int last_reduce = first_reduce;
 
@@ -2379,7 +4104,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (split->n_inputs > 0) {
                     int copy_thread = last_reduce >= 0 ? last_reduce : 0;
                     if (ith == copy_thread) {
-                        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+                        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, route);
                     }
                     barrier.arrive_and_wait();
                 }
@@ -2438,9 +4163,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     struct ggml_backend_sched_split * splits = sched->splits;
 
-    std::vector<int32_t> ids;
-    std::vector<uint32_t> unique_ids;
-    ggml_tensor * last_ids_tensor = nullptr;
+    ggml_backend_sched_moe_route_state route;
 
     // MoE expert prefetch; pre-scan the splits for expert-weight matmuls whose
     // weights live in a host mmap. Two behaviors, both page-cache warmers.
@@ -2528,7 +4251,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
-        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, route);
 
         // ids are now final and host-visible; enqueue the selected expert
         // slices of this split's host-computed MoE matmuls (up/gate and down
@@ -2548,7 +4271,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
             }
         }
-        auto ec = ggml_backend_sched_eval(sched, split_backend, split);
+        auto ec = GGML_STATUS_SUCCESS;
+        if (ggml_backend_sched_moe_ffn_node(sched, split->graph.nodes[0])) {
+            auto * task = sched->moe_ffn->graph_tasks.at(split->graph.nodes[0]);
+            GGML_ASSERT(task->up == split->graph.nodes[0] && split->graph.n_nodes == 1 &&
+                    i + 1 < sched->n_splits && splits[i + 1].graph.n_nodes == 1 &&
+                    splits[i + 1].graph.nodes[0] == task->down && splits[i + 1].backend_id == split_backend_id);
+            ggml_backend_sched_copy_inputs(sched, &splits[i + 1], sched->needs_sync, route);
+            ec = ggml_backend_sched_moe_ffn_compute(sched, *task, split_backend);
+            ++i;
+        } else {
+            ec = ggml_backend_sched_eval(sched, split_backend, split, &route);
+        }
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
         }
@@ -2585,7 +4319,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS);
     GGML_ASSERT(ggml_backend_is_cpu(backends[n_backends - 1])); // last backend must be CPU
 
-    struct ggml_backend_sched * sched = (ggml_backend_sched *)calloc(1, sizeof(struct ggml_backend_sched));
+    auto * sched = new ggml_backend_sched{};
 
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
@@ -2638,6 +4372,118 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    if (sched->moe_ffn) {
+        ggml_backend_sched_synchronize(sched);
+        auto & f = *sched->moe_ffn;
+        fprintf(stderr, "ggml_backend_sched: moe-resident complete-ffn slots=%zu cache=%zu MiB budget=%zu MiB reserve=%zu MiB layers=%llu hits=%llu fills=%llu evictions=%llu cpu_refs=%llu gpu_refs=%llu h2d_weights=%llu h2d_results=%llu d2d_weights=0\n",
+                f.slots.size(), f.allocation_bytes / (1024 * 1024), f.budget_bytes / (1024 * 1024), f.reserve_bytes / (1024 * 1024),
+                (unsigned long long)f.layers, (unsigned long long)f.hits, (unsigned long long)f.fills,
+                (unsigned long long)f.evictions, (unsigned long long)f.cpu_refs, (unsigned long long)f.gpu_refs,
+                (unsigned long long)f.host_bytes, (unsigned long long)f.result_bytes);
+        delete sched->moe_ffn;
+        sched->moe_ffn = nullptr;
+    }
+    if (sched->moe_ffn_candidates || sched->moe_ffn_reject_n[sched->MOE_FFN_R_GUARD]) {
+        static const char * const reject_names[] = {
+            "scan-guard", "op-not-pair", "op-wiring", "op-layout", "placement",
+            "act-ids-null", "act-ids-dtype", "act-batch", "ids-batch", "ids-width",
+            "act-ids-layout", "bank-null", "bank-not-host", "bank-usage",
+            "bank-unquantized", "bank-layout", "bank-width", "bank-layer-id",
+            "unsupported", "repeated", "scratch",
+        };
+        fprintf(stderr, "ggml_backend_sched: moe-resident scan candidate-nodes=%llu qualified-layers=%llu qualified-events=%llu",
+                (unsigned long long)sched->moe_ffn_candidates,
+                (unsigned long long)sched->moe_ffn_qualified_layers,
+                (unsigned long long)sched->moe_ffn_qualified_events);
+        bool any_reject = false;
+        for (int r = 0; r < sched->MOE_FFN_R_COUNT; ++r) {
+            if (sched->moe_ffn_reject_n[r]) any_reject = true;
+        }
+        fprintf(stderr, "%s", any_reject ? " rejected:" : " rejected:none");
+        for (int r = 0; r < sched->MOE_FFN_R_COUNT; ++r) {
+            if (sched->moe_ffn_reject_n[r]) {
+                fprintf(stderr, " %s=%llu", reject_names[r],
+                        (unsigned long long)sched->moe_ffn_reject_n[r]);
+            }
+        }
+        fprintf(stderr, "\n");
+        if (!sched->moe_ffn_qualified_layer.empty()) {
+            std::string missing;
+            for (size_t l = 0; l < sched->moe_ffn_qualified_layer.size(); ++l) {
+                if (!sched->moe_ffn_qualified_layer[l]) {
+                    missing += missing.empty() ? std::to_string(l) : ("," + std::to_string(l));
+                }
+            }
+            if (!missing.empty()) {
+                fprintf(stderr, "ggml_backend_sched: moe-resident layers without complete-FFN coverage: %s%s\n",
+                        missing.c_str(),
+                        sched->moe_ffn_qualified_layers == 0 ? " (none qualified)" : "");
+            }
+        }
+    }
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->moe_resident_slots != 0 && sched->moe_resident_budget[b].initialized) {
+            const auto & budget = sched->moe_resident_budget[b];
+            fprintf(stderr,
+                    "ggml_backend_sched: moe-resident budget backend=%s initial=%zu MiB budget=%zu MiB allocated=%zu MiB reserve=%zu MiB unavailable=%s\n",
+                    ggml_backend_name(sched->backends[b]), budget.initial_free_bytes / (1024 * 1024),
+                    budget.budget_bytes / (1024 * 1024), budget.allocated_bytes / (1024 * 1024),
+                    budget.safety_reserve_bytes / (1024 * 1024), budget.unavailable ? "yes" : "no");
+        }
+        auto & pools = sched->moe_resident[b];
+        for (int i = 0; i < pools.n_pools; ++i) {
+            auto & pool = pools.pools[i];
+            if (pool.buffer != nullptr) {
+                ggml_backend_synchronize(sched->backends[b]);
+            }
+            if (sched->moe_resident_slots != 0 &&
+                    (pool.buffer != nullptr || pool.hits != 0 || pool.misses != 0 || pool.bypasses != 0 || pool.disabled)) {
+                fprintf(stderr,
+                        "ggml_backend_sched: moe-resident backend=%s role=%s slots=%d layers=%d cached_layers=%d slot_bytes=%zu mode=%s lookups=%llu hits=%llu misses=%llu admissions=%llu evictions=%llu bypasses=%llu h2d=%llu d2d=%llu disabled=%s\n",
+                        ggml_backend_name(sched->backends[b]), ggml_backend_sched_moe_bank_role_name(pool.role), pool.slots, pool.layers, pool.cached_layers, pool.key_slot_bytes,
+                        pool.auto_sized ? "auto" : "fixed",
+                        static_cast<unsigned long long>(pool.lookups),
+                        static_cast<unsigned long long>(pool.hits),
+                        static_cast<unsigned long long>(pool.misses),
+                        static_cast<unsigned long long>(pool.admissions),
+                        static_cast<unsigned long long>(pool.evictions),
+                        static_cast<unsigned long long>(pool.bypasses),
+                        static_cast<unsigned long long>(pool.host_bytes),
+                        static_cast<unsigned long long>(pool.device_bytes),
+                        pool.disabled ? "yes" : "no");
+            }
+            ggml_backend_sched_moe_resident_clear_storage(&pool, &sched->moe_resident_budget[b]);
+        }
+        free(pools.pools);
+    }
+    if (sched->moe_resident_slots != 0) {
+        fprintf(stderr,
+                "ggml_backend_sched: moe-resident routes reads=%llu syncs=%llu reuses=%llu active_refs=%llu unique_experts=%llu invalid_ids=%llu\n",
+                static_cast<unsigned long long>(sched->moe_route_reads),
+                static_cast<unsigned long long>(sched->moe_route_syncs),
+                static_cast<unsigned long long>(sched->moe_route_reuses),
+                static_cast<unsigned long long>(sched->moe_route_active_references),
+                static_cast<unsigned long long>(sched->moe_route_unique_experts),
+                static_cast<unsigned long long>(sched->moe_route_invalid_ids));
+    }
+    if (sched->moe_decode) {
+        ggml_backend_sched_synchronize(sched);
+        fprintf(stderr, "ggml_backend_sched: moe-resident decode operators=%llu cpu_refs=%llu gpu_refs=%llu avoided_h2d=%llu\n",
+                (unsigned long long)sched->moe_decode->operators, (unsigned long long)sched->moe_decode->cpu_refs,
+                (unsigned long long)sched->moe_decode->gpu_refs, (unsigned long long)sched->moe_decode->avoided_bytes);
+        delete sched->moe_decode;
+    }
+    free(sched->moe_resident_route_use_counts);
+    free(sched->moe_resident_route_last_seen);
+    free(sched->moe_resident_route_layer_epochs);
+    free(sched->moe_resident_hybrid_gpu_layers);
+    free(sched->moe_resident_hybrid_slot_bytes);
+    sched->moe_resident_hybrid_gpu_layers = nullptr;
+    sched->moe_resident_hybrid_slot_bytes = nullptr;
+    sched->moe_resident_hybrid_layers = 0;
+    sched->moe_resident_hybrid_target_slots = 0;
+    sched->moe_resident_hybrid_plan_ready = false;
+    sched->moe_resident_replan_required = false;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2661,7 +4507,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
-    free(sched);
+    delete sched;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
@@ -2679,6 +4525,16 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     ggml_backend_sched_synchronize(sched);
 
+    if (sched->moe_ffn && sched->moe_ffn->cache) {
+        // Reserve may grow runtime buffers. Reclaim residency at this safe
+        // point, then size it again from post-reservation free memory.
+        auto & f = *sched->moe_ffn;
+        f.wait_io();
+        ggml_backend_buffer_free(f.cache);
+        f.cache = nullptr; f.slots.clear(); f.slot_index.clear(); f.allocation_bytes = 0;
+    }
+    ggml_backend_sched_moe_ffn_scan(sched, measure_graph);
+    ggml_backend_sched_moe_resident_hybrid_plan_graph(sched, measure_graph);
     ggml_backend_sched_split_graph(sched, measure_graph);
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
@@ -2779,6 +4635,8 @@ static void ggml_sched_prepare_graph(ggml_backend_sched_t sched) {
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
 
+    ggml_backend_sched_moe_ffn_scan(sched, graph);
+    ggml_backend_sched_moe_resident_hybrid_plan_graph(sched, graph);
     ggml_backend_sched_split_graph(sched, graph);
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
@@ -2787,6 +4645,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     ggml_sched_prepare_graph(sched);
 
     sched->is_alloc = true;
+    sched->moe_resident_replan_required = false;
 
     return true;
 }
@@ -2798,6 +4657,10 @@ enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, st
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // split_graph rewrites node sources to scheduler-owned copies. Re-splitting
+    // an allocated graph would reuse those pointers after their context is reset.
+    // Keep its placement and use uncached copies until the caller builds a fresh
+    // graph. The pending rebuild is cleared only after successful allocation.
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }

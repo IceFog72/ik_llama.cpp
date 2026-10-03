@@ -44,6 +44,7 @@
 #include "ggml-cuda/conv-transpose-1d.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/graph.cuh"
+#include "ggml-cuda/moe-resident.h"
 #include "ggml-cuda/mmq_id.cuh"
 #include "ggml-cuda/quantize_id.cuh"
 #include "ggml-cuda/topk-moe.cuh"
@@ -4480,6 +4481,27 @@ GGML_CALL static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+static __global__ void ggml_cuda_moe_copy_rows_kernel(float * dst, const float * src,
+        const int32_t * ids, int64_t elements, int64_t width) {
+    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < elements && ids[i / width] < 0) dst[i] = src ? src[i] : 0.0f;
+}
+
+void ggml_backend_cuda_moe_copy_rows(ggml_backend_t backend, ggml_tensor * dst,
+        const ggml_tensor * src, const ggml_tensor * ids) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend) && dst->type == GGML_TYPE_F32 &&
+            ids->type == GGML_TYPE_I32 && ggml_is_contiguous(dst) && ggml_is_contiguous(ids) &&
+            dst->ne[1] == ids->ne[0] && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+            (!src || (src->type == GGML_TYPE_F32 && ggml_is_contiguous(src) && ggml_are_same_shape(src, dst))));
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(ctx->device);
+    const int64_t elements = ggml_nelements(dst);
+    ggml_cuda_moe_copy_rows_kernel<<<(elements + 255) / 256, 256, 0, ctx->stream()>>>(
+            static_cast<float *>(dst->data), src ? static_cast<const float *>(src->data) : nullptr,
+            static_cast<const int32_t *>(ids->data), elements, dst->ne[0]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 #ifdef USE_CUDA_GRAPH
 
 static inline const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
@@ -4758,7 +4780,15 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
     bool cuda_graph_update_required = false;
 
     if (use_cuda_graph && graph->graph == nullptr) {
-        if (ggml_cuda_info().devices[cuda_ctx->device].cc < CC_AMPERE) {
+        // Stable complete-FFN decode also supports graph replay on Turing.
+        // Retain the architecture gate for other graph shapes.
+        const bool complete_ffn = cgraph->n_nodes == 2 &&
+                cgraph->nodes[0]->op == GGML_OP_MOE_FUSED_UP_GATE &&
+                cgraph->nodes[1]->op == GGML_OP_MUL_MAT_ID &&
+                cgraph->nodes[1]->src[1] == cgraph->nodes[0] &&
+                cgraph->nodes[0]->src[2]->ne[2] == 1;
+        if (ggml_cuda_info().devices[cuda_ctx->device].cc < CC_AMPERE &&
+                !(complete_ffn && ggml_cuda_info().devices[cuda_ctx->device].cc >= CC_TURING)) {
             graph->disable_due_to_gpu_arch = true;
 #ifndef NDEBUG
             GGML_CUDA_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);
@@ -5511,6 +5541,13 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
 
 GGML_CALL bool ggml_backend_is_cuda(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_cuda_guid());
+}
+
+GGML_CALL int ggml_backend_cuda_get_device(ggml_backend_t backend) {
+    if (!ggml_backend_is_cuda(backend)) {
+        return -1;
+    }
+    return static_cast<const ggml_backend_cuda_context *>(backend->context)->device;
 }
 
 GGML_CALL int ggml_backend_cuda_get_device_count() {

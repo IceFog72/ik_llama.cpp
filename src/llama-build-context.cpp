@@ -1096,6 +1096,8 @@ ggml_tensor * llm_build_context::llm_build_lora_mm_id(
           struct ggml_tensor * w,   // struct ggml_tensor * as
           struct ggml_tensor * cur, // struct ggml_tensor * b
           struct ggml_tensor * ids) {
+    // FT slice B substitutes banks in llm_build_moe_ffn (il in scope there),
+    // not here: lora_mm_id has no layer index for the per-layer remap.
     struct ggml_tensor * cur_mm = cur;
     if (auto rot = lctx.model.hadamard_rotation(w); rot != nullptr) {
         cur_mm = llm_build_hadamard_rotate(ctx0, cur, *rot);
