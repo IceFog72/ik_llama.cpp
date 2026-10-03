@@ -236,6 +236,80 @@ static void test_cpu_repeated_routes() {
     ggml_free(ctx);
 }
 
+static void test_cpu_quantized_masked_rows() {
+    constexpr int width = 256, rows = 16, experts = 4, top_k = 4;
+    auto cpu = ggml_backend_cpu_init();
+    ggml_backend_cpu_set_n_threads(cpu, 4);
+    for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (const int tokens : {1, 2}) for (const int input_rows : {1, 2, top_k}) {
+            auto ctx = ggml_init({1024 * 1024, nullptr, true});
+            auto bank = ggml_new_tensor_3d(ctx, type, width, rows, experts);
+            auto act = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, input_rows, tokens);
+            auto ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, tokens);
+            auto out = ggml_mul_mat_id(ctx, bank, act, ids);
+            auto graph = ggml_new_graph_custom(ctx, 64, false);
+            ggml_build_forward_expand(graph, out);
+            auto reference_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, tokens);
+            auto reference_out = ggml_mul_mat_id(ctx, bank, act, reference_ids);
+            auto reference_graph = ggml_new_graph_custom(ctx, 64, false);
+            ggml_build_forward_expand(reference_graph, reference_out);
+            auto buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
+            GGML_ASSERT(buffer);
+            std::vector<float> weights(ggml_nelements(bank));
+            for (size_t i = 0; i < weights.size(); ++i) weights[i] = float(i / (width * rows) + 1);
+            std::vector<uint8_t> quantized(ggml_nbytes(bank));
+            ggml_quantize_chunk(type, weights.data(), quantized.data(), 0,
+                    ggml_nrows(bank), width, nullptr, nullptr);
+            ggml_backend_tensor_set(bank, quantized.data(), 0, quantized.size());
+            const int32_t routes[][top_k] = {
+                {0, 1, 2, 3}, {-1, 2, experts, 2}, {-1, experts, -1, experts}, {3, 3, 1, 0},
+            };
+            std::vector<int32_t> route(top_k * tokens);
+            std::vector<float> activation(ggml_nelements(act)), values(ggml_nelements(out)), reference(values.size());
+            for (int pass = 0; pass < 4; ++pass) {
+                for (int token = 0; token < tokens; ++token) {
+                    std::copy(routes[pass], routes[pass] + top_k, route.begin() + token * top_k);
+                    for (int row = 0; row < input_rows; ++row)
+                        std::fill_n(activation.begin() + (token * input_rows + row) * width,
+                                width, float(1 + pass + token * input_rows + row));
+                }
+                ggml_backend_tensor_set(act, activation.data(), 0, ggml_nbytes(act));
+                ggml_backend_tensor_set(ids, route.data(), 0, ggml_nbytes(ids));
+                check(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS,
+                        "quantized masked rows compute on a reused graph");
+                ggml_backend_tensor_get(out, values.data(), 0, ggml_nbytes(out));
+                // Quantization rounds even constant rows. Compare against the
+                // native unmasked path, replacing invalid experts with zero.
+                // Run it after the masked graph so it cannot prime that graph's
+                // scratch with the current activations and hide a reuse bug.
+                auto valid_route = route;
+                for (auto & expert : valid_route) if (expert < 0 || expert >= experts) expert = 0;
+                ggml_backend_tensor_set(reference_ids, valid_route.data(), 0, ggml_nbytes(reference_ids));
+                check(ggml_backend_graph_compute(cpu, reference_graph) == GGML_STATUS_SUCCESS,
+                        "native unmasked quantized reference computes");
+                ggml_backend_tensor_get(reference_out, reference.data(), 0, ggml_nbytes(reference_out));
+                bool correct = true;
+                for (int token = 0; token < tokens; ++token) for (int row = 0; row < top_k; ++row) {
+                    const int expert = route[token * top_k + row];
+                    for (int col = 0; col < rows; ++col) {
+                        const size_t index = (token * top_k + row) * rows + col;
+                        const float expected = expert < 0 || expert >= experts ? 0.0f : reference[index];
+                        correct = correct && std::abs(values[index] - expected)
+                                <= 1e-5f + 1e-5f * std::abs(expected);
+                    }
+                }
+                if (!correct) fprintf(stderr, "quantized mask oracle type=%s tokens=%d input_rows=%d pass=%d first=%.9g\n",
+                        ggml_type_name(type), tokens, input_rows, pass, values[0]);
+                check(correct, "quantized masked, repeated, shared and batched rows match native unmasked oracle");
+            }
+            ggml_backend_buffer_free(buffer);
+            ggml_free(ctx);
+        }
+    }
+    ggml_backend_free(cpu);
+}
+
 #ifdef GGML_USE_CUDA
 static void test_cuda_rebuild(ggml_backend_t cuda, bool allocation_failure) {
     auto cpu = ggml_backend_cpu_init();
@@ -986,6 +1060,7 @@ int main(int argc, char ** argv) {
     test_identity();
     test_hybrid_placement();
     test_cpu_repeated_routes();
+    test_cpu_quantized_masked_rows();
     if (argc > 1 && strcmp(argv[1], "--cuda") == 0) {
 #ifdef GGML_USE_CUDA
         test_cuda_copy();

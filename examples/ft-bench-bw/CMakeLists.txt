@@ -1,7 +1,0 @@
-set(TARGET ft-bench-bw)
-add_executable(${TARGET} ft-bench-bw.cpp)
-install(TARGETS ${TARGET} RUNTIME)
-target_link_libraries(${TARGET} PRIVATE ggml)
-target_include_directories(${TARGET} PRIVATE ../../common)
-target_compile_features(${TARGET} PRIVATE cxx_std_17)
-target_compile_definitions(${TARGET} PRIVATE $<$<BOOL:${GGML_CUDA}>:GGML_USE_CUDA>)
