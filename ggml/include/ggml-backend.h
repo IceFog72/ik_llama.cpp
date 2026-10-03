@@ -216,6 +216,8 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off);
     // Set before enabling residency; 0 preserves automatic sizing. Applies only to auto mode.
     GGML_API void                 ggml_backend_sched_set_moe_resident_budget(ggml_backend_sched_t sched, size_t bytes);
+    // Select before enabling residency; false uses the old positive-fill policy (default), true includes zero fills.
+    GGML_API void                 ggml_backend_sched_set_moe_resident_zero_fill(ggml_backend_sched_t sched, bool enabled);
     GGML_API void                 ggml_backend_sched_set_moe_resident(ggml_backend_sched_t sched, int slots);
     GGML_API void                 ggml_backend_sched_set_moe_resident_layers(ggml_backend_sched_t sched, int n_layers);
     // Allocated graphs retain their placement after a residency demotion.

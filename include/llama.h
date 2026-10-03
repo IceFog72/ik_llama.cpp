@@ -510,6 +510,7 @@ extern "C" {
         bool only_active_experts;
         int  moe_resident;        // FT slice B: resident (layer,expert) LRU slots per bank pool (0 = disabled, -1 = auto)
         int  moe_resident_mib;    // auto cache cap per CUDA backend in MiB (0 = existing automatic budget)
+        bool moe_resident_zero_fill; // new profiler includes zero fills; false selects the old profiler
         bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
         int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)
         bool k_cache_hadamard;  // if true, apply Hadamard transform to K-cache

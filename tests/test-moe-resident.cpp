@@ -857,7 +857,7 @@ static void test_cuda_copy() {
 #endif
 
 #ifdef GGML_USE_CUDA
-static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false) {
+static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false) {
     constexpr int width = 256, hidden = 512, experts = 16, top_k = 8, layers = 3;
     auto * cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
     check(cuda != nullptr, "complete FFN CUDA backend initializes");
@@ -867,6 +867,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
     ggml_backend_t backends[] = {cuda, cpu};
     auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 512, false);
     ggml_backend_sched_set_moe_resident_model_info(sched, layers, experts, top_k);
+    ggml_backend_sched_set_moe_resident_zero_fill(sched, !old_profiler);
     ggml_backend_sched_set_moe_resident(sched, -1);
     auto * sources = ggml_init({4 * 1024 * 1024, nullptr, true});
     ggml_tensor * banks[layers][3]{}, * gpu_banks[layers][3]{};
@@ -957,7 +958,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             make_bank(layers - 1, 2, hidden, 1);
         }
         const size_t old_cache_bytes = sched->moe_ffn ? sched->moe_ffn->allocation_bytes : 0;
-        if (!fail_cache && r == 5) {
+        if (!fail_cache && !zero_fill && r == 5) {
             // Grow an intermediate dimension on the same scheduler. All shared
             // slot strides and persistent CPU/device scratch must follow it.
             for (int b = 0; b < 3; ++b)
@@ -980,7 +981,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         }
         ggml_backend_tensor_set(ids, routes[r], 0, ggml_nbytes(ids));
         check(ggml_backend_sched_alloc_graph(sched, graph), "complete FFN graph allocates without bank staging");
-        if (!fail_cache && r == 5) {
+        if (!fail_cache && !zero_fill && r == 5) {
             check(!sched->moe_ffn->cache && sched->moe_ffn->slots.empty(),
                     "larger geometry releases the old global cache before execution");
         }
@@ -1030,7 +1031,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             for (const auto & samples : timing.misses) old_zero_samples += samples[0].count;
         check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
                 "complete FFN graph computes with masks and downstream weighting");
-        if (prefer_zero) {
+        if (prefer_zero && !old_profiler) {
             check(state.fills == old_fills && state.evictions == old_evictions && state.host_bytes == old_weights,
                     "zero fills preserves cache entries and uploads no expert weights");
             check(state.cpu_refs > old_cpu_refs, "zero fills executes misses on CPU");
@@ -1043,8 +1044,17 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                 check(zero_samples > old_zero_samples, "periodic recheck measures the zero-fill candidate");
             }
         }
+        if (prefer_zero && old_profiler) {
+            check(state.fills > old_fills && state.host_bytes > old_weights,
+                    "old profiler still fills misses when zero has the fastest seeded timing");
+            uint64_t zero_samples = 0;
+            for (const auto & timing : state.timings)
+                for (const auto & samples : timing.misses) zero_samples += samples[0].count;
+            check(zero_samples == old_zero_samples,
+                    "old profiler excludes zero fills from selection and periodic rechecks");
+        }
         sched->bufts[0] = original_buft;
-        if (!fail_cache && r == 5) check(sched->moe_ffn->allocation_bytes > old_cache_bytes,
+        if (!fail_cache && !zero_fill && r == 5) check(sched->moe_ffn->allocation_bytes > old_cache_bytes,
                 "larger geometry allocates complete slots with the new strides");
         if (r == 0 && !fail_cache && !zero_fill) {
             for (int layer = 0; layer < layers; ++layer) {
@@ -1128,6 +1138,16 @@ int main(int argc, char ** argv) {
     test_hybrid_placement();
     test_cpu_repeated_routes();
     test_cpu_quantized_masked_rows();
+    if (argc > 1 && strcmp(argv[1], "--cuda-profiler") == 0) {
+#ifdef GGML_USE_CUDA
+        // Focused policy checks use the injected tiny cache and do not need
+        // the reserve headroom required by the allocation/growth cases.
+        test_complete_ffn(false, false, false, true);
+        test_complete_ffn(false, false, false, true, true);
+#else
+        check(false, "CUDA profiler test requires a CUDA build");
+#endif
+    }
     if (argc > 1 && strcmp(argv[1], "--cuda") == 0) {
 #ifdef GGML_USE_CUDA
         test_cuda_budget_cap();
@@ -1137,6 +1157,7 @@ int main(int argc, char ** argv) {
         test_complete_ffn(false, true);
         test_complete_ffn(false, false, true);
         test_complete_ffn(false, false, false, true);
+        test_complete_ffn(false, false, false, true, true);
 #else
         check(false, "CUDA test requires a CUDA build");
 #endif

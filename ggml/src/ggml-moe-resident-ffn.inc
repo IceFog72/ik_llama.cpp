@@ -303,7 +303,8 @@ static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched
     }
     auto & timing = ggml_backend_sched_moe_ffn_timing(f, t, k);
     const int m = int(missing.size());
-    int q = 0;
+    const int first = sched->moe_resident_zero_fill ? 0 : 1;
+    int q = cache && m ? first : 0;
     bool probe = false;
     if (cache && m) {
         auto & samples = timing.misses[m];
@@ -311,14 +312,17 @@ static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched
         // candidate reject single hot-kernel/transfer measurements. Later probes
         // revisit the policy under changed host load without changing outputs.
         // Zero fills keeps existing GPU hits and computes every miss on CPU.
-        for (int candidate = 0; candidate <= m; ++candidate) {
+        for (int candidate = first; candidate <= m; ++candidate) {
             if (samples[candidate].count < 3) { q = candidate; probe = true; break; }
         }
         if (!probe) {
-            for (int candidate = 1; candidate <= m; ++candidate)
+            for (int candidate = first + 1; candidate <= m; ++candidate)
                 if (samples[candidate].us < samples[q].us) q = candidate;
             if (++timing.visits % 256 == 0) {
-                q = int((timing.visits / 256 - 1) % size_t(m + 1)); probe = true;
+                q = sched->moe_resident_zero_fill
+                        ? int((timing.visits / 256 - 1) % size_t(m + 1))
+                        : 1 + int((timing.visits / 256) % size_t(m));
+                probe = true;
             }
         }
     }

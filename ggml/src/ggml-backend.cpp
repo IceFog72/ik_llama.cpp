@@ -1469,6 +1469,7 @@ struct ggml_backend_sched {
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
 
     bool only_active_experts;
+    bool moe_resident_zero_fill = false;
     size_t moe_resident_cap_bytes;
     int moe_resident_slots;
     int moe_resident_layers;
@@ -1559,6 +1560,12 @@ void ggml_backend_sched_set_op_offload(ggml_backend_sched_t sched, enum ggml_op 
 void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
     if (!sched) return;
     sched->only_active_experts = on_or_off;
+}
+
+void ggml_backend_sched_set_moe_resident_zero_fill(ggml_backend_sched_t sched, bool enabled) {
+    if (!sched) return;
+    GGML_ASSERT(!sched->is_alloc);
+    sched->moe_resident_zero_fill = enabled;
 }
 
 void ggml_backend_sched_set_moe_resident_budget(ggml_backend_sched_t sched, size_t bytes) {

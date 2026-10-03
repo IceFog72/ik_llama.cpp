@@ -534,6 +534,7 @@ bool llama_prepare_dflash_graph_inputs(
         if (lctx.dflash.kv.cache_sched != nullptr) {
             ggml_backend_sched_set_moe_resident_model_info(lctx.dflash.kv.cache_sched,
                     lctx.model.hparams.n_layer, lctx.model.hparams.n_expert, lctx.model.hparams.n_expert_used);
+            ggml_backend_sched_set_moe_resident_zero_fill(lctx.dflash.kv.cache_sched, lctx.cparams.moe_resident_zero_fill);
             ggml_backend_sched_set_moe_resident_budget(lctx.dflash.kv.cache_sched, size_t(lctx.cparams.moe_resident_mib) * 1024 * 1024);
             ggml_backend_sched_set_moe_resident(lctx.dflash.kv.cache_sched, lctx.cparams.moe_resident);
         }
