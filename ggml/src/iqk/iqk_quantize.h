@@ -315,6 +315,18 @@ void   dequantize_row_q1_0_g128_r8(const block_q1_0_g128_r8  * GGML_RESTRICT x, 
 void   vec_dot_q1_0_g128_r8_q8_k(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
 void   repack_q1_0_g128_r8(int nrows, int n_per_row, const block_q1_0_g128 * GGML_RESTRICT x, block_q1_0_g128_r8 * GGML_RESTRICT y, bool online);
 
+void   repack_pq2_0_r8(int nrows, int n_per_row, const block_pq2_0 * GGML_RESTRICT x, block_pq2_0_r8 * GGML_RESTRICT y, bool online);
+void   dequantize_row_pq2_0_r8(const block_pq2_0_r8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void   quantize_row_pq2_0_r8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void   quantize_row_pq2_0_r8_ref(const float * GGML_RESTRICT x, block_pq2_0_r8 * GGML_RESTRICT y, int64_t k);
+void   vec_dot_pq2_0_r8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
+void   repack_ptq1_0_r8(int nrows, int n_per_row, const block_ptq1_0 * GGML_RESTRICT x, block_ptq1_0_r8 * GGML_RESTRICT y, bool online);
+void   dequantize_row_ptq1_0_r8(const block_ptq1_0_r8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void   quantize_row_ptq1_0_r8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
+void   quantize_row_ptq1_0_r8_ref(const float * GGML_RESTRICT x, block_ptq1_0_r8 * GGML_RESTRICT y, int64_t k);
+void   vec_dot_ptq1_0_r8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+
 void   quantize_row_mxfp4_r8_ref(const float * GGML_RESTRICT x, block_mxfp4_r8  * GGML_RESTRICT y, int64_t k);
 void   quantize_row_mxfp4_r8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 size_t quantize_mxfp4_r8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix, const struct quantize_user_data * use_data);
@@ -354,6 +366,9 @@ void iqk_quantize_any(int from_type, int to_type,
                       to_float_t to_float, from_float_t from_float, int ith, int nth);
 
 bool iqk_validate_tensor(const struct ggml_tensor * src);
+
+int  iqk_kt_codebook(int type, int bank, const int ** offsets, const int ** points, const float ** values, const float ** mid);
+void iqk_kt_finish_row(int type, const void * ypad, void * qrow, int64_t n_per_row);
 
 #ifdef __cplusplus
 }

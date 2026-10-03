@@ -1179,6 +1179,7 @@ static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, 
 static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
     return model.hparams.nextn_predict_layers > 0 &&
         (model.arch == LLM_ARCH_GLM_DSA ||
+         model.arch == LLM_ARCH_GLM5NEXT ||
          model.arch == LLM_ARCH_QWEN35MOE ||
          model.arch == LLM_ARCH_QWEN4EXP ||
          model.arch == LLM_ARCH_STEP35);
@@ -1476,7 +1477,8 @@ static bool llama_kv_cache_init(
             // indexer keys in F16 so a decoded token can score against ALL past keys.
             // GLM5NEXT's k-pool indexer packs [key; gate] per token (gate depends on the hidden
             // state and cannot be recomputed from the cache), so its row is 2*indexer_head_size.
-            if (has_glm_dsa_indexer && model.layers[i].indexer_attn_k && hparams.indexer_is_full[i] && !is_mtp_tail_layer) {
+            if (has_glm_dsa_indexer && model.layers[i].indexer_attn_k && hparams.indexer_is_full[i] &&
+                    (!is_mtp_tail_layer || (model.arch == LLM_ARCH_GLM5NEXT && cparams.dsa))) {
                 const uint32_t idx_row = (model.arch == LLM_ARCH_GLM5NEXT)
                     ? 2 * hparams.indexer_head_size : hparams.indexer_head_size;
                 ggml_tensor * kr = ggml_new_tensor_2d(ctx, idx_type_k, idx_row, kv_size);
@@ -5287,6 +5289,9 @@ static bool llm_load_tensors(
         ml.tensor_buft_overrides = nullptr;
     }
 
+    // Prism ternary Hadamard rotations
+    llm_load_hadamard(ml, model);
+
     // loading time will be recalculate after the first eval, so
     // we take page faults deferred by mmap() into consideration
     model.t_load_us = ggml_time_us() - model.t_start_us;
@@ -5334,7 +5339,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
 #endif
         }
         if (params.defer_ple) {
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
             if (!params.use_mmap) {
                 LLAMA_LOG_WARN("%s: --defer-ple had no effect: mmap is disabled\n", __func__);
             } else {
@@ -5344,7 +5349,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 }
             }
 #else
-            LLAMA_LOG_WARN("%s: deferred per-layer token embedding is only supported on Linux; ignoring defer_ple\n", __func__);
+            LLAMA_LOG_WARN("%s: deferred per-layer token embedding is only supported on Linux and Windows; ignoring defer_ple\n", __func__);
 #endif
         }
         try {
@@ -8629,6 +8634,8 @@ struct llama_context_params llama_context_default_params() {
         /*.offload_policy              =*/ nullptr,
         /*.cuda_params                 =*/ nullptr,
         /*.dflash_query_capacity       =*/ 0,
+        /*.cpu_affinity                =*/ nullptr,
+        /*.n_cpu_affinity              =*/ 0,
     };
 
     return result;
@@ -8661,6 +8668,7 @@ struct llama_model_quantize_params llama_model_quantize_default_params() {
         /*.dry_run                        =*/ false,
         /*.partial_requant                =*/ false,
         /*.slab_size                      =*/ 1ull << 30,
+        /*.cuda_quantize                  =*/ false,
         /*.imatrix                        =*/ nullptr,
         /*.kv_overrides                   =*/ nullptr,
         /*.custom_quants                  =*/ nullptr,
@@ -9262,6 +9270,7 @@ struct llama_context * llama_init_from_model(
     if (model->arch != LLM_ARCH_GLM4_MOE && model->arch != LLM_ARCH_QWEN35 &&
         model->arch != LLM_ARCH_QWEN35MOE && model->arch != LLM_ARCH_GEMMA4 &&
         model->arch != LLM_ARCH_GEMMA4_MTP && model->arch != LLM_ARCH_GLM_DSA &&
+        model->arch != LLM_ARCH_GLM5NEXT &&
         !llm_arch_is_dsv4(model->arch) &&
         model->arch != LLM_ARCH_STEP35 &&
         model->arch != LLM_ARCH_GEMMA4_ASSISTANT &&
@@ -9499,6 +9508,10 @@ struct llama_context * llama_init_from_model(
             return nullptr;
         }
         ctx->backends.push_back(ctx->backend_cpu);
+
+        if (params.cpu_affinity != NULL && params.n_cpu_affinity > 0) {
+            llama_set_cpu_affinity(ctx, params.cpu_affinity, params.n_cpu_affinity);
+        }
 
         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, params.idx_type_k, kv_size, cparams.offload_kqv,
                     params.type_k_first, params.type_k_last, params.type_v_first, params.type_v_last,
@@ -9831,6 +9844,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_JAIS:
         case LLM_ARCH_GLM5NEXT:
+        case LLM_ARCH_GLM5NEXT_DASHED:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -12759,6 +12773,14 @@ size_t llama_state_seq_load_file(struct llama_context * ctx, const char * filepa
 void llama_set_n_threads(struct llama_context * ctx, uint32_t n_threads, uint32_t n_threads_batch) {
     ctx->cparams.n_threads       = n_threads;
     ctx->cparams.n_threads_batch = n_threads_batch;
+}
+
+void llama_set_cpu_affinity(struct llama_context * ctx, const int32_t * cpus, int n_cpus) {
+    if (ctx->backend_cpu == nullptr) {
+        return;
+    }
+
+    ggml_backend_cpu_set_cpu_affinity(ctx->backend_cpu, cpus, n_cpus);
 }
 
 uint32_t llama_n_threads(struct llama_context * ctx) {

@@ -1712,10 +1712,68 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_q1_0_g128_r8,
         .from_float               = quantize_row_q1_0_g128_r8,
-        .from_float_ref           = (ggml_from_float_t)quantize_row_q1_0_g128_r8_ref,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q1_0_g128_r8_ref,
         .vec_dot                  = vec_dot_q1_0_g128_r8_q8_k,
         .vec_dot_type             = GGML_TYPE_Q8_K128,
         .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_PQ2_0_R8] = {
+        .type_name                = "pq2_0_r8",
+        .blck_size                = QK_PQ2_0,
+        .type_size                = sizeof(block_pq2_0_r8)/QK_PQ2_0_R8_ROWS,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_pq2_0_r8,
+        .from_float               = quantize_row_pq2_0_r8,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_pq2_0_r8_ref,
+        .vec_dot                  = vec_dot_pq2_0_r8_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K128,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_PTQ1_0_R8] = {
+        .type_name                = "ptq1_0_r8",
+        .blck_size                = QK_PTQ1_0,
+        .type_size                = sizeof(block_ptq1_0_r8)/QK_PTQ1_0_R8_ROWS,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ptq1_0_r8,
+        .from_float               = quantize_row_ptq1_0_r8,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_ptq1_0_r8_ref,
+        .vec_dot                  = vec_dot_ptq1_0_r8_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K128,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_PQ2_0] = {
+        .type_name                = "pq2_0",
+        .blck_size                = QK_PQ2_0,
+        .type_size                = sizeof(block_pq2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_pq2_0,
+        .from_float               = quantize_row_pq2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_pq2_0_ref,
+        .vec_dot                  = ggml_vec_dot_pq2_0_q8_K,
+        .vec_dot_type             = GGML_TYPE_Q8_K,
+        .nrows                    = 1,
+        .ncols                    = 1,
+        .gemv                     = ggml_gemv_pq2_0_q8_K,
+        .gemm                     = ggml_gemm_pq2_0_q8_K,
+        .row_meta_size            = 0,
+    },
+    [GGML_TYPE_PTQ1_0] = {
+        .type_name                = "ptq1_0",
+        .blck_size                = QK_PTQ1_0,
+        .type_size                = sizeof(block_ptq1_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_ptq1_0,
+        .from_float               = quantize_row_ptq1_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_ptq1_0_ref,
+        .vec_dot                  = ggml_vec_dot_ptq1_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+        .ncols                    = 1,
+        .gemv                     = ggml_gemv_ptq1_0_q8_0,
+        .gemm                     = ggml_gemm_ptq1_0_q8_0,
         .row_meta_size            = 0,
     },
     [GGML_TYPE_IQ3_K] = {
@@ -5204,6 +5262,8 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_IQ3_KT:        wtype = GGML_TYPE_IQ3_KT;   break;
         case GGML_FTYPE_MOSTLY_IQ4_KT:        wtype = GGML_TYPE_IQ4_KT;   break;
         case GGML_FTYPE_MOSTLY_Q1_0_128:      wtype = GGML_TYPE_Q1_0_G128;break;
+        case GGML_FTYPE_MOSTLY_PQ2_0:         wtype = GGML_TYPE_PQ2_0;   break;
+        case GGML_FTYPE_MOSTLY_PTQ1_0:        wtype = GGML_TYPE_PTQ1_0;  break;
         case GGML_FTYPE_MOSTLY_IQ3_K:         wtype = GGML_TYPE_IQ3_K;    break;
         case GGML_FTYPE_MOSTLY_IQ3_KS:        wtype = GGML_TYPE_IQ3_KS;   break;
         case GGML_FTYPE_MOSTLY_IQ2_KL:        wtype = GGML_TYPE_IQ2_KL;   break;
@@ -18366,8 +18426,9 @@ static int ggml_compute_forward_mul_mat(
                     (float *)dst_next->data, dst_next->nb[1]/sizeof(float), ith, nth)) break;
                 ++node_n;
             }
+            return node_n;
         }
-        return node_n;
+        // no IQK kernel: fall through to the generic vec_dot path
     }
 
     if (ith == 0) {
@@ -20268,6 +20329,8 @@ static void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q4_0_4_4:
         case GGML_TYPE_Q4_0_4_8:
         case GGML_TYPE_Q4_0_8_8:
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_PTQ1_0:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -21041,6 +21104,10 @@ static void ggml_compute_forward_clamp(
         case GGML_TYPE_Q8_KV:
         case GGML_TYPE_Q8_K16:
         case GGML_TYPE_Q8_K32:
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_PQ2_0_R8:
+        case GGML_TYPE_PTQ1_0:
+        case GGML_TYPE_PTQ1_0_R8:
         case GGML_TYPE_Q4_0_4_4:
         case GGML_TYPE_Q4_0_4_8:
         case GGML_TYPE_Q4_0_8_8:
@@ -28889,11 +28956,42 @@ static void clear_numa_thread_affinity(void) {
 
     CPU_FREE(cpus);
 }
+
+// pin worker `thread_n` to its assigned logical CPU (no-op without affinity)
+static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) {
+    if (cplan == NULL || cplan->cpu_affinity == NULL || cplan->n_cpu_affinity <= 0) {
+        return;
+    }
+
+    if (thread_n == 0 && cplan->n_threads > cplan->n_cpu_affinity) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "warning: n_threads (%d) exceeds the %d CPUs in the affinity list, threads are stacked\n",
+                    cplan->n_threads, cplan->n_cpu_affinity);
+        }
+    }
+
+    const int cpu = cplan->cpu_affinity[thread_n % cplan->n_cpu_affinity];
+    if (cpu < 0 || cpu >= CPU_SETSIZE) {
+        return;
+    }
+
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    CPU_SET(cpu, &mask);
+
+    const int rv = pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
+    if (rv) {
+        fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
+    }
+}
 #else
 // TODO: Windows etc.
 // (the linux implementation may also work on BSD, someone should test)
 static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
+static void set_cpu_thread_affinity(const struct ggml_cplan * cplan, int thread_n) { UNUSED(cplan); UNUSED(thread_n); }
 #endif
 
 static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
@@ -29394,6 +29492,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     const struct ggml_cplan  * cplan  = state->shared->cplan;
 
     set_numa_thread_affinity(state->ith);
+    set_cpu_thread_affinity(cplan, state->ith); // explicit affinity takes precedence over NUMA
 
     struct ggml_compute_params params = {
         /*.ith   =*/ state->ith,
@@ -29446,6 +29545,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
     int n_threads = cplan->n_threads;
+
+#if defined(__gnu_linux__)
+    // the calling thread is worker 0 and gets pinned below; remember its affinity
+    cpu_set_t saved_affinity;
+    const bool restore_affinity =
+        cplan->cpu_affinity != NULL && cplan->n_cpu_affinity > 0 &&
+        pthread_getaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity) == 0;
+#endif
 
     struct ggml_compute_state_shared state_shared = {
         /*.cgraph                  =*/ cgraph,
@@ -29526,6 +29633,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+#if defined(__gnu_linux__)
+    if (restore_affinity) {
+        pthread_setaffinity_np(pthread_self(), sizeof(saved_affinity), &saved_affinity);
+    }
+#endif
 
     return state_shared.ec;
 }
@@ -31275,6 +31388,8 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_IQ3_KT:  result = quantize_iq3_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ4_KT:  result = quantize_iq4_kt (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_Q1_0_G128: result = quantize_q1_0_g128(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
+        case GGML_TYPE_PQ2_0:   result = quantize_pq2_0 (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
+        case GGML_TYPE_PTQ1_0:  result = quantize_ptq1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ3_K:   result = quantize_iq3_k  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ3_KS:  result = quantize_iq3_ks (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_IQ2_KL:  result = quantize_iq2_kl (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
