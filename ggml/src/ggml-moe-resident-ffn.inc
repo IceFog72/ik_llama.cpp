@@ -1,3 +1,6 @@
+// Hybrid expert residency and CPU/GPU execution inspired by FreeToken:
+// https://arxiv.org/abs/2608.16157
+
 // Scheduler-private complete-expert decode. Included after the resident-pool
 // helpers so off/fixed and unsupported graphs keep their existing path.
 static bool ggml_backend_sched_moe_ffn_node(ggml_backend_sched_t sched, const ggml_tensor * node) {

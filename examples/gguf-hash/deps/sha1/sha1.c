@@ -201,8 +201,6 @@ void SHA1Update(
     uint32_t len
 )
 {
-    uint32_t i;
-
     uint32_t j;
 
     j = context->count[0];
@@ -210,19 +208,20 @@ void SHA1Update(
         context->count[1]++;
     context->count[1] += (len >> 29);
     j = (j >> 3) & 63;
-    if ((j + len) > 63)
+    if (len >= 64 - j)
     {
-        memcpy(&context->buffer[j], data, (i = 64 - j));
+        const uint32_t fill = 64 - j;
+        memcpy(&context->buffer[j], data, fill);
         SHA1Transform(context->state, context->buffer);
-        for (; i + 63 < len; i += 64)
+        data += fill;
+        len -= fill;
+        for (; len >= 64; data += 64, len -= 64)
         {
-            SHA1Transform(context->state, &data[i]);
+            SHA1Transform(context->state, data);
         }
         j = 0;
     }
-    else
-        i = 0;
-    memcpy(&context->buffer[j], &data[i], len - i);
+    memcpy(&context->buffer[j], data, len);
 }
 
 

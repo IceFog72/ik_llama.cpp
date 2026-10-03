@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <fstream>
 
+// No-copy n-gram cache lookups adapted from jadidbourbaki:
+// https://github.com/jadidbourbaki/llama.cpp/pull/2
+
 void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, int ngram_max,
                               std::vector<llama_token> & inp, int nnew, bool print_progress) {
     const int64_t t_start_ms = ggml_time_ms();
