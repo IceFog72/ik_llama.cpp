@@ -677,6 +677,19 @@ static const ggml_type_traits_t type_traits[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
         .row_meta_size            = 0,
     },
+    [GGML_TYPE_Q2_0] = {
+        .type_name                = "q2_0",
+        .blck_size                = QK2_0,
+        .type_size                = sizeof(block_q2_0),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
+        .from_float               = quantize_row_q2_0,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
+        .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+        .row_meta_size            = 0,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -2038,6 +2051,7 @@ static float fudge_factors[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F64]        = 1.0f,
     [GGML_TYPE_F32]        = 1.0f,
     [GGML_TYPE_F16]        = 1.0f,
+    [GGML_TYPE_Q2_0]       = 1.0f,
     [GGML_TYPE_Q4_0]       = 1.0f,
     [GGML_TYPE_Q4_1]       = 1.0f,
     [4]                    = 1.0f,
@@ -13789,6 +13803,7 @@ static void ggml_compute_forward_add(
                     GGML_ABORT("fatal error");
                 }
             } break;
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -14342,6 +14357,7 @@ static void ggml_compute_forward_add1(
                     GGML_ABORT("fatal error");
                 }
             } break;
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -14525,6 +14541,7 @@ static void ggml_compute_forward_acc(
             } break;
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -18641,7 +18658,8 @@ static void ggml_compute_forward_mul_mat_id(
 
 #if GGML_USE_IQK_MULMAT
 #if defined GGML_EXPERT_CHUNKING
-    if (ne13 == 1 && dst->type == GGML_TYPE_F32) {
+    // Q2_0 has no IQK kernel; all threads must take the scalar fallback together.
+    if (type != GGML_TYPE_Q2_0 && ne13 == 1 && dst->type == GGML_TYPE_F32) {
         const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
 
@@ -19421,6 +19439,7 @@ static void ggml_compute_forward_out_prod(
     const struct ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -19845,6 +19864,7 @@ static void ggml_compute_forward_set(
             } break;
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -20250,6 +20270,7 @@ static void ggml_compute_forward_get_rows(
     }
 
     switch (src0->type) {
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -21022,6 +21043,7 @@ static void ggml_compute_forward_clamp(
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
         case GGML_TYPE_BF16_R16:
+        case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -31326,6 +31348,7 @@ size_t ggml_quantize_chunk(
     size_t result = 0;
 
     switch (type) {
+        case GGML_TYPE_Q2_0:    result = quantize_q2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix, user_data); break;
