@@ -1256,12 +1256,13 @@ struct ggml_backend_sched_moe_decode {
     }
 };
 
-// One complete-expert slot mapping is shared by all projections and layers.
+// Complete-expert slots are shared by layers with identical bank layouts.
 // Task descriptors have scheduler lifetime. Host I/O has a single owner, and
 // its completion event is waited before reuse or destruction.
 struct ggml_backend_sched_moe_ffn {
     struct task {
         int layer = -1;
+        size_t group = 0;
         ggml_tensor * up = nullptr, * down = nullptr;
         ggml_tensor * banks[3]{};
         ggml_tensor host_act{}, host_ids{}, host_up{}, host_down{};
@@ -1287,10 +1288,59 @@ struct ggml_backend_sched_moe_ffn {
     };
     std::vector<std::unique_ptr<task>> tasks;
     std::unordered_map<const ggml_tensor *, task *> graph_tasks;
-    std::vector<slot> slots;
-    std::unordered_map<uint64_t, int> slot_index;
+    struct group {
+        struct layout {
+            bool present = false;
+            ggml_type type = GGML_TYPE_F32;
+            int64_t columns = 0, rows = 0;
+            size_t bytes = 0;
+        } banks[3];
+        size_t strides[3]{}, offsets[3]{};
+        std::vector<slot> slots;
+        std::unordered_map<uint64_t, int> slot_index;
+    };
+    std::vector<group> groups;
     std::vector<timing> timings;
-    size_t strides[3]{}, offsets[3]{}, allocation_bytes = 0;
+    size_t allocation_bytes = 0;
+    size_t slot_count() const {
+        size_t count = 0;
+        for (const auto & g : groups) count += g.slots.size();
+        return count;
+    }
+    bool plan_cache(size_t budget, int top_k, size_t shared_layers = 0) {
+        std::vector<size_t> layer_counts(groups.size(), 0), expert_bytes(groups.size(), 0);
+        for (const auto & t : tasks) if (t) ++layer_counts[t->group];
+        long double weight = 0;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            for (size_t stride : groups[i].strides) {
+                if (stride > SIZE_MAX - expert_bytes[i]) { return false; }
+                expert_bytes[i] += stride;
+            }
+            weight += static_cast<long double>(expert_bytes[i]) * layer_counts[i];
+        }
+        if (top_k <= 0 || !weight) { return false; }
+        size_t offset = 0;
+        for (size_t i = 0; i < groups.size(); ++i) {
+            auto & g = groups[i];
+            if (!layer_counts[i]) continue;
+            // Allocate the same resident fraction to each layout, then round down
+            // to whole experts. All groups together remain within the shared cap.
+            const size_t share = size_t(static_cast<long double>(budget) * expert_bytes[i] * layer_counts[i] / weight);
+            const size_t target = (shared_layers ? shared_layers : layer_counts[i]) * size_t(top_k) * 2;
+            const size_t slots = std::min({share / expert_bytes[i], (budget - offset) / expert_bytes[i], target, size_t(INT_MAX)});
+            if (slots < size_t(top_k)) { return false; }
+            g.slots.resize(slots);
+            for (int b = 0; b < 3; ++b) { g.offsets[b] = offset; offset += slots * g.strides[b]; }
+        }
+        allocation_bytes = offset;
+        return true;
+    }
+    void clear_cache() {
+        ggml_backend_buffer_free(cache);
+        cache = nullptr;
+        for (auto & g : groups) { g.slots.clear(); g.slot_index.clear(); }
+        allocation_bytes = 0;
+    }
     ggml_backend_buffer_t cache = nullptr;
     ggml_backend_buffer_t activation = nullptr, intermediate = nullptr, output = nullptr;
     ggml_backend_buffer_t ids = nullptr, device_ids = nullptr, device_cpu = nullptr;
@@ -1470,6 +1520,7 @@ struct ggml_backend_sched {
 
     bool only_active_experts;
     bool moe_resident_zero_fill = false;
+    bool moe_resident_grouping = false; // layout-grouped complete cache; shared cache by default
     size_t moe_resident_cap_bytes;
     int moe_resident_slots;
     int moe_resident_layers;
@@ -1566,6 +1617,13 @@ void ggml_backend_sched_set_moe_resident_zero_fill(ggml_backend_sched_t sched, b
     if (!sched) return;
     GGML_ASSERT(!sched->is_alloc);
     sched->moe_resident_zero_fill = enabled;
+}
+
+void ggml_backend_sched_set_moe_resident_grouping(ggml_backend_sched_t sched, bool enabled) {
+    if (!sched) return;
+    // Cache geometry is fixed for the lifetime of the complete-FFN state.
+    GGML_ASSERT(!sched->is_alloc && !sched->moe_ffn);
+    sched->moe_resident_grouping = enabled;
 }
 
 void ggml_backend_sched_set_moe_resident_budget(ggml_backend_sched_t sched, size_t bytes) {
@@ -4395,7 +4453,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_backend_sched_synchronize(sched);
         auto & f = *sched->moe_ffn;
         fprintf(stderr, "ggml_backend_sched: moe-resident complete-ffn slots=%zu cache=%zu MiB budget=%zu MiB reserve=%zu MiB layers=%llu hits=%llu fills=%llu evictions=%llu cpu_refs=%llu gpu_refs=%llu h2d_weights=%llu h2d_results=%llu d2d_weights=0\n",
-                f.slots.size(), f.allocation_bytes / (1024 * 1024), f.budget_bytes / (1024 * 1024), f.reserve_bytes / (1024 * 1024),
+                f.slot_count(), f.allocation_bytes / (1024 * 1024), f.budget_bytes / (1024 * 1024), f.reserve_bytes / (1024 * 1024),
                 (unsigned long long)f.layers, (unsigned long long)f.hits, (unsigned long long)f.fills,
                 (unsigned long long)f.evictions, (unsigned long long)f.cpu_refs, (unsigned long long)f.gpu_refs,
                 (unsigned long long)f.host_bytes, (unsigned long long)f.result_bytes);
@@ -4549,8 +4607,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
         // point, then size it again from post-reservation free memory.
         auto & f = *sched->moe_ffn;
         f.wait_io();
-        ggml_backend_buffer_free(f.cache);
-        f.cache = nullptr; f.slots.clear(); f.slot_index.clear(); f.allocation_bytes = 0;
+        f.clear_cache();
     }
     ggml_backend_sched_moe_ffn_scan(sched, measure_graph);
     ggml_backend_sched_moe_resident_hybrid_plan_graph(sched, measure_graph);

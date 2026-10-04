@@ -8624,6 +8624,7 @@ struct llama_context_params llama_context_default_params() {
         /*.moe_resident                =*/ 0,
         /*.moe_resident_mib            =*/ 0,
         /*.moe_resident_zero_fill      =*/ false,
+        /*.moe_resident_grouping       =*/ false,
         /*.prefetch_experts            =*/ false,
         /*.prefetch_experts_threads    =*/ 0,
         /*.k_cache_hadamard            =*/ false,
@@ -9164,6 +9165,7 @@ struct llama_context * llama_init_from_model(
     cparams.moe_resident     = params.moe_resident;
     cparams.moe_resident_mib = params.moe_resident_mib;
     cparams.moe_resident_zero_fill = params.moe_resident_zero_fill;
+    cparams.moe_resident_grouping = params.moe_resident_grouping;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.worst_graph_tokens = params.worst_case_tokens;
@@ -9336,6 +9338,7 @@ struct llama_context * llama_init_from_model(
     if (cparams.moe_resident < 0) {
         LLAMA_LOG_INFO("%s: moe_resident profiler = %s\n", __func__,
                 cparams.moe_resident_zero_fill ? "new (zero fills allowed)" : "old (positive fills only)");
+        LLAMA_LOG_INFO("%s: moe_resident grouping = %s\n", __func__, cparams.moe_resident_grouping ? "layout" : "off");
     }
     if (cparams.moe_resident != 0) {
         LLAMA_LOG_INFO("%s: moe_resident = %s\n", __func__,
@@ -9691,6 +9694,7 @@ struct llama_context * llama_init_from_model(
             ggml_backend_sched_set_moe_resident_model_info(ctx->sched,
                     model->hparams.n_layer, model->hparams.n_expert, model->hparams.n_expert_used);
             ggml_backend_sched_set_moe_resident_zero_fill(ctx->sched, cparams.moe_resident_zero_fill);
+            ggml_backend_sched_set_moe_resident_grouping(ctx->sched, cparams.moe_resident_grouping);
             ggml_backend_sched_set_moe_resident_budget(ctx->sched, size_t(cparams.moe_resident_mib) * 1024 * 1024);
             ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
 
@@ -9724,6 +9728,7 @@ struct llama_context * llama_init_from_model(
                     ggml_backend_sched_set_moe_resident_model_info(ctx->sched,
                             model->hparams.n_layer, model->hparams.n_expert, model->hparams.n_expert_used);
                     ggml_backend_sched_set_moe_resident_zero_fill(ctx->sched, cparams.moe_resident_zero_fill);
+                    ggml_backend_sched_set_moe_resident_grouping(ctx->sched, cparams.moe_resident_grouping);
                     ggml_backend_sched_set_moe_resident_budget(ctx->sched, size_t(cparams.moe_resident_mib) * 1024 * 1024);
                     ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);

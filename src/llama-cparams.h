@@ -56,6 +56,7 @@ struct llama_cparams {
     int  moe_resident;   // FT slice B: resident (layer,expert) LRU slots per bank pool (0 = disabled, -1 = auto)
     int  moe_resident_mib;     // auto cache cap per CUDA backend in MiB (0 = existing automatic budget)
     bool moe_resident_zero_fill; // new profiler includes zero fills; false selects the old profiler
+    bool moe_resident_grouping; // layout-grouped complete cache (default: false)
     bool mtp;
     int  worst_graph_tokens;
     int  dflash_query_capacity = 0; // internal DFlash query capacity override

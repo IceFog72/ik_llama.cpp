@@ -857,7 +857,7 @@ static void test_cuda_copy() {
 #endif
 
 #ifdef GGML_USE_CUDA
-static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false) {
+static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false, bool skip_growth = false, bool grouping = true) {
     constexpr int width = 256, hidden = 512, experts = 16, top_k = 8, layers = 3;
     auto * cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
     check(cuda != nullptr, "complete FFN CUDA backend initializes");
@@ -867,6 +867,8 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
     ggml_backend_t backends[] = {cuda, cpu};
     auto * sched = ggml_backend_sched_new(backends, nullptr, 2, 512, false);
     ggml_backend_sched_set_moe_resident_model_info(sched, layers, experts, top_k);
+    check(!sched->moe_resident_grouping, "cache grouping defaults to off");
+    ggml_backend_sched_set_moe_resident_grouping(sched, grouping);
     ggml_backend_sched_set_moe_resident_zero_fill(sched, !old_profiler);
     ggml_backend_sched_set_moe_resident(sched, -1);
     auto * sources = ggml_init({4 * 1024 * 1024, nullptr, true});
@@ -950,7 +952,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             // Replace the DOWN bank while this layer has a live cached expert.
             // Repeating that expert makes stale slot reuse observable.
             int cached_expert = -1;
-            for (const auto & slot : sched->moe_ffn->slots)
+            for (const auto & slot : sched->moe_ffn->groups[sched->moe_ffn->tasks[layers - 1]->group].slots)
                 if (slot.layer == layers - 1) { cached_expert = slot.expert; break; }
             check(cached_expert >= 0, "bank identity regression starts with a live resident expert");
             GGML_ASSERT(cached_expert >= 0);
@@ -958,7 +960,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             make_bank(layers - 1, 2, hidden, 1);
         }
         const size_t old_cache_bytes = sched->moe_ffn ? sched->moe_ffn->allocation_bytes : 0;
-        if (!fail_cache && !zero_fill && r == 5) {
+        if (!fail_cache && !zero_fill && !skip_growth && r == 5) {
             // Grow an intermediate dimension on the same scheduler. All shared
             // slot strides and persistent CPU/device scratch must follow it.
             for (int b = 0; b < 3; ++b)
@@ -981,9 +983,9 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         }
         ggml_backend_tensor_set(ids, routes[r], 0, ggml_nbytes(ids));
         check(ggml_backend_sched_alloc_graph(sched, graph), "complete FFN graph allocates without bank staging");
-        if (!fail_cache && !zero_fill && r == 5) {
-            check(!sched->moe_ffn->cache && sched->moe_ffn->slots.empty(),
-                    "larger geometry releases the old global cache before execution");
+        if (!fail_cache && !zero_fill && !skip_growth && r == 5) {
+            check(!sched->moe_ffn->cache && sched->moe_ffn->slot_count() == 0,
+                    "larger geometry releases the old grouped cache before execution");
         }
         if (!injected) {
             check(sched->moe_ffn && sched->moe_ffn->graph_tasks.size() == 2 * layers,
@@ -994,11 +996,15 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                 // A deliberately tiny global cache forces cross-layer eviction.
                 const size_t capacity = top_k;
                 size_t bytes = 0;
-                for (int b = 0; b < 3; ++b) { f.offsets[b] = bytes; bytes += capacity * f.strides[b]; }
+                check(f.groups.size() == (mixed_quant && grouping ? 2u : 1u), "matching layouts share slots and different quantization separates them");
+                for (auto & g : f.groups) {
+                    for (int b = 0; b < 3; ++b) { g.offsets[b] = bytes; bytes += capacity * g.strides[b]; }
+                    g.slots.resize(capacity);
+                }
                 f.cache = ggml_backend_buft_alloc_buffer(original_buft, bytes);
                 GGML_ASSERT(f.cache);
                 ggml_backend_buffer_clear(f.cache, 0);
-                f.slots.resize(capacity); f.allocation_bytes = bytes;
+                f.allocation_bytes = bytes;
                 for (auto & task : f.tasks) if (task) {
                     auto & timing = ggml_backend_sched_moe_ffn_timing(f, *task, top_k);
                     for (size_t m = 1; m < timing.misses.size(); ++m) for (size_t q = 0; q <= m; ++q) {
@@ -1054,7 +1060,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                     "old profiler excludes zero fills from selection and periodic rechecks");
         }
         sched->bufts[0] = original_buft;
-        if (!fail_cache && !zero_fill && r == 5) check(sched->moe_ffn->allocation_bytes > old_cache_bytes,
+        if (!fail_cache && !zero_fill && !skip_growth && r == 5) check(sched->moe_ffn->allocation_bytes > old_cache_bytes,
                 "larger geometry allocates complete slots with the new strides");
         if (r == 0 && !fail_cache && !zero_fill) {
             for (int layer = 0; layer < layers; ++layer) {
@@ -1115,12 +1121,14 @@ static void test_cuda_budget_cap() {
         sched->moe_ffn = new ggml_backend_sched_moe_ffn;
         // Three one-MiB projections form one complete expert. A four-MiB
         // cap must allocate one slot, while one MiB must fall back to CPU.
-        for (auto & stride : sched->moe_ffn->strides) stride = mib;
+        sched->moe_ffn->groups.resize(1);
+        for (auto & stride : sched->moe_ffn->groups[0].strides) stride = mib;
+        sched->moe_ffn->tasks.emplace_back(new ggml_backend_sched_moe_ffn::task);
         const bool allocated = ggml_backend_sched_moe_ffn_cache(sched, cuda);
         check(allocated == (cap == 4 * mib), "cap controls real complete-cache allocation");
         check(sched->moe_ffn->allocation_bytes <= cap,
                 "device expert-cache allocation stays within the cap");
-        if (allocated) check(sched->moe_ffn->slots.size() == 1,
+        if (allocated) check(sched->moe_ffn->slot_count() == 1,
                 "capped allocation rounds down to complete expert slots");
         else check(sched->moe_ffn->disabled && ggml_backend_sched_moe_resident_needs_rebuild(sched),
                 "insufficient cap safely requests CPU fallback and a fresh graph");
@@ -1131,7 +1139,41 @@ static void test_cuda_budget_cap() {
 }
 #endif
 
+static void test_layout_capacity() {
+    ggml_backend_sched_moe_ffn f;
+    f.groups.resize(2);
+    f.groups[0].strides[0] = 100;
+    f.groups[1].strides[0] = 200;
+    for (size_t group : {0u, 0u, 1u}) {
+        f.tasks.emplace_back(new ggml_backend_sched_moe_ffn::task);
+        f.tasks.back()->group = group;
+    }
+    check(f.plan_cache(1200, 2), "mixed layouts fit their proportional shares");
+    check(f.groups[0].slots.size() == 6 && f.groups[1].slots.size() == 3,
+            "equal host-weight shares produce different whole-expert capacities");
+    check(f.allocation_bytes == 1200, "group allocations obey the aggregate budget");
+    f.clear_cache();
+    check(f.plan_cache(1251, 2) && f.allocation_bytes <= 1251,
+            "fractional group shares round down within the cap");
+    f.clear_cache();
+    check(!f.plan_cache(799, 2), "undersized layout working set safely rejects residency");
+    f.clear_cache();
+    f.groups.resize(3); // An obsolete layout with no layers gets no allocation.
+    f.groups[2].strides[0] = 100000;
+    check(f.plan_cache(1200, 2) && f.groups[2].slots.empty() && f.allocation_bytes == 1200,
+            "inactive layouts do not consume the shared budget");
+    f.clear_cache();
+    f.groups.resize(1);
+    f.tasks.resize(1);
+    check(f.plan_cache(5000, 2, 4) && f.slot_count() == 16,
+            "shared mode preserves the model-wide two-working-set bound");
+    f.clear_cache();
+    check(f.plan_cache(5000, 2) && f.slot_count() == 4,
+            "layout mode bounds capacity by its member layers");
+}
+
 int main(int argc, char ** argv) {
+    test_layout_capacity();
     test_history();
     test_history_boundaries();
     test_identity();
@@ -1148,6 +1190,16 @@ int main(int argc, char ** argv) {
         check(false, "CUDA profiler test requires a CUDA build");
 #endif
     }
+    if (argc > 1 && strcmp(argv[1], "--cuda-layout") == 0) {
+#ifdef GGML_USE_CUDA
+        test_complete_ffn(false, false, true, false, true, true);
+        test_complete_ffn(true, false, false, false, true, true);
+        test_complete_ffn(false, false, true, false, true, true, false);
+        test_complete_ffn(true, false, false, false, true, true, false);
+#else
+        check(false, "CUDA layout test requires a CUDA build");
+#endif
+    }
     if (argc > 1 && strcmp(argv[1], "--cuda") == 0) {
 #ifdef GGML_USE_CUDA
         test_cuda_budget_cap();
@@ -1156,6 +1208,8 @@ int main(int argc, char ** argv) {
         test_complete_ffn(true, false);
         test_complete_ffn(false, true);
         test_complete_ffn(false, false, true);
+        test_complete_ffn(false, false, true, false, true, false, false);
+        test_complete_ffn(true, false, false, false, true, false, false);
         test_complete_ffn(false, false, false, true);
         test_complete_ffn(false, false, false, true, true);
 #else

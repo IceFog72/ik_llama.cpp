@@ -136,32 +136,63 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
             f.graph_tasks.erase(f.tasks[layer]->up); f.graph_tasks.erase(f.tasks[layer]->down);
             repeated_layers.insert(layer); note(sched->MOE_FFN_R_REPEATED); continue;
         }
-        bool changed = false;
+        ggml_backend_sched_moe_ffn::group layout;
         for (int b = 0; b < 3; ++b) {
             if (!banks[b]) continue;
             const size_t bytes = banks[b]->nb[2];
             if (bytes > SIZE_MAX - 1024) { supported = false; break; }
-            const size_t stride = (bytes + 1023) / 512 * 512;
-            if (stride > f.strides[b]) { f.strides[b] = stride; changed = true; }
+            layout.banks[b] = {true, banks[b]->type, banks[b]->ne[0], banks[b]->ne[1], bytes};
+            layout.strides[b] = (bytes + 1023) / 512 * 512;
         }
         if (!supported) continue;
         // The fused CUDA operator uses a common expert stride for UP/GATE.
-        if (banks[1]) {
-            const size_t stride = std::max(f.strides[0], f.strides[1]);
-            changed = changed || f.strides[0] != stride || f.strides[1] != stride;
-            f.strides[0] = f.strides[1] = stride;
-        }
-        if (changed && f.cache) {
-            ggml_backend_sched_synchronize(sched);
-            f.wait_io();
-            ggml_backend_buffer_free(f.cache);
-            f.cache = nullptr; f.slots.clear(); f.slot_index.clear(); f.allocation_bytes = 0;
+        if (banks[1]) layout.strides[0] = layout.strides[1] = std::max(layout.strides[0], layout.strides[1]);
+        size_t group = 0;
+        if (sched->moe_resident_grouping) {
+            for (; group < f.groups.size(); ++group) {
+                bool same = true;
+                for (int b = 0; b < 3; ++b) {
+                    const auto & a = layout.banks[b]; const auto & old = f.groups[group].banks[b];
+                    same = same && a.present == old.present && a.type == old.type &&
+                            a.columns == old.columns && a.rows == old.rows && a.bytes == old.bytes;
+                }
+                if (same) break;
+            }
+            const bool new_group = group == f.groups.size();
+            const bool changed = new_group || size_t(layer) >= f.tasks.size() || !f.tasks[layer] || f.tasks[layer]->group != group;
+            if (changed && f.cache) {
+                ggml_backend_sched_synchronize(sched);
+                f.wait_io();
+                f.clear_cache();
+            }
+            if (new_group) f.groups.push_back(std::move(layout));
+        } else {
+            // Preserve the original shared pool: each projection retains its
+            // largest observed stride, with one mapping across all layers.
+            if (f.groups.empty()) f.groups.emplace_back();
+            auto & shared = f.groups[0];
+            bool changed = false;
+            for (int b = 0; b < 3; ++b) {
+                if (layout.strides[b] > shared.strides[b]) {
+                    shared.strides[b] = layout.strides[b]; changed = true;
+                }
+            }
+            if (banks[1]) {
+                const size_t stride = std::max(shared.strides[0], shared.strides[1]);
+                changed = changed || shared.strides[0] != stride || shared.strides[1] != stride;
+                shared.strides[0] = shared.strides[1] = stride;
+            }
+            if (changed && f.cache) {
+                ggml_backend_sched_synchronize(sched);
+                f.wait_io();
+                f.clear_cache();
+            }
         }
         if (!ggml_backend_sched_moe_ffn_scratch(sched, up, down)) { note(sched->MOE_FFN_R_SCRATCH); continue; }
         if (size_t(layer) >= f.tasks.size()) f.tasks.resize(size_t(layer) + 1);
         if (!f.tasks[layer]) f.tasks[layer] = std::make_unique<ggml_backend_sched_moe_ffn::task>();
         auto & t = *f.tasks[layer];
-        t.layer = layer; t.up = up; t.down = down;
+        t.layer = layer; t.group = group; t.up = up; t.down = down;
         for (int b = 0; b < 3; ++b) t.banks[b] = banks[b];
         f.graph_tasks[up] = &t; f.graph_tasks[down] = &t;
     }
@@ -186,32 +217,22 @@ static bool ggml_backend_sched_moe_ffn_cache(ggml_backend_sched_t sched, ggml_ba
     f.reserve_bytes = std::max<size_t>(256 * 1024 * 1024, free_bytes / 8);
     f.budget_bytes = ggml_backend_sched_moe_resident_cap_budget(sched,
             free_bytes > f.reserve_bytes ? free_bytes - f.reserve_bytes : 0);
-    size_t expert_bytes = 0;
-    for (size_t stride : f.strides) {
-        if (stride > SIZE_MAX - expert_bytes) { f.disabled = true; return false; }
-        expert_bytes += stride;
-    }
-    if (!expert_bytes) { f.disabled = true; return false; }
-    // Two full active working sets over the entire model bound the useful
-    // allocation. Capacity is global, with no per-layer reservation.
-    const size_t target = size_t(sched->moe_resident_layers) * size_t(sched->moe_resident_n_expert_used) * 2;
-    const size_t slots = std::min({f.budget_bytes / expert_bytes, target, size_t(INT_MAX)});
-    if (slots < size_t(sched->moe_resident_n_expert_used)) {
-        f.disabled = true;
-    } else {
-        f.allocation_bytes = slots * expert_bytes;
+    f.disabled = !f.plan_cache(f.budget_bytes, sched->moe_resident_n_expert_used,
+            sched->moe_resident_grouping ? 0 : size_t(sched->moe_resident_layers));
+    if (!f.disabled) {
         f.cache = ggml_backend_buft_alloc_buffer(sched->bufts[0], f.allocation_bytes);
-        if (!f.cache) { f.disabled = true; f.allocation_bytes = 0; }
-        else {
-            ggml_backend_buffer_clear(f.cache, 0);
-            f.slots.resize(slots);
-            size_t offset = 0;
-            for (int b = 0; b < 3; ++b) { f.offsets[b] = offset; offset += slots * f.strides[b]; }
-        }
+        if (f.cache) ggml_backend_buffer_clear(f.cache, 0);
+        else f.disabled = true;
+    }
+    if (f.disabled) f.clear_cache();
+    for (size_t i = 0; i < f.groups.size(); ++i) if (!f.groups[i].slots.empty()) {
+        const auto & g = f.groups[i];
+        fprintf(stderr, "ggml_backend_sched: moe-resident layout=%zu expert_bytes=%zu slots=%zu\n",
+                i, g.strides[0] + g.strides[1] + g.strides[2], g.slots.size());
     }
     fprintf(stderr, "ggml_backend_sched: moe-resident complete cache free_after_reserve=%zu MiB budget=%zu MiB reserve=%zu MiB slots=%zu allocated=%zu MiB%s\n",
             free_bytes / (1024 * 1024), f.budget_bytes / (1024 * 1024), f.reserve_bytes / (1024 * 1024),
-            f.slots.size(), f.allocation_bytes / (1024 * 1024), f.disabled ? " CPU fallback" : "");
+            f.slot_count(), f.allocation_bytes / (1024 * 1024), f.disabled ? " CPU fallback" : "");
     if (f.disabled) {
         // The allocated pair remains valid because the host banks are still its
         // source of truth. Compute it fully on CPU, then rebuild fresh graphs.
@@ -258,6 +279,7 @@ static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched
         ggml_backend_sched_moe_ffn::task & t, ggml_backend_t gpu) {
     auto & f = *sched->moe_ffn;
     const bool cache = ggml_backend_sched_moe_ffn_cache(sched, gpu);
+    auto & g = f.groups[t.group];
     const int k = int(t.up->src[3]->ne[0]);
     t.host_act = *t.up->src[2]; t.host_ids = *t.up->src[3];
     t.host_up = *t.up; t.host_down = *t.down;
@@ -290,11 +312,11 @@ static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched
         int position = -1;
         if (cache) {
             const uint64_t key = (uint64_t(t.layer) << 32) | uint32_t(expert);
-            const auto found = f.slot_index.find(key);
-            if (found != f.slot_index.end()) {
-                auto & slot = f.slots[found->second];
+            const auto found = g.slot_index.find(key);
+            if (found != g.slot_index.end()) {
+                auto & slot = g.slots[found->second];
                 if (ggml_backend_sched_moe_ffn_match(slot, t, expert)) position = found->second;
-                else { slot = {}; f.slot_index.erase(found); }
+                else { slot = {}; g.slot_index.erase(found); }
             }
         }
         positions.push_back(position);
@@ -327,14 +349,14 @@ static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched
         }
     }
     // Protect every current hit and selected fill before choosing any victim.
-    std::vector<bool> protected_slots(f.slots.size(), false);
+    std::vector<bool> protected_slots(g.slots.size(), false);
     for (int position : positions) if (position >= 0) protected_slots[position] = true;
     std::vector<int> filled, victims;
     if (q) {
-        for (size_t s = 0; s < f.slots.size(); ++s) if (!protected_slots[s]) victims.push_back(int(s));
+        for (size_t s = 0; s < g.slots.size(); ++s) if (!protected_slots[s]) victims.push_back(int(s));
         GGML_ASSERT(victims.size() >= size_t(q));
         std::partial_sort(victims.begin(), victims.begin() + q, victims.end(), [&](int a, int b) {
-            const auto & sa = f.slots[a]; const auto & sb = f.slots[b];
+            const auto & sa = g.slots[a]; const auto & sb = g.slots[b];
             if ((sa.layer < 0) != (sb.layer < 0)) return sa.layer < 0;
             return sa.used == sb.used ? a < b : sa.used < sb.used;
         });
@@ -360,31 +382,31 @@ static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched
     if (cpu_count || !gpu_count) f.submit(t);
     // Start the CPU worker before DMA reads compete for host-memory bandwidth.
     for (int index : filled) {
-        auto & slot = f.slots[positions[index]];
+        auto & slot = g.slots[positions[index]];
         if (slot.layer >= 0) {
             ++f.evictions;
-            f.slot_index.erase((uint64_t(slot.layer) << 32) | uint32_t(slot.expert));
+            g.slot_index.erase((uint64_t(slot.layer) << 32) | uint32_t(slot.expert));
         }
         for (int b = 0; b < 3; ++b) {
             auto * bank = t.banks[b];
             if (!bank) { slot.banks[b] = nullptr; slot.data[b] = nullptr; continue; }
             ggml_moe_prefetch_wait(bank);
             ggml_tensor destination = *bank;
-            destination.ne[2] = int64_t(f.slots.size());
-            destination.nb[2] = f.strides[b]; destination.nb[3] = destination.nb[2] * f.slots.size();
+            destination.ne[2] = int64_t(g.slots.size());
+            destination.nb[2] = g.strides[b]; destination.nb[3] = destination.nb[2] * g.slots.size();
             ggml_backend_sched_moe_ffn_bind(destination, f.cache);
-            destination.data = static_cast<uint8_t *>(destination.data) + f.offsets[b];
-            const size_t offset = size_t(positions[index]) * f.strides[b];
+            destination.data = static_cast<uint8_t *>(destination.data) + g.offsets[b];
+            const size_t offset = size_t(positions[index]) * g.strides[b];
             ggml_backend_tensor_set_async(gpu, &destination,
                     static_cast<const uint8_t *>(bank->data) + size_t(experts[index]) * bank->nb[2], offset, bank->nb[2]);
             f.host_bytes += bank->nb[2];
             slot.banks[b] = bank; slot.data[b] = bank->data;
         }
         slot.layer = t.layer; slot.expert = experts[index]; ++f.fills;
-        f.slot_index[(uint64_t(t.layer) << 32) | uint32_t(slot.expert)] = positions[index];
+        g.slot_index[(uint64_t(t.layer) << 32) | uint32_t(slot.expert)] = positions[index];
     }
-    if (++f.clock == 0) { for (auto & slot : f.slots) slot.used = 0; f.clock = 1; }
-    for (int position : positions) if (position >= 0) f.slots[position].used = f.clock;
+    if (++f.clock == 0) { for (auto & group : f.groups) for (auto & slot : group.slots) slot.used = 0; f.clock = 1; }
+    for (int position : positions) if (position >= 0) g.slots[position].used = f.clock;
     ggml_status status = GGML_STATUS_SUCCESS;
     if (gpu_count) {
         t.device_ids = *t.up->src[3];
@@ -393,11 +415,11 @@ static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched
         for (int b = 0; b < 3; ++b) {
             if (!t.banks[b]) continue;
             t.device_banks[b] = *t.banks[b];
-            t.device_banks[b].ne[2] = int64_t(f.slots.size());
-            t.device_banks[b].nb[2] = f.strides[b];
-            t.device_banks[b].nb[3] = f.strides[b] * f.slots.size();
+            t.device_banks[b].ne[2] = int64_t(g.slots.size());
+            t.device_banks[b].nb[2] = g.strides[b];
+            t.device_banks[b].nb[3] = g.strides[b] * g.slots.size();
             ggml_backend_sched_moe_ffn_bind(t.device_banks[b], f.cache);
-            t.device_banks[b].data = static_cast<uint8_t *>(t.device_banks[b].data) + f.offsets[b];
+            t.device_banks[b].data = static_cast<uint8_t *>(t.device_banks[b].data) + g.offsets[b];
         }
         t.device_up = *t.up; t.device_down = *t.down;
         t.device_up.src[0] = &t.device_banks[0];
