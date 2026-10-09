@@ -8,7 +8,7 @@
 #if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
 
 // same result as IQ4_KT/IQ3_KT quantization on the CPU; the _rn intrinsics mirror each rounding and FMA of the GCC -O3 build
-namespace {
+namespace ggml_cuda_kt_detail {
 
 constexpr int   kKtBlock  = 32;
 constexpr float kKtWeight = 1e-4f;
@@ -29,7 +29,9 @@ struct kt_codebook {
     kt_bank bank[2];
 };
 
-}
+} // namespace ggml_cuda_kt_detail
+
+using namespace ggml_cuda_kt_detail;
 
 static __device__ __forceinline__ int kt_bin5(float x) {
     return x < -48.f ? 0 : x < -16.f ? 1 : x < 16.f ? 2 : x < 48.f ? 3 : 4;

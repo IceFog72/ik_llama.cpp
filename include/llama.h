@@ -439,7 +439,7 @@ extern "C" {
         bool dry_run;       // skip loading tensors
         bool flash_attn;
         bool defer_experts;    // defer expert mmap residency to speed up model loading (Linux only)
-        bool defer_ple;        // keep the per-layer token embedding on the file instead of resident in memory (Linux and Windows only)
+        bool defer_ple;        // keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux and Windows only)
         bool swa_compress;     // must match llama_context_params::swa_compress; the fit also assumes that context's n_ubatch
     };
 
@@ -509,6 +509,9 @@ extern "C" {
         float thresh_experts;
         bool only_active_experts;
         int  moe_resident;        // FT slice B: resident (layer,expert) LRU slots per bank pool (0 = disabled, -1 = auto)
+        int  moe_resident_mib;    // auto cache cap per CUDA backend in MiB (0 = existing automatic budget)
+        bool moe_resident_zero_fill; // new profiler includes zero fills; false selects the old profiler
+        bool moe_resident_grouping; // layout-grouped complete cache (default: false)
         bool prefetch_experts;  // if true, stream mmap'd MoE expert weights into the page cache (Linux only)
         int  prefetch_experts_threads; // number of expert prefetch workers (<=0 = auto)
         bool k_cache_hadamard;  // if true, apply Hadamard transform to K-cache

@@ -316,7 +316,7 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
         }
 
         if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || common_speculative_type_is_dflash_family(stage.type)) && !params.has_dft()) {
-            return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model or draft params");
+            return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model (-md/--model-draft)");
         }
 
     }
@@ -481,8 +481,8 @@ struct cpu_affinity_restore {
     }
 };
 
-// P-cores: primaries first, then the extra SMT siblings (for n_threads overflow)
-static std::vector<int32_t> cpu_detect_math_cpus(bool with_siblings) {
+// cores of one class (P/E): primaries, then SMT siblings
+static std::vector<int32_t> cpu_detect_cores(bool with_siblings, bool efficiency) {
     std::vector<int32_t> primaries;
     std::vector<int32_t> extra;
 
@@ -510,8 +510,9 @@ static std::vector<int32_t> cpu_detect_math_cpus(bool with_siblings) {
             extra.clear();
             break;
         }
-        if (is_running_on_efficiency_core()) {
-            continue; // efficiency cores harm lockstep threading
+        if (is_running_on_efficiency_core() != efficiency) {
+            // E-cores harm lockstep threading
+            continue;
         }
 
         const std::string key = cpu_physical_core_key(cpu);
@@ -530,12 +531,22 @@ static std::vector<int32_t> cpu_detect_math_cpus(bool with_siblings) {
 }
 
 std::vector<int32_t> cpu_get_math_cpus() {
-    static const std::vector<int32_t> cpus = cpu_detect_math_cpus(false);
+    static const std::vector<int32_t> cpus = cpu_detect_cores(false, false);
+    return cpus;
+}
+
+std::vector<int32_t> cpu_get_efficiency_cpus() {
+    static const std::vector<int32_t> cpus = cpu_detect_cores(false, true);
     return cpus;
 }
 
 static std::vector<int32_t> cpu_affinity_auto_cpus() {
-    static const std::vector<int32_t> cpus = cpu_detect_math_cpus(true);
+    static const std::vector<int32_t> cpus = cpu_detect_cores(true, false);
+    return cpus;
+}
+
+static std::vector<int32_t> cpu_affinity_auto_cpus_draft() {
+    static const std::vector<int32_t> cpus = cpu_detect_cores(true, true);
     return cpus;
 }
 
@@ -562,8 +573,10 @@ static std::vector<int32_t> cpu_affinity_filter(const std::vector<int32_t> & cpu
 }
 
 #else
-std::vector<int32_t> cpu_get_math_cpus() { return {}; }
-static std::vector<int32_t> cpu_affinity_auto_cpus() { return {}; }
+std::vector<int32_t> cpu_get_math_cpus()       { return {}; }
+std::vector<int32_t> cpu_get_efficiency_cpus() { return {}; }
+static std::vector<int32_t> cpu_affinity_auto_cpus()       { return {}; }
+static std::vector<int32_t> cpu_affinity_auto_cpus_draft() { return {}; }
 static std::vector<int32_t> cpu_affinity_filter(const std::vector<int32_t> & cpus) { return cpus; }
 #endif // __x86_64__ && __linux__
 
@@ -580,9 +593,18 @@ int32_t cpu_get_num_math() {
     return cpu_get_num_physical_cores();
 }
 
-std::vector<int32_t> cpu_affinity_resolve(const std::vector<int32_t> & cpus, bool auto_detect) {
-    const std::vector<int32_t> resolved = (!cpus.empty() || !auto_detect) ? cpus : cpu_affinity_auto_cpus();
+static std::vector<int32_t> cpu_affinity_resolve_impl(
+        const std::vector<int32_t> & cpus, bool auto_detect, const std::vector<int32_t> & auto_cpus) {
+    const std::vector<int32_t> resolved = (!cpus.empty() || !auto_detect) ? cpus : auto_cpus;
     return cpu_affinity_filter(resolved);
+}
+
+std::vector<int32_t> cpu_affinity_resolve(const std::vector<int32_t> & cpus, bool auto_detect) {
+    return cpu_affinity_resolve_impl(cpus, auto_detect, cpu_affinity_auto_cpus());
+}
+
+std::vector<int32_t> cpu_affinity_resolve_draft(const std::vector<int32_t> & cpus, bool auto_detect) {
+    return cpu_affinity_resolve_impl(cpus, auto_detect, cpu_affinity_auto_cpus_draft());
 }
 
 // Parse a CPU bitmask ("0x55", "85") into a list of logical CPU ids.
@@ -895,6 +917,10 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
         if (invalid_param) {
             throw std::invalid_argument("error: invalid parameter for argument: " + arg);
         }
+    }
+
+    if (params.moe_resident_mib > 0 && params.moe_resident != -1) {
+        throw std::invalid_argument("error: --moe-resident-mib requires --moe-resident auto\n");
     }
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
@@ -2176,6 +2202,44 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--moe-resident-grouping") {
+        CHECK_ARG
+        if (strcmp(argv[i], "off") == 0) params.moe_resident_grouping = false;
+        else if (strcmp(argv[i], "layout") == 0) params.moe_resident_grouping = true;
+        else {
+            fprintf(stderr, "error: --moe-resident-grouping must be off or layout\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--moe-resident-profiler") {
+        CHECK_ARG
+        if (strcmp(argv[i], "old") == 0) params.moe_resident_zero_fill = false;
+        else if (strcmp(argv[i], "new") == 0) params.moe_resident_zero_fill = true;
+        else {
+            fprintf(stderr, "error: --moe-resident-profiler must be old or new\n");
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--moe-resident-mib") {
+        CHECK_ARG
+        if (strcmp(argv[i], "auto") == 0) {
+            params.moe_resident_mib = 0;
+            return true;
+        }
+        try {
+            size_t end = 0;
+            params.moe_resident_mib = std::stoi(argv[i], &end);
+            invalid_param = params.moe_resident_mib < 0 || argv[i][end] != '\0';
+        } catch (const std::exception &) {
+            invalid_param = true;
+        }
+        if (invalid_param) {
+            fprintf(stderr, "error: --moe-resident-mib must be auto or a positive integer within the supported range\n");
+        }
+        return true;
+    }
     if (arg == "--moe-resident") {
         CHECK_ARG
         if (strcmp(argv[i], "auto") == 0) {
@@ -2365,12 +2429,12 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.fit = true;
         return true;
     }
-    if (arg == "--defer-experts") {
+    if (arg == "-dexp" || arg == "--defer-experts") {
         params.defer_experts = true;
         params.warmup = false;
         return true;
     }
-    if (arg == "--defer-ple") {
+    if (arg == "-dple" || arg == "--defer-ple") {
         params.defer_ple = true;
         return true;
     }
@@ -2382,6 +2446,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             return true;
         }
         params.cpu_affinity_auto = false;
+        params.cpu_affinity_configured = true;
         return true;
     }
     if (arg == "--cpu-range" || arg == "-cr") {
@@ -2392,18 +2457,20 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             return true;
         }
         params.cpu_affinity_auto = false;
+        params.cpu_affinity_configured = true;
         return true;
     }
     if (arg == "--cpu-affinity") {
         params.cpu_affinity.clear();
         params.cpu_affinity_auto = true;
+        params.cpu_affinity_configured = true;
         return true;
     }
-    if (arg == "--prefetch-experts") {
+    if (arg == "-prexp" || arg == "--prefetch-experts") {
         params.prefetch_experts = true;
         return true;
     }
-    if (arg == "--prefetch-experts-threads") {
+    if (arg == "-prexp-t" || arg == "--prefetch-experts-threads") {
         CHECK_ARG;
         params.prefetch_experts_threads = std::stoi(argv[i]);
         return true;
@@ -2424,7 +2491,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.worst_graph_tokens = std::stoi(argv[i]);
         return true;
     }
-    if (arg == "--no-mmap") {
+    if (arg == "-nmm" || arg == "--no-mmap") {
         params.use_mmap = false;
         return true;
     }
@@ -3315,6 +3382,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "       --moe-resident N|auto",   "cache experts on CUDA (N slots per bank pool; auto shares complete experts across layers and splits fused single-GPU decode between CPU/CUDA; default: %d, 0 = disabled)", params.moe_resident });
+    options.push_back({ "*",           "       --moe-resident-mib N|auto", "cap auto expert cache per CUDA backend in MiB (N requires --moe-resident auto; auto = automatic budget; default: %s)", params.moe_resident_mib == 0 ? "auto" : std::to_string(params.moe_resident_mib).c_str() });
+    options.push_back({ "*",           "       --moe-resident-profiler old|new", "auto residency fill policy (old: positive fills only; new: includes zero fills; default: %s)", params.moe_resident_zero_fill ? "new" : "old" });
+    options.push_back({ "*",           "       --moe-resident-grouping off|layout", "auto residency cache layout (off: shared slots; layout: separate slots per bank layout; default: %s)", params.moe_resident_grouping ? "layout" : "off" });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fug, --no-fused-up-gate",   "disable fused up-gate (default: %s)", params.fused_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-mmad, --no-fused-mul-multiadd", "disable fused mul-multi_add (default: %s)", params.fused_mmad ? "enabled" : "disabled" });
@@ -3528,21 +3598,21 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "backend" });
     options.push_back({ "*",           "       --rpc SERVERS",          "comma separated list of RPC servers" });
     options.push_back({ "*",           "-cuda, --cuda-params",          "comma separate list of cuda parameters" });
-    options.push_back({ "*",           "-draft, --draft-params",        "comma separate list of draft model parameters" });
+    options.push_back({ "*",           "-draft, --draft-params",        "comma separate list of draft model parameters (--cpu-affinity pins the draft to E-cores on Intel hybrid CPUs, -cr LIST picks CPUs)" });
     if (llama_supports_mlock()) {
         options.push_back({ "*",           "       --mlock",                "force system to keep model in RAM rather than swapping or compressing" });
     }
     if (llama_supports_mmap()) {
-        options.push_back({ "*",           "       --no-mmap",              "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
+        options.push_back({ "*",       "-nmm,   --no-mmap",               "do not memory-map model (slower load but may reduce pageouts if not using mlock)" });
     }
     options.push_back({ "*",           "-rtr,   --run-time-repack",      "repack tensors if interleaved variant is available"});
     options.push_back({ "*",           "-cmoe,  --cpu-moe",              "keep all MoE weights in CPU memory"});
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
-    options.push_back({ "*",           "       --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
-    options.push_back({ "*",           "       --defer-ple",            "keep the per-layer token embedding on the file instead of resident in memory (Linux, Windows)"});
-    options.push_back({ "*",           "       --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
-    options.push_back({ "*",           "       --prefetch-experts-threads N",
+    options.push_back({ "*",           "-dexp,  --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
+    options.push_back({ "*",           "-dple,  --defer-ple",            "keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux, Windows)"});
+    options.push_back({ "*",           "-prexp, --prefetch-experts",     "stream mmap'd MoE expert weights into the page cache on Linux"});
+    options.push_back({ "*",           "-prexp-t, --prefetch-experts-threads N",
                                                                         "number of expert prefetch workers, tune to drive speed/type (default: auto)"});
     options.push_back({ "*",           "       --cpu-affinity",          "pin CPU workers to the physical P-cores (hybrid CPUs only)"});
     options.push_back({ "*",           "-cm,   --cpu-mask MASK",         "pin CPU workers to the logical CPUs set in MASK (hex or decimal bitmask, e.g. 0x55; 64 CPUs max, use --cpu-range for more)"});
@@ -4633,6 +4703,9 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.min_experts       = params.min_experts;
     cparams.thresh_experts    = params.thresh_experts;
     cparams.moe_resident      = params.moe_resident;
+    cparams.moe_resident_mib  = params.moe_resident_mib;
+    cparams.moe_resident_zero_fill = params.moe_resident_zero_fill;
+    cparams.moe_resident_grouping = params.moe_resident_grouping;
     cparams.only_active_experts = params.only_active_exps;
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;
@@ -5681,6 +5754,9 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "scheduler_async: %s # default: false\n", params.scheduler_async ? "true" : "false");
     fprintf(stream, "ser: %d,%g # default: -1,0\n", params.min_experts, params.thresh_experts);
     fprintf(stream, "moe_resident: %d # default: 0 (FT slice B LRU slots)\n", params.moe_resident);
+    fprintf(stream, "moe_resident_mib: %d # default: 0 (automatic budget)\n", params.moe_resident_mib);
+    fprintf(stream, "moe_resident_grouping: %s # default: off\n", params.moe_resident_grouping ? "layout" : "off");
+    fprintf(stream, "moe_resident_profiler: %s # default: old\n", params.moe_resident_zero_fill ? "new" : "old");
     fprintf(stream, "temp: %f # default: 0.8\n", sparams.temp);
 
     const std::vector<float> tensor_split_vector(params.tensor_split, params.tensor_split + llama_max_devices());

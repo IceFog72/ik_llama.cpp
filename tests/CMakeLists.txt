@@ -149,6 +149,12 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 if (NOT WIN32)
+    add_executable(test-q2-0 test-q2-0.cpp)
+    target_include_directories(test-q2-0 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    target_link_libraries(test-q2-0 PRIVATE ggml)
+    llama_test(test-q2-0)
+    set_tests_properties(test-q2-0 PROPERTIES TIMEOUT 30)
+
     # White-box scheduler policy checks, with an opt-in real CUDA copy test:
     # test-moe-resident --cuda. No model or GPU is needed for the default test.
     find_package(Threads REQUIRED)
@@ -203,6 +209,7 @@ llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURC
 llama_build_and_test(test-chat-template.cpp )
 llama_build_and_test(test-json-partial.cpp )
 llama_build_and_test(test-cpu-affinity.cpp )
+llama_build_and_test(test-nanbeige-loop.cpp )
 #llama_build_and_test(test-log.cpp)
 llama_build_and_test(
     test-peg-parser.cpp

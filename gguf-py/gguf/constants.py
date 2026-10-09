@@ -215,6 +215,10 @@ class Keys:
         CHUNK_SIZE  = "imatrix.chunk_size"
         DATASETS    = "imatrix.datasets"
 
+    class Nanbeige:
+        NUM_LOOPS            = "{arch}.num_loops"
+        SKIP_LOOP_FINAL_NORM = "{arch}.skip_loop_final_norm"
+
 #
 # recommended mapping of model tensor names for storage in gguf
 #
@@ -228,6 +232,7 @@ class GGUFType:
 
 class MODEL_ARCH(IntEnum):
     LLAMA        = auto()
+    NANBEIGE     = auto()
     DECI         = auto()
     FALCON       = auto()
     BAICHUAN     = auto()
@@ -477,6 +482,7 @@ class MODEL_TENSOR(IntEnum):
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.LLAMA:          "llama",
+    MODEL_ARCH.NANBEIGE:       "nanbeige",
     MODEL_ARCH.DECI:           "deci",
     MODEL_ARCH.FALCON:         "falcon",
     MODEL_ARCH.BAICHUAN:       "baichuan",
@@ -2031,6 +2037,8 @@ MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     ],
 }
 
+MODEL_TENSORS[MODEL_ARCH.NANBEIGE] = MODEL_TENSORS[MODEL_ARCH.LLAMA]  # same tensor names
+
 #
 # types
 #
@@ -2091,6 +2099,7 @@ class GGMLQuantizationType(IntEnum):
     Q4_0_4_8  =  32
     Q4_0_8_8  =  33
     I2_S      =  36
+    Q2_0      =  42
     MXFP4     =  39
     Q8_0_X4   =  97
     Q8_1_X4   =  98
@@ -2299,6 +2308,7 @@ QK_K = 256
 GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F32         : (   1,    4),
     GGMLQuantizationType.F16         : (   1,    2),
+    GGMLQuantizationType.Q2_0        : (  64,   18),
     GGMLQuantizationType.Q4_0        : (  32,   18),
     GGMLQuantizationType.Q4_1        : (  32,   20),
     GGMLQuantizationType.Q5_0        : (  32,   22),
