@@ -476,7 +476,7 @@ struct gpt_params {
     bool use_thp           = false; // use transparent huge pages (linux only)
     bool validate_quants   = false; // if true, check for NaNs while loading the model
     bool only_active_exps  = true;  // if true, offload only active experts (relevant only for hybrid CPU/GPU)
-    int  moe_resident      = 0;     // B3: adaptive per-layer active-expert LRU slots per bank pool in VRAM (0 = disabled, -1 = auto)
+    int  moe_resident      = 0;     // 0 = disabled, -1 = auto hybrid residency; positive legacy slot counts remain available to programmatic callers
     int  moe_resident_mib = 0; // auto cache cap per CUDA backend in MiB (0 = existing automatic budget)
     bool moe_resident_zero_fill = false; // old profiler by default; true includes zero fills
     bool moe_resident_grouping = false; // layout-grouped complete cache; shared cache by default

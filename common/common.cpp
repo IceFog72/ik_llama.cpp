@@ -920,7 +920,7 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     }
 
     if (params.moe_resident_mib > 0 && params.moe_resident != -1) {
-        throw std::invalid_argument("error: --moe-resident-mib requires --moe-resident auto\n");
+        throw std::invalid_argument("error: an MoE resident MiB cap requires auto residency\n");
     }
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
@@ -2222,35 +2222,40 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
-    if (arg == "--moe-resident-mib") {
-        CHECK_ARG
-        if (strcmp(argv[i], "auto") == 0) {
-            params.moe_resident_mib = 0;
-            return true;
+    if (arg == "--moe-resident" || arg == "--moe-resident-mib") {
+        // The old cap spelling remains an explicit-value compatibility alias.
+        // Numeric CLI values now select auto residency with a MiB cap; the
+        // internal positive-slot API remains available to existing callers.
+        const bool legacy_cap = arg == "--moe-resident-mib";
+        const char * value = "auto";
+        if (legacy_cap) {
+            CHECK_ARG
+            value = argv[i];
+        } else if (i + 1 < argc && (argv[i + 1][0] != '-' ||
+                (argv[i + 1][1] >= '0' && argv[i + 1][1] <= '9'))) {
+            value = argv[++i];
         }
-        try {
-            size_t end = 0;
-            params.moe_resident_mib = std::stoi(argv[i], &end);
-            invalid_param = params.moe_resident_mib < 0 || argv[i][end] != '\0';
-        } catch (const std::exception &) {
-            invalid_param = true;
-        }
-        if (invalid_param) {
-            fprintf(stderr, "error: --moe-resident-mib must be auto or a positive integer within the supported range\n");
-        }
-        return true;
-    }
-    if (arg == "--moe-resident") {
-        CHECK_ARG
-        if (strcmp(argv[i], "auto") == 0) {
-            params.moe_resident = -1;
-        } else {
-            params.moe_resident = std::stoi(argv[i]);
-            if (params.moe_resident < 0) {
-                fprintf(stderr, "error: --moe-resident must be >= 0 or auto\n");
+
+        const bool automatic = strcmp(value, "auto") == 0;
+        int cap_mib = 0;
+        if (!automatic) {
+            try {
+                const std::string cap(value);
+                invalid_param = cap.empty() || cap.find_first_not_of("0123456789") != std::string::npos;
+                if (!invalid_param) cap_mib = std::stoi(cap);
+            } catch (const std::exception &) {
                 invalid_param = true;
             }
         }
+        if (invalid_param) {
+            fprintf(stderr, "error: %s must be auto or a non-negative integer MiB cap within the supported range\n", arg.c_str());
+            return true;
+        }
+        // Each occurrence replaces both fields, so disabling clears a previous
+        // cap and a later bare/auto flag restores automatic sizing. The legacy
+        // cap flag keeps its old 0 = automatic-budget meaning.
+        params.moe_resident = automatic || legacy_cap || cap_mib > 0 ? -1 : 0;
+        params.moe_resident_mib = cap_mib;
         return true;
     }
     if (arg == "-co" || arg == "--color") {
@@ -3381,8 +3386,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
-    options.push_back({ "*",           "       --moe-resident N|auto",   "cache experts on CUDA (N slots per bank pool; auto shares complete experts across layers and splits fused single-GPU decode between CPU/CUDA; default: %d, 0 = disabled)", params.moe_resident });
-    options.push_back({ "*",           "       --moe-resident-mib N|auto", "cap auto expert cache per CUDA backend in MiB (N requires --moe-resident auto; auto = automatic budget; default: %s)", params.moe_resident_mib == 0 ? "auto" : std::to_string(params.moe_resident_mib).c_str() });
+    options.push_back({ "*",           "       --moe-resident [N|auto]", "cache experts on CUDA and split eligible fused single-GPU decode between CPU/CUDA (N: cache cap per CUDA backend in MiB; auto or no value: automatic budget; 0: disabled; default: disabled)" });
     options.push_back({ "*",           "       --moe-resident-profiler old|new", "auto residency fill policy (old: positive fills only; new: includes zero fills; default: %s)", params.moe_resident_zero_fill ? "new" : "old" });
     options.push_back({ "*",           "       --moe-resident-grouping off|layout", "auto residency cache layout (off: shared slots; layout: separate slots per bank layout; default: %s)", params.moe_resident_grouping ? "layout" : "off" });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
