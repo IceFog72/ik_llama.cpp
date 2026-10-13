@@ -1916,6 +1916,9 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     }
 
     {
+        // Slots are reused: an omitted sampler override must inherit server defaults,
+        // not the sequence (including an empty one) from the previous request.
+        slot.sparams.samplers_sequence = default_sparams.samplers_sequence;
         const auto samplers = data.find("samplers");
         if (samplers != data.end()) {
             if (samplers->is_array()) {
