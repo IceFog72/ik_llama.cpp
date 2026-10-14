@@ -922,6 +922,9 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     if (params.moe_resident_mib > 0 && params.moe_resident != -1) {
         throw std::invalid_argument("error: an MoE resident MiB cap requires auto residency\n");
     }
+    if (params.moe_resident_ubatch && params.moe_resident > 0) {
+        throw std::invalid_argument("error: --moe-resident-ubatch requires auto residency\n");
+    }
 
     if (params.prompt_cache_all && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
@@ -953,6 +956,23 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     if (!params.kv_overrides.empty()) {
         params.kv_overrides.emplace_back();
         params.kv_overrides.back().key[0] = 0;
+    }
+    if (params.moe_resident < 0 && params.moe_resident_zero_fill && params.ncmoe == 999 &&
+            (params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP))) {
+        // -cmoe deliberately excludes predictor layers in the loader. The new
+        // policy caches their experts too, instead of fixing the whole bank in
+        // VRAM. Append after user rules so explicit placements still win.
+        const char * pattern = "blk\\.[0-9]+\\.ffn_(up|down|gate|gate_up)_exps\\.(weight|scale)$";
+        const auto & rules = params.tensor_buft_overrides;
+        const bool present = std::any_of(rules.begin(), rules.end(), [&](const auto & rule) {
+            return rule.pattern && strcmp(rule.pattern, pattern) == 0;
+        });
+        if (!present) {
+            const auto end = std::find_if(rules.begin(), rules.end(), [](const auto & rule) {
+                return rule.pattern == nullptr;
+            });
+            params.tensor_buft_overrides.insert(end, {strdup(pattern), ggml_backend_cpu_buffer_type()});
+        }
     }
     if (!params.tensor_buft_overrides.empty()) {
         params.tensor_buft_overrides.push_back({nullptr, nullptr});
@@ -1744,6 +1764,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-ub" || arg == "--ubatch-size") {
         CHECK_ARG
         params.n_ubatch = std::stoi(argv[i]);
+        params.n_ubatch_explicit = true;
         return true;
     }
     if (arg == "--keep") {
@@ -2198,6 +2219,17 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             params.min_experts    = values.front().first;
             params.thresh_experts = values.front().second;
         } else {
+            invalid_param = true;
+        }
+        return true;
+    }
+    if (arg == "--moe-resident-ubatch") {
+        CHECK_ARG
+        try {
+            const std::string value(argv[i]);
+            invalid_param = value.empty() || value.find_first_not_of("0123456789") != std::string::npos;
+            if (!invalid_param) params.moe_resident_ubatch = std::stoi(value);
+        } catch (const std::exception &) {
             invalid_param = true;
         }
         return true;
@@ -3387,7 +3419,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
     options.push_back({ "*",           "       --moe-resident [N|auto]", "cache experts on CUDA and split eligible fused single-GPU decode between CPU/CUDA (N: cache cap per CUDA backend in MiB; auto or no value: automatic budget; 0: disabled; default: disabled)" });
-    options.push_back({ "*",           "       --moe-resident-profiler old|new", "auto residency fill policy (old: positive fills only; new: includes zero fills; default: %s)", params.moe_resident_zero_fill ? "new" : "old" });
+    options.push_back({ "*",           "       --moe-resident-ubatch N", "cap generation and follow-up workspace at N tokens until full context reset (0: off; requires auto residency; omitted -ub: auto initial prefill in multiples of 512, up to -b)" });
+    options.push_back({ "*",           "       --moe-resident-profiler old|new", "auto residency policy (old: positive-fill profiler; new: routing history, GPU lookup, packed CPU results, background admission and stable cache resizing; default: %s)", params.moe_resident_zero_fill ? "new" : "old" });
     options.push_back({ "*",           "       --moe-resident-grouping off|layout", "auto residency cache layout (off: shared slots; layout: separate slots per bank layout; default: %s)", params.moe_resident_grouping ? "layout" : "off" });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fug, --no-fused-up-gate",   "disable fused up-gate (default: %s)", params.fused_up_gate ? "enabled" : "disabled" });
@@ -4547,6 +4580,8 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
 static std::pair<int, int> get_batch_ubatch(const gpt_params & params) {
     int n_batch = params.n_batch;
     int n_ubatch = params.n_ubatch;
+    if (params.moe_resident < 0 && params.moe_resident_ubatch && !params.n_ubatch_explicit)
+        n_ubatch = n_batch; // upper bound for memory-measured automatic prefill
     if (params.n_ctx > 0) {
         n_batch = std::min(n_batch, params.n_ctx);
     }
@@ -4708,6 +4743,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.thresh_experts    = params.thresh_experts;
     cparams.moe_resident      = params.moe_resident;
     cparams.moe_resident_mib  = params.moe_resident_mib;
+    cparams.moe_resident_ubatch = params.moe_resident_ubatch;
+    cparams.moe_resident_ubatch_auto = params.moe_resident_ubatch && !params.n_ubatch_explicit;
     cparams.moe_resident_zero_fill = params.moe_resident_zero_fill;
     cparams.moe_resident_grouping = params.moe_resident_grouping;
     cparams.only_active_experts = params.only_active_exps;
@@ -5759,6 +5796,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "ser: %d,%g # default: -1,0\n", params.min_experts, params.thresh_experts);
     fprintf(stream, "moe_resident: %d # default: 0 (FT slice B LRU slots)\n", params.moe_resident);
     fprintf(stream, "moe_resident_mib: %d # default: 0 (automatic budget)\n", params.moe_resident_mib);
+    fprintf(stream, "moe_resident_ubatch: %u # default: 0 (disabled)\n", params.moe_resident_ubatch);
     fprintf(stream, "moe_resident_grouping: %s # default: off\n", params.moe_resident_grouping ? "layout" : "off");
     fprintf(stream, "moe_resident_profiler: %s # default: old\n", params.moe_resident_zero_fill ? "new" : "old");
     fprintf(stream, "temp: %f # default: 0.8\n", sparams.temp);

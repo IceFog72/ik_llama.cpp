@@ -1,6 +1,8 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-moe-executor.h"
+#include "ggml-moe-resident-control.h"
 #include "ggml-rpc.h"
 #include "ggml-moe-prefetch.h"
 #ifdef GGML_USE_CUDA
@@ -29,6 +31,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <memory>
+#include <atomic>
 #include <unordered_map>
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -891,7 +894,8 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backe
     GGML_UNUSED(backend);
 }
 
-GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+static enum ggml_status ggml_backend_cpu_graph_compute_executor(ggml_backend_t backend,
+        struct ggml_cgraph * cgraph, ggml_compute_executor_fn executor, void * executor_data) {
     struct ggml_backend_cpu_context * cpu_ctx = (struct ggml_backend_cpu_context *)backend->context;
 
     struct ggml_cplan cplan = ggml_graph_plan(cgraph, cpu_ctx->n_threads);
@@ -913,7 +917,11 @@ GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t 
     cplan.cpu_affinity        = cpu_ctx->cpu_affinity;
     cplan.n_cpu_affinity      = cpu_ctx->n_cpu_affinity;
 
-    return ggml_graph_compute(cgraph, &cplan);
+    return ggml_graph_compute_with_executor(cgraph, &cplan, executor, executor_data);
+}
+
+GGML_CALL static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
+    return ggml_backend_cpu_graph_compute_executor(backend, cgraph, nullptr, nullptr);
 }
 
 GGML_CALL static bool ggml_backend_cpu_supports_op(ggml_backend_t backend, const struct ggml_tensor * op) {
@@ -1256,6 +1264,67 @@ struct ggml_backend_sched_moe_decode {
     }
 };
 
+// Native team for the opt-in complete-FFN executor. Job metadata is protected by
+// one mutex; all graph workers join before stack-owned graph state is released.
+class ggml_moe_cpu_workers {
+    std::mutex mutex;
+    std::condition_variable posted, done;
+    std::vector<std::thread> threads;
+    ggml_compute_worker_fn worker = nullptr;
+    void * data = nullptr;
+    uint64_t generation = 0;
+    int active = 0, pending = 0;
+    bool stopping = false;
+public:
+    static void execute(void * pool, ggml_compute_worker_fn fn, void * job, int n_threads) {
+        static_cast<ggml_moe_cpu_workers *>(pool)->run(fn, job, n_threads);
+    }
+    void run(ggml_compute_worker_fn fn, void * job, int n_threads) {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(pending == 0);
+            if (threads.empty() && n_threads > 1)
+                fprintf(stderr, "ggml_backend_sched: moe-resident new persistent CPU team threads=%d\n", n_threads);
+            while (int(threads.size()) + 1 < n_threads) {
+                const int ith = int(threads.size()) + 1;
+                const uint64_t initial = generation;
+                threads.emplace_back([this, ith, initial] {
+                    uint64_t seen = initial;
+                    std::unique_lock<std::mutex> lock(mutex);
+                    for (;;) {
+                        posted.wait(lock, [&] { return stopping || generation != seen; });
+                        if (stopping) break;
+                        seen = generation;
+                        if (ith >= active) continue;
+                        const auto fn = worker;
+                        void * const job = data;
+                        lock.unlock();
+                        fn(job, ith);
+                        lock.lock();
+                        if (--pending == 0) done.notify_one();
+                    }
+                });
+            }
+            worker = fn; data = job; active = n_threads; pending = n_threads - 1;
+            ++generation;
+        }
+        posted.notify_all();
+        fn(job, 0);
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [&] { return pending == 0; });
+        worker = nullptr; data = nullptr;
+    }
+    ~ggml_moe_cpu_workers() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(pending == 0);
+            stopping = true;
+        }
+        posted.notify_all();
+        for (auto & thread : threads) thread.join();
+    }
+};
+
 // Complete-expert slots are shared by layers with identical bank layouts.
 // Task descriptors have scheduler lifetime. Host I/O has a single owner, and
 // its completion event is waited before reuse or destruction.
@@ -1264,8 +1333,11 @@ struct ggml_backend_sched_moe_ffn {
         int layer = -1;
         size_t group = 0;
         ggml_tensor * up = nullptr, * down = nullptr;
+        ggml_tensor * join = nullptr;
+        bool allow_defer = false;
         ggml_tensor * banks[3]{};
         ggml_tensor host_act{}, host_ids{}, host_up{}, host_down{};
+        ggml_tensor host_experts{};
         ggml_tensor device_ids{}, device_banks[3]{}, device_up{}, device_down{};
         ggml_tensor device_cpu{};
         ggml_tensor * host_nodes[2]{}, * device_nodes[2]{};
@@ -1277,6 +1349,7 @@ struct ggml_backend_sched_moe_ffn {
         const ggml_tensor * banks[3]{};
         const void * data[3]{};
         uint64_t used = 0;
+        bool predicted = false;
     };
     struct timing {
         ggml_type types[3]{};
@@ -1288,6 +1361,132 @@ struct ggml_backend_sched_moe_ffn {
     };
     std::vector<std::unique_ptr<task>> tasks;
     std::unordered_map<const ggml_tensor *, task *> graph_tasks;
+    struct invocation {
+        task * owner = nullptr; // non-null until CPU result publication completes
+        ggml_backend_t gpu = nullptr;
+        int tokens = 0, k = 0;
+        size_t cpu_count = 0, gpu_count = 0;
+        int64_t host_started = 0, cpu_started = 0;
+        ggml_status status = GGML_STATUS_SUCCESS;
+        bool cache = false;
+        std::vector<int> missing;
+        std::vector<bool> protected_slots;
+    } in_flight;
+    uint64_t deferred_layers = 0, overlapped_gpu_splits = 0, deferred_join_us = 0;
+    struct token_routes {
+        struct layer {
+            uint8_t samples = 0;
+            std::vector<uint8_t> counts;
+        };
+        uint64_t used = 0;
+        std::vector<layer> layers;
+    };
+    struct forecast { int token, layer, expert; double probability; };
+    std::unordered_map<int32_t, token_routes> learned_routes;
+    std::vector<forecast> forecasts;
+    std::vector<forecast> forecast_queue;
+    std::vector<double> forecast_probability;
+    std::vector<int32_t> route_tokens;
+    std::vector<int32_t> prediction_tokens;
+    uint64_t route_clock = 0, prediction_calls = 0, prediction_candidates = 0;
+    uint64_t prediction_selected = 0, prediction_correct = 0, prediction_uploads = 0, prediction_used = 0;
+    void observe_token_route(int32_t token, int layer, const int32_t * ids, int k, int layers, int experts) {
+        if (token < 0 || layer < 0 || layer >= layers || experts <= 0 || experts > 1024) return;
+        auto found = learned_routes.find(token);
+        if (found == learned_routes.end()) {
+            // Bounded RAM and work: at most 512 token-conditioned routing
+            // tables, with at most 32 recent observations per token/layer.
+            if (learned_routes.size() >= 512) {
+                auto oldest = std::min_element(learned_routes.begin(), learned_routes.end(),
+                        [](const auto & a, const auto & b) { return a.second.used < b.second.used; });
+                learned_routes.erase(oldest);
+            }
+            found = learned_routes.emplace(token, token_routes{}).first;
+        }
+        auto & history = found->second;
+        history.used = ++route_clock;
+        if (history.layers.size() != size_t(layers)) history.layers.resize(layers);
+        auto & row = history.layers[layer];
+        if (row.counts.size() != size_t(experts)) { row.counts.assign(experts, 0); row.samples = 0; }
+        if (row.samples >= 32) {
+            row.samples /= 2;
+            for (auto & count : row.counts) count /= 2;
+        }
+        ++row.samples;
+        for (int i = 0; i < k; ++i) {
+            const int e = ids[i];
+            if (e < 0 || e >= experts || std::find(ids, ids + i, e) != ids + i) continue;
+            ++row.counts[e];
+        }
+    }
+    void predict_token_routes(const int32_t * tokens, int n, int layers, int experts) {
+        forecasts.clear(); forecast_queue.clear();
+        prediction_tokens.clear();
+        if (layers <= 0 || experts <= 0 || experts > 1024) { forecast_probability.clear(); return; }
+        forecast_probability.assign(size_t(layers) * experts, 0);
+        if (!tokens || n <= 0 || n > 4 || experts <= 0 || experts > 1024) return;
+        prediction_tokens.assign(tokens, tokens + n);
+        ++prediction_calls;
+        for (int i = 0; i < n; ++i) {
+            auto found = learned_routes.find(tokens[i]);
+            if (found == learned_routes.end() || found->second.layers.size() != size_t(layers)) continue;
+            found->second.used = ++route_clock;
+            for (int l = 0; l < layers; ++l) {
+                const auto & row = found->second.layers[l];
+                if (row.samples < 4 || row.counts.size() != size_t(experts)) continue;
+                // Speculative token IDs condition this target-layer forecast;
+                // predictor-layer expert IDs are never target expert IDs.
+                for (int e = 0; e < experts; ++e) {
+                    const double probability = double(row.counts[e]) / row.samples;
+                    if (probability < 0.75) continue;
+                    auto & p = forecast_probability[size_t(l) * experts + e];
+                    if (probability <= p) continue;
+                    p = probability;
+                    forecasts.push_back({tokens[i], l, e, probability});
+                }
+            }
+        }
+        const auto resident = [&](const forecast & c) {
+            if (size_t(c.layer) >= tasks.size() || !tasks[c.layer]) return false;
+            const auto & t = *tasks[c.layer];
+            if (t.group >= groups.size()) return false;
+            const auto & g = groups[t.group];
+            const auto found = g.slot_index.find((uint64_t(c.layer) << 32) | uint32_t(c.expert));
+            if (found == g.slot_index.end() || found->second < 0 || size_t(found->second) >= g.slots.size()) return false;
+            const auto & slot = g.slots[found->second];
+            if (slot.layer != c.layer || slot.expert != c.expert) return false;
+            for (int b = 0; b < 3; ++b) if (slot.banks[b] != t.banks[b] ||
+                    slot.data[b] != (t.banks[b] ? t.banks[b]->data : nullptr)) return false;
+            return true;
+        };
+        std::stable_sort(forecasts.begin(), forecasts.end(), [&](const forecast & a, const forecast & b) {
+            if (a.layer != b.layer) return a.layer < b.layer;
+            // Spend the per-layer upload shortlist on missing experts. A hot
+            // resident pair must not hide another confident missing expert.
+            const bool a_resident = resident(a), b_resident = resident(b);
+            if (a_resident != b_resident) return !a_resident;
+            return a.probability > b.probability;
+        });
+        // Keep the full confidence plan for resident protection and accuracy.
+        // Only the upload queue gets a two-entry-per-layer limit. Otherwise
+        // choosing missing experts could unprotect wanted resident experts.
+        std::vector<forecast> plan;
+        for (const auto & c : forecasts) {
+            const auto duplicate = std::find_if(plan.begin(), plan.end(), [&](const forecast & a) {
+                return a.layer == c.layer && a.expert == c.expert;
+            });
+            if (duplicate == plan.end()) plan.push_back(c);
+        }
+        forecasts = std::move(plan);
+        std::fill(forecast_probability.begin(), forecast_probability.end(), 0);
+        for (const auto & c : forecasts) forecast_probability[size_t(c.layer) * experts + c.expert] = c.probability;
+        int queue_layer = -1, per_layer = 0;
+        for (const auto & c : forecasts) {
+            if (c.layer != queue_layer) { queue_layer = c.layer; per_layer = 0; }
+            if (per_layer++ < 2) forecast_queue.push_back(c);
+        }
+        prediction_candidates += forecasts.size();
+    }
     struct group {
         struct layout {
             bool present = false;
@@ -1298,18 +1497,184 @@ struct ggml_backend_sched_moe_ffn {
         size_t strides[3]{}, offsets[3]{};
         std::vector<slot> slots;
         std::unordered_map<uint64_t, int> slot_index;
+        ggml_backend_buffer_t storage[3]{}; // new policy: stable per-bank virtual addresses
+        std::vector<std::pair<double, size_t>> victims;
+        uint64_t victim_epoch = UINT64_MAX;
     };
     std::vector<group> groups;
+    bool new_policy = false, virtual_cache = false, histogram_dirty = false, mapping_dirty = false;
+    ggml_backend_buffer_t histogram = nullptr, slot_map = nullptr, packed_output = nullptr;
+    ggml_backend_event_t router_ready = nullptr, upload_ready = nullptr, upload_fence = nullptr;
+    ggml_backend_event_t upload_started = nullptr;
+    double upload_us_per_byte = 1e6 / (8.0 * 1024 * 1024 * 1024);
+    ggml_backend_t uploader = nullptr;
+    ggml_backend_t profile_backend = nullptr;
+    std::unordered_map<const ggml_tensor *, int> observations;
+    std::vector<double> popularity;
+    std::vector<double> cpu_cost;
+    std::vector<uint64_t> observed_at;
+    std::vector<int32_t> mapping;
+    uint64_t history_layers = 1; // eligible FFN invocations in one model pass
+    uint64_t policy_clock = 1, admission_rejected = 0, promotions = 0, all_hit_layers = 0;
+    uint64_t activation_bytes = 0, packed_result_bytes = 0;
+    uint64_t d2d_bytes = 0;
+    uint64_t mapping_uploads = 0, empty_gpu_layers = 0, mapped_routes = 0, fallback_routes = 0;
+    uint64_t router_wait_us = 0, cpu_wait_us = 0, gpu_enqueue_us = 0, mapping_wait_us = 0;
+    uint64_t host_layer_us = 0, cpu_only_layers = 0;
+    uint64_t token_layers = 0, batch2_layers = 0, batch3_layers = 0, batch4_layers = 0;
+    void report_new(const char * reason) const {
+        if (!new_policy || !layers) return;
+        const double refs = double(cpu_refs + gpu_refs);
+        fprintf(stderr, "ggml_backend_sched: moe-resident new stats reason=%s layers=%llu gpu_share=%.1f%% all_hit=%llu empty_gpu=%llu router_wait=%.1f us/layer cpu_wait=%.1f us/layer gpu_enqueue=%.1f us/layer mapping_wait=%.1f us/layer promotions=%llu rejected=%llu map_uploads=%llu mapped_routes=%llu dma_routes=%llu h2d_weights=%llu h2d_results=%llu cache=%zu MiB cpu_team=native cpu_only=%llu admission=%.1f us/layer upload_host=%.1f us/layer ffn_host=%.1f us/layer\n",
+                reason, (unsigned long long)layers, refs ? 100.0 * gpu_refs / refs : 0.0,
+                (unsigned long long)all_hit_layers, (unsigned long long)empty_gpu_layers,
+                double(router_wait_us) / layers, double(cpu_wait_us) / layers,
+                double(gpu_enqueue_us) / layers, double(mapping_wait_us) / layers,
+                (unsigned long long)promotions, (unsigned long long)admission_rejected,
+                (unsigned long long)mapping_uploads, (unsigned long long)mapped_routes,
+                (unsigned long long)fallback_routes, (unsigned long long)host_bytes,
+                (unsigned long long)result_bytes, allocation_bytes / 1048576,
+                (unsigned long long)cpu_only_layers, double(admission_us) / layers,
+                double(upload_host_us.load(std::memory_order_relaxed)) / layers,
+                double(host_layer_us) / layers);
+        if (token_layers > layers) fprintf(stderr,
+                "ggml_backend_sched: moe-resident new batches token_layers=%llu batch2_layers=%llu batch3_layers=%llu batch4_layers=%llu ffn_host=%.1f us/token-layer\n",
+                (unsigned long long)token_layers, (unsigned long long)batch2_layers,
+                (unsigned long long)batch3_layers, (unsigned long long)batch4_layers,
+                double(host_layer_us) / token_layers);
+        if (deferred_layers) fprintf(stderr,
+                "ggml_backend_sched: moe-resident new overlap deferred_layers=%llu gpu_splits=%llu join_wait=%.1f us/deferred-layer\n",
+                (unsigned long long)deferred_layers, (unsigned long long)overlapped_gpu_splits,
+                double(deferred_join_us) / deferred_layers);
+        if (prediction_calls) fprintf(stderr,
+                "ggml_backend_sched: moe-resident new prediction calls=%llu candidates=%llu selected=%llu correct=%llu uploads=%llu used=%llu learned_tokens=%zu\n",
+                (unsigned long long)prediction_calls, (unsigned long long)prediction_candidates,
+                (unsigned long long)prediction_selected, (unsigned long long)prediction_correct,
+                (unsigned long long)prediction_uploads, (unsigned long long)prediction_used, learned_routes.size());
+        if (cpu_batch_rows) fprintf(stderr,
+                "ggml_backend_sched: moe-resident new CPU work rows=%llu unique_experts=%llu masked_quant_rows=%llu compact_routes=yes\n",
+                (unsigned long long)cpu_batch_rows, (unsigned long long)cpu_batch_experts,
+                (unsigned long long)cpu_masked_quant_rows);
+    }
+    struct promotion {
+        bool pending = false;
+        size_t group = 0, position = 0;
+        slot entry;
+        size_t bytes = 0;
+    } upload;
+    ggml_moe_cpu_workers cpu_workers;
+    struct upload_copy {
+        ggml_tensor destination{};
+        const ggml_tensor * bank = nullptr;
+        const uint8_t * source = nullptr;
+        size_t bytes = 0, offset = 0;
+    } upload_copies[3];
+    ggml_backend_buffer_t upload_staging = nullptr;
+    std::mutex upload_mutex;
+    std::condition_variable upload_wake, upload_recorded;
+    std::thread upload_worker;
+    std::atomic<bool> upload_queued{false};
+    bool upload_job = false, upload_stop = false;
+    std::atomic<uint64_t> upload_host_us{0};
+    uint64_t admission_us = 0;
+    void ensure_upload_worker() {
+        if (upload_worker.joinable()) return;
+        upload_worker = std::thread([this] {
+            std::unique_lock<std::mutex> lock(upload_mutex);
+            for (;;) {
+                upload_wake.wait(lock, [this] { return upload_stop || upload_job; });
+                if (upload_stop) break;
+                upload_job = false;
+                lock.unlock();
+                const int64_t started = ggml_time_us();
+                auto * pinned = static_cast<uint8_t *>(ggml_backend_buffer_get_base(upload_staging));
+                size_t offset = 0;
+                for (const auto & copy : upload_copies) if (copy.bytes) {
+                    ggml_moe_prefetch_wait(copy.bank);
+                    std::memcpy(pinned + offset, copy.source, copy.bytes);
+                    offset += copy.bytes;
+                }
+                ggml_backend_event_wait(uploader, upload_fence);
+                ggml_backend_event_record(upload_started);
+                offset = 0;
+                for (auto & copy : upload_copies) if (copy.bytes) {
+                    ggml_backend_tensor_set_async(uploader, &copy.destination, pinned + offset, copy.offset, copy.bytes);
+                    offset += copy.bytes;
+                }
+                ggml_backend_event_record(upload_ready);
+                upload_host_us.fetch_add(ggml_time_us() - started, std::memory_order_relaxed);
+                lock.lock();
+                upload_queued.store(true, std::memory_order_release);
+                upload_recorded.notify_one();
+            }
+        });
+        fprintf(stderr, "ggml_backend_sched: moe-resident new host upload worker staging=%zu bytes\n",
+                ggml_backend_buffer_get_size(upload_staging));
+    }
+    double score(int layer, int expert, int n_expert) const {
+        const size_t i = size_t(layer) * n_expert + expert;
+        if (i >= popularity.size()) return 0;
+        // Match generation locality in model passes, rather than a fixed
+        // decay per layer that keeps old experts hot for ~850 Qwen tokens.
+        return popularity[i] * std::exp2(-double(policy_clock - observed_at[i]) /
+                (128.0 * double(history_layers)));
+    }
+    void finish_upload() {
+        if (!upload.pending) return;
+        {
+            std::unique_lock<std::mutex> lock(upload_mutex);
+            upload_recorded.wait(lock, [this] { return upload_queued.load(std::memory_order_acquire); });
+        }
+        ggml_backend_event_synchronize(upload_ready);
+        publish_upload();
+    }
+    void publish_upload() {
+        if (!upload.pending) return;
+#ifdef GGML_USE_CUDA
+        if (upload.bytes) upload_us_per_byte = 0.8 * upload_us_per_byte + 0.2 *
+                ggml_backend_cuda_moe_elapsed_us(upload_started, upload_ready) / upload.bytes;
+#endif
+        auto & g = groups[upload.group];
+        g.slots[upload.position] = upload.entry;
+        g.slot_index[(uint64_t(upload.entry.layer) << 32) | uint32_t(upload.entry.expert)] = int(upload.position);
+        // Publication can also happen during graph scan, refresh or teardown,
+        // outside new_compute(). The next dispatch must refresh device lookup.
+        mapping_dirty = true;
+        upload.pending = false;
+        ++promotions; ++fills;
+    }
+    struct remembered_slot { size_t group; slot entry; };
+    std::vector<remembered_slot> remembered;
+    void remember_cache() {
+        if (!cache) return; // a second release must not discard an earlier saved working set
+        remembered.clear();
+        for (size_t i = 0; i < groups.size(); ++i)
+            for (const auto & s : groups[i].slots)
+                if (s.layer >= 0 && s.expert >= 0) remembered.push_back({i, s});
+        std::stable_sort(remembered.begin(), remembered.end(), [](const remembered_slot & a, const remembered_slot & b) {
+            return a.entry.used > b.entry.used;
+        });
+    }
     std::vector<timing> timings;
+    bool live_task(const task & t) const {
+        return !new_policy || graph_tasks.count(t.up) != 0;
+    }
     size_t allocation_bytes = 0;
     size_t slot_count() const {
         size_t count = 0;
         for (const auto & g : groups) count += g.slots.size();
         return count;
     }
-    bool plan_cache(size_t budget, int top_k, size_t shared_layers = 0) {
+    // Calculate capacity without changing live slots or their expert identities.
+    bool plan_cache(size_t budget, int top_k, int experts_per_layer,
+            std::vector<size_t> & counts, size_t & bytes) const {
+        counts.assign(groups.size(), 0);
+        bytes = 0;
         std::vector<size_t> layer_counts(groups.size(), 0), expert_bytes(groups.size(), 0);
-        for (const auto & t : tasks) if (t) ++layer_counts[t->group];
+        for (const auto & t : tasks) if (t && live_task(*t)) {
+            if (t->group >= groups.size()) return false;
+            ++layer_counts[t->group];
+        }
         long double weight = 0;
         for (size_t i = 0; i < groups.size(); ++i) {
             for (size_t stride : groups[i].strides) {
@@ -1318,27 +1683,37 @@ struct ggml_backend_sched_moe_ffn {
             }
             weight += static_cast<long double>(expert_bytes[i]) * layer_counts[i];
         }
-        if (top_k <= 0 || !weight) { return false; }
+        if (top_k <= 0 || experts_per_layer <= 0 || !weight) { return false; }
         size_t offset = 0;
         for (size_t i = 0; i < groups.size(); ++i) {
-            auto & g = groups[i];
+            const auto & g = groups[i];
             if (!layer_counts[i]) continue;
+            if (!expert_bytes[i]) return false;
             // Allocate the same resident fraction to each layout, then round down
             // to whole experts. All groups together remain within the shared cap.
             const size_t share = size_t(static_cast<long double>(budget) * expert_bytes[i] * layer_counts[i] / weight);
-            const size_t target = (shared_layers ? shared_layers : layer_counts[i]) * size_t(top_k) * 2;
+            const size_t target = layer_counts[i] * size_t(experts_per_layer);
             const size_t slots = std::min({share / expert_bytes[i], (budget - offset) / expert_bytes[i], target, size_t(INT_MAX)});
             if (slots < size_t(top_k)) { return false; }
-            g.slots.resize(slots);
-            for (int b = 0; b < 3; ++b) { g.offsets[b] = offset; offset += slots * g.strides[b]; }
+            counts[i] = slots;
+            for (int b = 0; b < 3; ++b) offset += slots * g.strides[b];
         }
-        allocation_bytes = offset;
+        bytes = offset;
         return true;
     }
     void clear_cache() {
-        ggml_backend_buffer_free(cache);
+        finish_upload();
+        if (virtual_cache) {
+            for (auto & g : groups) for (auto & bank : g.storage) {
+                ggml_backend_buffer_free(bank); bank = nullptr;
+            }
+        } else ggml_backend_buffer_free(cache);
+        virtual_cache = false;
         cache = nullptr;
-        for (auto & g : groups) { g.slots.clear(); g.slot_index.clear(); }
+        for (auto & g : groups) {
+            g.slots.clear(); g.slot_index.clear(); g.victims.clear(); g.victim_epoch = UINT64_MAX;
+        }
+        mapping_dirty = true;
         allocation_bytes = 0;
     }
     ggml_backend_buffer_t cache = nullptr;
@@ -1350,6 +1725,8 @@ struct ggml_backend_sched_moe_ffn {
     uint64_t cpu_refs = 0, gpu_refs = 0, host_bytes = 0, result_bytes = 0;
     size_t budget_bytes = 0, reserve_bytes = 0;
     std::vector<int32_t> gpu_ids, cpu_ids;
+    std::vector<int32_t> cpu_experts; // immutable until this CPU invocation joins
+    uint64_t cpu_batch_rows = 0, cpu_batch_experts = 0, cpu_masked_quant_rows = 0;
     std::mutex mutex;
     std::condition_variable wake, done;
     std::thread worker;
@@ -1357,6 +1734,7 @@ struct ggml_backend_sched_moe_ffn {
     task * job = nullptr;
     bool stop = false, busy = false;
     ggml_status status = GGML_STATUS_SUCCESS;
+    int64_t cpu_finished_us = 0; // published with busy=false under mutex
 
     void wait_io() {
         if (pending) { ggml_backend_event_synchronize(completion); pending = false; }
@@ -1373,9 +1751,12 @@ struct ggml_backend_sched_moe_ffn {
                     if (stop) break;
                     auto * current = job;
                     lock.unlock();
-                    auto result = ggml_backend_graph_compute(cpu, &current->host_graph);
+                    auto result = new_policy
+                            ? ggml_backend_cpu_graph_compute_executor(cpu, &current->host_graph,
+                                    ggml_moe_cpu_workers::execute, &cpu_workers)
+                            : ggml_backend_graph_compute(cpu, &current->host_graph);
                     lock.lock();
-                    status = result; busy = false;
+                    status = result; cpu_finished_us = ggml_time_us(); busy = false;
                     done.notify_one();
                 }
             });
@@ -1393,8 +1774,22 @@ struct ggml_backend_sched_moe_ffn {
         wake.notify_one();
         if (worker.joinable()) worker.join();
         wait_io();
+        finish_upload();
+        {
+            std::lock_guard<std::mutex> lock(upload_mutex);
+            upload_stop = true;
+        }
+        upload_wake.notify_one();
+        if (upload_worker.joinable()) upload_worker.join();
+        clear_cache();
+#ifdef GGML_USE_CUDA
+        if (profile_backend) ggml_backend_cuda_moe_profile(profile_backend, nullptr, 0, 0);
+#endif
+        for (auto event : {router_ready, upload_ready, upload_fence, upload_started}) ggml_backend_event_free(event);
+        if (uploader) ggml_backend_free(uploader);
+        for (auto buffer : {histogram, slot_map, packed_output, upload_staging}) ggml_backend_buffer_free(buffer);
         ggml_backend_event_free(completion);
-        for (auto buffer : {cache, activation, intermediate, output, ids, device_ids, device_cpu})
+        for (auto buffer : {activation, intermediate, output, ids, device_ids, device_cpu})
             ggml_backend_buffer_free(buffer);
     }
 };
@@ -1521,6 +1916,8 @@ struct ggml_backend_sched {
     bool only_active_experts;
     bool moe_resident_zero_fill = false;
     bool moe_resident_grouping = false; // layout-grouped complete cache; shared cache by default
+    bool moe_resident_adaptive = false;
+    bool moe_resident_refresh_pending = false;
     size_t moe_resident_cap_bytes;
     int moe_resident_slots;
     int moe_resident_layers;
@@ -1661,7 +2058,7 @@ void ggml_backend_sched_set_moe_resident_layers(ggml_backend_sched_t sched, int 
 }
 
 bool ggml_backend_sched_moe_resident_needs_rebuild(ggml_backend_sched_t sched) {
-    return sched != nullptr && sched->moe_resident_replan_required;
+    return sched != nullptr && (sched->moe_resident_replan_required || sched->moe_resident_refresh_pending);
 }
 
 void ggml_backend_sched_set_moe_resident_model_info(
@@ -2536,7 +2933,8 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 #ifndef NDEBUG
         fprintf(stderr, "%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        const bool reserved = ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!reserved && sched->moe_resident_adaptive) return false;
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             fprintf(stderr, "%s: failed to allocate graph\n", __func__);
             return false;
@@ -3754,6 +4152,84 @@ static ggml_status ggml_backend_sched_moe_decode_compute(ggml_backend_sched_t sc
 
 #include "ggml-moe-resident-ffn.inc"
 
+void ggml_backend_sched_moe_resident_set_tokens(ggml_backend_sched_t sched, const int32_t * tokens, int n) {
+    if (!sched || sched->moe_resident_slots >= 0 || !sched->moe_resident_zero_fill || !sched->moe_ffn) return;
+    auto & f = *sched->moe_ffn;
+    if (!f.new_policy || f.in_flight.owner) return;
+    f.route_tokens.clear();
+    if (tokens && n >= 1 && n <= 4) f.route_tokens.assign(tokens, tokens + n);
+    if (!f.route_tokens.empty() && std::any_of(f.route_tokens.begin(), f.route_tokens.end(), [&](int32_t token) {
+            return std::find(f.prediction_tokens.begin(), f.prediction_tokens.end(), token) == f.prediction_tokens.end();
+        })) {
+        // Without MTP, the chosen input tokens still permit forecasting later
+        // layers before their routers run. MTP supplies these IDs earlier.
+        ggml_backend_sched_moe_resident_predict(sched, tokens, n);
+    }
+    // Graph rebuilds, prompt chunks and rejected/shortened draft windows may
+    // change the upcoming tokens. Never keep an unrelated forecast pinned.
+    f.forecasts.erase(std::remove_if(f.forecasts.begin(), f.forecasts.end(), [&](const auto & c) {
+        return std::find(f.route_tokens.begin(), f.route_tokens.end(), c.token) == f.route_tokens.end();
+    }), f.forecasts.end());
+    f.forecast_queue.erase(std::remove_if(f.forecast_queue.begin(), f.forecast_queue.end(), [&](const auto & c) {
+        return std::find(f.route_tokens.begin(), f.route_tokens.end(), c.token) == f.route_tokens.end();
+    }), f.forecast_queue.end());
+    std::fill(f.forecast_probability.begin(), f.forecast_probability.end(), 0);
+    for (const auto & c : f.forecasts) {
+        const size_t i = size_t(c.layer) * sched->moe_resident_n_expert + c.expert;
+        if (i < f.forecast_probability.size()) f.forecast_probability[i] = std::max(f.forecast_probability[i], c.probability);
+    }
+    f.prediction_tokens.clear(); // this plan is now bound to one actual invocation
+}
+
+void ggml_backend_sched_moe_resident_predict(ggml_backend_sched_t sched, const int32_t * tokens, int n) {
+    if (!sched || sched->moe_resident_slots >= 0 || !sched->moe_resident_zero_fill || !sched->moe_ffn) return;
+    auto & f = *sched->moe_ffn;
+    if (!f.new_policy || f.in_flight.owner) return;
+    f.predict_token_routes(tokens, n, sched->moe_resident_layers, sched->moe_resident_n_expert);
+    for (auto & g : f.groups) g.victim_epoch = UINT64_MAX;
+#ifdef GGML_USE_CUDA
+    if (!f.forecasts.empty() && f.cache && sched->n_backends == 2 && ggml_backend_is_cuda(sched->backends[0])) {
+        // Called between target invocations. Fence the previous reusable map
+        // source before predictive admission queues an updated map on GPU.
+        f.wait_io();
+        resident_prefetch_prediction(sched, sched->backends[0]);
+        ggml_backend_event_record(f.completion); f.pending = true;
+    }
+#endif
+}
+
+void ggml_backend_sched_moe_resident_begin_generation(ggml_backend_sched_t sched) {
+    if (!sched || sched->moe_resident_slots >= 0 || sched->moe_resident_n_expert_used <= 0 ||
+            sched->moe_resident_refresh_pending) return;
+#ifdef GGML_USE_CUDA
+    bool cuda = false;
+    for (int b = 0; b < sched->n_backends; ++b) cuda |= ggml_backend_is_cuda(sched->backends[b]);
+    if (!cuda) return;
+    ggml_backend_sched_synchronize(sched);
+    if (sched->moe_ffn) {
+        sched->moe_ffn->finish();
+        sched->moe_ffn->wait_io();
+        sched->moe_ffn->finish_upload();
+        sched->moe_ffn->report_new("generation-boundary");
+        if (sched->moe_ffn->new_policy) ggml_backend_sched_moe_new_collect(sched);
+        sched->moe_ffn->disabled = false; // retry a previous allocation failure on the new response
+    }
+    // Cached CUDA graphs may reference expert slots. Invalidate them before
+    // scanning a fresh graph or freeing either complete or legacy bank caches.
+    for (int b = 0; b < sched->n_backends; ++b) {
+        if (ggml_backend_is_cuda(sched->backends[b])) ggml_backend_cuda_trim_compute(sched->backends[b]);
+        auto & pools = sched->moe_resident[b];
+        for (int p = 0; p < pools.n_pools; ++p)
+            ggml_backend_sched_moe_resident_clear_storage(&pools.pools[p]);
+        sched->moe_resident_budget[b] = {};
+    }
+    sched->moe_resident_hybrid_plan_ready = false;
+    sched->moe_resident_refresh_pending = true;
+    sched->moe_resident_replan_required = true;
+    fprintf(stderr, "ggml_backend_sched: moe-resident generation refresh requested\n");
+#endif
+}
+
 static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_backend_sched_split * split,
         std::array<bool, GGML_SCHED_MAX_BACKENDS> & needs_sync,
         ggml_backend_sched_moe_route_state & route) {
@@ -4240,6 +4716,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    // A failed independent GPU split must not leave a CPU job using graph
+    // descriptors after the caller resets/frees them. Successful graphs join
+    // and publish at the marked dependent split below.
+    struct deferred_cleanup {
+        ggml_backend_sched_t sched;
+        ~deferred_cleanup() {
+            if (!sched->moe_ffn || !sched->moe_ffn->in_flight.owner) return;
+            auto & f = *sched->moe_ffn;
+            f.finish(); f.wait_io();
+            ggml_backend_synchronize(f.in_flight.gpu);
+            f.in_flight.owner = nullptr;
+        }
+    } deferred_guard{sched};
+
     ggml_backend_sched_moe_route_state route;
 
     // MoE expert prefetch; pre-scan the splits for expert-weight matmuls whose
@@ -4311,6 +4801,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
+        if (sched->moe_ffn && sched->moe_ffn->in_flight.owner) {
+            auto & f = *sched->moe_ffn;
+            if (split_backend != f.in_flight.gpu || split->graph.nodes[0] == f.in_flight.owner->join ||
+                    ggml_backend_sched_moe_ffn_node(sched, split->graph.nodes[0])) {
+                const auto status = resident_finish_ffn(sched);
+                if (status != GGML_STATUS_SUCCESS) return status;
+            } else {
+                ++f.overlapped_gpu_splits;
+            }
+        }
+
         if (moe_prefetch && !moe_infos.empty()) {
             while (moe_next < moe_infos.size() && moe_infos[moe_next].split < i) {
                 moe_next++;
@@ -4349,11 +4850,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
         auto ec = GGML_STATUS_SUCCESS;
+        if (sched->moe_ffn && sched->moe_ffn->new_policy &&
+                !ggml_backend_sched_moe_ffn_node(sched, split->graph.nodes[0])) {
+            ggml_backend_sched_moe_new_observe(sched, split->graph.nodes[0], split_backend);
+        }
         if (ggml_backend_sched_moe_ffn_node(sched, split->graph.nodes[0])) {
             auto * task = sched->moe_ffn->graph_tasks.at(split->graph.nodes[0]);
             GGML_ASSERT(task->up == split->graph.nodes[0] && split->graph.n_nodes == 1 &&
                     i + 1 < sched->n_splits && splits[i + 1].graph.n_nodes == 1 &&
                     splits[i + 1].graph.nodes[0] == task->down && splits[i + 1].backend_id == split_backend_id);
+            task->allow_defer = false;
+            // The graph builder places the shared GPU branch before this
+            // direct consumer. Validate actual split placement before allowing
+            // CPU scratch/worker ownership to cross any of those splits.
+            bool independent_gpu_work = false;
+            for (int j = i + 2; task->join && j < sched->n_splits; ++j) {
+                const auto & next = splits[j];
+                if (next.graph.nodes[0] == task->join) {
+                    task->allow_defer = independent_gpu_work;
+                    break;
+                }
+                bool safe = next.backend_id == split_backend_id;
+                for (int n = 0; safe && n < next.graph.n_nodes; ++n) {
+                    const auto * node = next.graph.nodes[n];
+                    safe = !ggml_backend_sched_moe_ffn_node(sched, node) && node->view_src != task->down;
+                    for (const auto * src : node->src) if (src == task->down) safe = false;
+                }
+                if (!safe) break;
+                independent_gpu_work |= next.graph.n_nodes > 0;
+            }
             ggml_backend_sched_copy_inputs(sched, &splits[i + 1], sched->needs_sync, route);
             ec = ggml_backend_sched_moe_ffn_compute(sched, *task, split_backend);
             ++i;
@@ -4382,6 +4907,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
+
+    if (sched->moe_ffn && sched->moe_ffn->in_flight.owner) {
+        // Every deferred job has a validated consumer in this graph.
+        // Reaching the end without it is an internal scheduling error.
+        return GGML_STATUS_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }
@@ -4452,11 +4983,18 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched->moe_ffn) {
         ggml_backend_sched_synchronize(sched);
         auto & f = *sched->moe_ffn;
-        fprintf(stderr, "ggml_backend_sched: moe-resident complete-ffn slots=%zu cache=%zu MiB budget=%zu MiB reserve=%zu MiB layers=%llu hits=%llu fills=%llu evictions=%llu cpu_refs=%llu gpu_refs=%llu h2d_weights=%llu h2d_results=%llu d2d_weights=0\n",
+        f.finish_upload();
+        f.report_new("shutdown");
+        fprintf(stderr, "ggml_backend_sched: moe-resident complete-ffn slots=%zu cache=%zu MiB budget=%zu MiB reserve=%zu MiB layers=%llu hits=%llu fills=%llu evictions=%llu cpu_refs=%llu gpu_refs=%llu h2d_weights=%llu h2d_results=%llu d2d_weights=%llu\n",
                 f.slot_count(), f.allocation_bytes / (1024 * 1024), f.budget_bytes / (1024 * 1024), f.reserve_bytes / (1024 * 1024),
                 (unsigned long long)f.layers, (unsigned long long)f.hits, (unsigned long long)f.fills,
                 (unsigned long long)f.evictions, (unsigned long long)f.cpu_refs, (unsigned long long)f.gpu_refs,
-                (unsigned long long)f.host_bytes, (unsigned long long)f.result_bytes);
+                (unsigned long long)f.host_bytes, (unsigned long long)f.result_bytes, (unsigned long long)f.d2d_bytes);
+        if (f.new_policy) fprintf(stderr,
+                "ggml_backend_sched: moe-resident new all_hit_layers=%llu promotions=%llu rejected=%llu d2h_activation=%llu packed_h2d_results=%llu\n",
+                (unsigned long long)f.all_hit_layers, (unsigned long long)f.promotions,
+                (unsigned long long)f.admission_rejected, (unsigned long long)f.activation_bytes,
+                (unsigned long long)f.packed_result_bytes);
         delete sched->moe_ffn;
         sched->moe_ffn = nullptr;
     }
@@ -4598,6 +5136,77 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     sched->is_alloc = false;
 }
 
+void ggml_backend_sched_set_moe_resident_adaptive(ggml_backend_sched_t sched, bool enabled) {
+    GGML_ASSERT(sched && !sched->is_alloc);
+    sched->moe_resident_adaptive = enabled;
+}
+
+void ggml_backend_sched_moe_resident_release_cache(ggml_backend_sched_t sched) {
+    if (!sched || sched->moe_resident_slots >= 0 || !sched->moe_resident_zero_fill) return;
+    ggml_backend_sched_synchronize(sched);
+    if (sched->moe_ffn) {
+        auto & f = *sched->moe_ffn;
+        f.finish(); f.wait_io(); f.finish_upload();
+    }
+#ifdef GGML_USE_CUDA
+    for (int b = 0; b < sched->n_backends; ++b)
+        if (ggml_backend_is_cuda(sched->backends[b])) ggml_backend_cuda_trim_compute(sched->backends[b]);
+#endif
+    if (sched->moe_ffn) {
+        auto & f = *sched->moe_ffn;
+        f.remember_cache(); f.clear_cache();
+        f.graph_tasks.clear(); f.disabled = false;
+    }
+    for (int b = 0; b < sched->n_backends; ++b) {
+        auto & pools = sched->moe_resident[b];
+        for (int p = 0; p < pools.n_pools; ++p)
+            ggml_backend_sched_moe_resident_clear_storage(&pools.pools[p]);
+        sched->moe_resident_budget[b] = {};
+    }
+    sched->moe_resident_hybrid_plan_ready = false;
+    sched->moe_resident_replan_required = true;
+    sched->moe_resident_refresh_pending = true;
+}
+
+void ggml_backend_sched_release_compute(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched && sched->moe_resident_adaptive && sched->n_copies == 1);
+    ggml_backend_sched_synchronize(sched);
+    if (sched->moe_ffn) {
+        auto & f = *sched->moe_ffn;
+        f.finish(); f.wait_io();
+        f.remember_cache(); f.clear_cache();
+        f.graph_tasks.clear();
+        f.disabled = false;
+    }
+    for (int b = 0; b < sched->n_backends; ++b) {
+        auto & pools = sched->moe_resident[b];
+        for (int p = 0; p < pools.n_pools; ++p) {
+            ggml_backend_sched_moe_resident_clear_storage(&pools.pools[p]);
+            pools.pools[p].disabled = false;
+        }
+        sched->moe_resident_budget[b] = {};
+    }
+    delete sched->moe_decode;
+    sched->moe_decode = nullptr;
+    ggml_backend_sched_reset(sched);
+    ggml_gallocr_free(sched->galloc);
+    sched->galloc = ggml_gallocr_new_n(sched->bufts, sched->n_backends);
+    sched->n_splits = 0;
+    sched->graph.n_nodes = sched->graph.n_leafs = 0;
+    sched->moe_resident_hybrid_plan_ready = false;
+    sched->moe_resident_replan_required = true;
+}
+
+void ggml_backend_sched_measure(ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t * bytes) {
+    GGML_ASSERT(sched && sched->moe_resident_adaptive && !sched->is_alloc && bytes);
+    ggml_backend_sched_reset(sched);
+    ggml_backend_sched_moe_ffn_scan(sched, graph);
+    ggml_backend_sched_moe_resident_hybrid_plan_graph(sched, graph);
+    ggml_backend_sched_split_graph(sched, graph);
+    ggml_gallocr_measure_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids, bytes);
+    ggml_backend_sched_reset(sched);
+}
+
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     ggml_backend_sched_synchronize(sched);
@@ -4607,6 +5216,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
         // point, then size it again from post-reservation free memory.
         auto & f = *sched->moe_ffn;
         f.wait_io();
+        f.remember_cache();
         f.clear_cache();
     }
     ggml_backend_sched_moe_ffn_scan(sched, measure_graph);
@@ -4619,6 +5229,13 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_reset(sched);
 
+    if (sched->moe_resident_adaptive) {
+        // Measurement runs before compute buffers exist. Placement on the
+        // first real graph must use free memory after their reservation.
+        for (int b = 0; b < sched->n_backends; ++b) sched->moe_resident_budget[b] = {};
+        sched->moe_resident_hybrid_plan_ready = false;
+        sched->moe_resident_replan_required = true;
+    }
     return true;
 }
 
@@ -4718,6 +5335,7 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;
     }
+    ggml_backend_sched_moe_ffn_refresh(sched);
     ggml_sched_prepare_graph(sched);
 
     sched->is_alloc = true;

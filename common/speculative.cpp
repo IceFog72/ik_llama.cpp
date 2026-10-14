@@ -324,6 +324,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
         GGML_UNUSED(prompt);
         target_hidden_by_seq.clear();
         draft_cache_by_seq.clear();
+        llama_moe_resident_predict(ctx_tgt, nullptr, 0);
     }
 
     void draft(
@@ -342,6 +343,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             llama_seq_id seq_id,
             llama_tokens & result) override {
 
+        llama_moe_resident_predict(ctx_tgt, nullptr, 0);
         const llama_pos mtp_pos_max = llama_kv_cache_seq_pos_max(ctx_mtp, seq_id);
         const bool has_draft_base_pos = draft_base_pos >= 0;
         // Prefer the target slot position when the caller has it. Gemma4 external MTP reads
@@ -386,6 +388,13 @@ struct common_speculative_state_mtp : public common_speculative_state {
             seq_id,
             constant_draft_positions
         );
+        if (seq_id == 0) {
+            // The carry token and actual MTP proposals are the next target
+            // verification inputs. No predictor-layer expert IDs are reused.
+            llama_tokens upcoming{ id_last };
+            upcoming.insert(upcoming.end(), result.begin(), result.begin() + std::min<size_t>(3, result.size()));
+            llama_moe_resident_predict(ctx_tgt, upcoming.data(), int32_t(upcoming.size()));
+        }
     }
 
     void accept(uint16_t n_accepted) override {
@@ -1476,6 +1485,10 @@ common_speculative * common_speculative_init(
                 llama_context * ctx_mtp = ctx_dft;
                 if (!ctx_mtp) {
                     const llama_model * model = llama_get_model(ctx_tgt);
+                    // Target warm-up may already have filled auto residency.
+                    // Companion KV/compute allocations take priority; expert
+                    // history survives and refills against the remaining VRAM.
+                    llama_moe_resident_release_cache(ctx_tgt);
                     ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), config.params.cparams_dft);
                     if (!ctx_mtp) {
                         LOG_ERR("%s: failed to create MTP context\n", __func__);
@@ -2068,6 +2081,9 @@ bool common_speculative_load_draft_model(
     params.cpu_affinity_configured = false;
 
     gpt_params params_dft = params_base;
+    // External draft contexts retain their ordinary workspace policy. Only an
+    // embedded MTP predictor participates in the target's adaptive handoff.
+    params_dft.moe_resident_ubatch = 0;
     params_dft.cpu_affinity.clear();
     params_dft.cpu_affinity_auto = false;
     params_dft.cpu_affinity_configured = false;
@@ -2181,7 +2197,35 @@ bool common_speculative_prepare_mtp_runtime(
         gpt_params params_mtp = params_base;
         params_mtp.pooling_type = LLAMA_POOLING_TYPE_NONE;
         common_speculative_apply_draft_threads(params, params_mtp);
+        if (params_base.moe_resident < 0 && params_base.moe_resident_zero_fill) {
+            // Independent auto allocators otherwise let a one-layer predictor
+            // claim its entire expert bank before target generation begins.
+            // Start with a bounded working set; never raise a user cap. This
+            // budget includes the predictor cache's own allocation overhead.
+            params_mtp.moe_resident_mib = params_base.moe_resident_mib > 0
+                ? std::min(params_base.moe_resident_mib, 128) : 128;
+            if (!params.params.empty()) {
+                gpt_params overrides = params_mtp;
+                if (!common_speculative_parse_params(params.params, overrides, false)) return false;
+                // Only residency overrides are new for embedded predictors.
+                // Preserve the existing MTP workspace, thread and state policy.
+                params_mtp.moe_resident = overrides.moe_resident;
+                params_mtp.moe_resident_mib = overrides.moe_resident_mib;
+                params_mtp.moe_resident_zero_fill = overrides.moe_resident_zero_fill;
+                params_mtp.moe_resident_grouping = overrides.moe_resident_grouping;
+            }
+            LOG_INF("%s: embedded predictor residency=%d cap=%d MiB profiler=%s\n", __func__,
+                    params_mtp.moe_resident, params_mtp.moe_resident_mib,
+                    params_mtp.moe_resident_zero_fill ? "new" : "old");
+        }
         params.cparams_dft = common_context_params_to_llama(params_mtp);
+        if (params.cparams_dft.moe_resident_ubatch && params.cparams_dft.moe_resident < 0) {
+            // params_mtp is local; the copied raw CUDA options pointer must
+            // survive until the predictor backend is constructed.
+            params.adaptive_cuda_params_dft = std::make_shared<const std::string>(params_mtp.cuda_params);
+            params.cparams_dft.cuda_params = params.adaptive_cuda_params_dft->empty() ? nullptr
+                    : const_cast<char *>(params.adaptive_cuda_params_dft->c_str());
+        }
         // same draft affinity as the external draft path
         const std::vector<int32_t> & cpu_affinity_dft = params.cpu_affinity_configured
             ? params.cpu_affinity

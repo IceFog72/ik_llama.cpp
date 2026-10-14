@@ -59,6 +59,9 @@ GGML_API bool ggml_gallocr_reserve_n(
     struct ggml_cgraph * graph,
     const int * node_buffer_ids,
     const int * leaf_buffer_ids);
+// Compute required bytes per allocator buffer without allocating physical storage.
+GGML_API void ggml_gallocr_measure_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+    const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * bytes);
 
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)

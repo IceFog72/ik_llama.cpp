@@ -8,6 +8,8 @@
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
 #include "ggml-impl.h"
+#include "ggml-moe-executor.h"
+#include "ggml-moe-resident-control.h"
 #include "ggml-utils.h"
 #include "ggml-quants.h"
 #include "ggml.h"
@@ -3005,6 +3007,7 @@ struct ggml_compute_state_shared {
 
     int n_threads;
     int n_batch;
+    bool external_executor;
 
     // synchronization primitives
     atomic_int n_barrier;
@@ -4899,7 +4902,7 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
-    if (shared && shared->n_batch > 32) {
+    if (shared && (shared->external_executor || shared->n_batch > 32)) {
         ggml_barrier_impl(shared);
         return;
     }
@@ -18543,6 +18546,21 @@ static int ggml_compute_forward_mul_mat(
 
 // ggml_compute_forward_mul_mat_id
 
+// Scheduler-owned CPU-only descriptors carry the actual unique miss IDs.
+// They stay immutable until the resident CPU job joins. Ordinary nodes and
+// GPU descriptors never use this private input/marker contract.
+static const struct ggml_tensor * ggml_moe_resident_cpu_routes(const struct ggml_tensor * dst, int n_experts) {
+    if (dst->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] != GGML_MOE_RESIDENT_CPU_ROUTES) return NULL;
+    const struct ggml_tensor * list = dst->src[dst->op == GGML_OP_MOE_FUSED_UP_GATE ? 6 : 3];
+    GGML_ASSERT(list && list->type == GGML_TYPE_I32 && list->ne[0] >= 0 && list->ne[0] <= n_experts &&
+            list->ne[1] == 1 && list->ne[2] == 1 && list->ne[3] == 1 &&
+            list->nb[0] == sizeof(int32_t) && (list->ne[0] == 0 || list->data));
+    const int32_t * ids = (const int32_t *)list->data;
+    for (int i = 0; i < list->ne[0]; ++i)
+        GGML_ASSERT(ids[i] >= 0 && ids[i] < n_experts && (i == 0 || ids[i - 1] < ids[i]));
+    return list;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -18550,6 +18568,7 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+    const struct ggml_tensor * cpu_routes = ggml_moe_resident_cpu_routes(dst, src0->ne[2]);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -18610,6 +18629,10 @@ static void ggml_compute_forward_mul_mat_id(
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                    if (cpu_routes && ne13 == 1 && ne11 == ids->ne[0] && ne12 == ids->ne[1]) {
+                        const int32_t e = *(const int32_t *)((const char *)ids->data + i12 * ids->nb[1] + i11 * ids->nb[0]);
+                        if (e < 0 || e >= ne02) continue; // no CPU dot product reads this quantized row
+                    }
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                                ne10);
@@ -18665,16 +18688,19 @@ static void ggml_compute_forward_mul_mat_id(
 
         const int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
 
-        int total_chunks = 0;
-        for (int a = 0; a < n_as; a++) {
+        int total_chunks = cpu_routes ? cpu_routes->ne[0] * chunks_per_expert : 0;
+        if (!cpu_routes) for (int a = 0; a < n_as; a++)
             if (matrix_row_counts[a] > 0) total_chunks += chunks_per_expert;
-        }
 
         int chunk_id = ith;
         while (chunk_id < total_chunks) {
             // Map global chunk_id to (expert_index, local_chunk_index)
             int acc = 0, cur_a = -1, local_chunk = 0;
-            for (int a = 0; a < n_as; a++) {
+            if (cpu_routes) {
+                cur_a = ((const int32_t *)cpu_routes->data)[chunk_id / chunks_per_expert];
+                local_chunk = chunk_id % chunks_per_expert;
+            }
+            for (int a = 0; !cpu_routes && a < n_as; a++) {
                 if (matrix_row_counts[a] == 0) continue;
                 if (chunk_id < acc + chunks_per_expert) {
                     cur_a = a;
@@ -18878,6 +18904,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     const struct ggml_tensor * src0_1 = dst->src[0];
     const struct ggml_tensor * src0_2 = dst->src[1];
     const struct ggml_tensor * src0 = src0_1; // so GGML_TENSOR_BINARY_OP_LOCALS works
+    const struct ggml_tensor * cpu_routes = ggml_moe_resident_cpu_routes(dst, src0->ne[2]);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -18996,17 +19023,20 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
     const int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
 
-    int total_chunks_ug = 0;
-    for (int a = 0; a < n_as; a++) {
+    int total_chunks_ug = cpu_routes ? cpu_routes->ne[0] * chunks_per_expert_ug : 0;
+    if (!cpu_routes) for (int a = 0; a < n_as; a++)
         if (matrix_row_counts[a] > 0) total_chunks_ug += chunks_per_expert_ug;
-    }
 
     int last_a = 0;
     int last_acc = 0;
     int chunk_id_ug = ith;
     while (chunk_id_ug < total_chunks_ug) {
         int acc = last_acc, cur_a = -1, local_chunk = 0;
-        for (int a = last_a; a < n_as; a++) {
+        if (cpu_routes) {
+            cur_a = ((const int32_t *)cpu_routes->data)[chunk_id_ug / chunks_per_expert_ug];
+            local_chunk = chunk_id_ug % chunks_per_expert_ug;
+        }
+        for (int a = last_a; !cpu_routes && a < n_as; a++) {
             if (matrix_row_counts[a] == 0) continue;
             if (chunk_id_ug < acc + chunks_per_expert_ug) {
                 cur_a = a;
@@ -29560,7 +29590,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     return 0;
 }
 
-enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+static void ggml_graph_compute_external_worker(void * data, int ith) {
+    struct ggml_compute_state worker = {
+        .thrd = 0,
+        .ith = ith,
+        .shared = (struct ggml_compute_state_shared *)data,
+    };
+    ggml_graph_compute_thread(&worker);
+    clear_numa_thread_affinity();
+}
+
+enum ggml_status ggml_graph_compute_with_executor(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan,
+        ggml_compute_executor_fn executor, void * executor_data) {
     GGML_ASSERT(cplan);
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
@@ -29580,6 +29621,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.cgraph_plan             =*/ cplan,
         /*.n_threads               =*/ n_threads,
         /*.n_batch                 =*/ cgraph->n_batch,
+        /*.external_executor       =*/ executor != NULL,
         /*.n_barrier               =*/ 0,
         /*.n_barrier_passed        =*/ 0,
         /*.abort_callback          =*/ NULL,
@@ -29588,6 +29630,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.ec                      =*/ GGML_STATUS_SUCCESS,
     };
 
+    if (executor) {
+        executor(executor_data, ggml_graph_compute_external_worker, &state_shared, n_threads);
+    } else {
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
 //#if IK_PRINT_TIMING
@@ -29652,6 +29697,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
 #endif
 
+    }
+
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
 
@@ -29662,6 +29709,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #endif
 
     return state_shared.ec;
+}
+
+enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    return ggml_graph_compute_with_executor(cgraph, cplan, NULL, NULL);
 }
 
 enum ggml_status ggml_graph_compute_with_ctx(struct ggml_context * ctx, struct ggml_cgraph * cgraph, int n_threads) {

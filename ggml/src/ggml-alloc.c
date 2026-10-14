@@ -670,7 +670,8 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
-bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
+static bool ggml_gallocr_reserve_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * measured_bytes) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
     // add 25% margin to avoid hash collisions
     min_hash_size += min_hash_size / 4;
@@ -749,6 +750,15 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
         }
     }
 
+    if (measured_bytes) {
+        for (int i = 0; i < galloc->n_buffers; ++i) {
+            measured_bytes[i] = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i]);
+            for (int j = 0; j < i; ++j)
+                if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) measured_bytes[i] = 0;
+        }
+        return true;
+    }
+
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
         // if the buffer type is used multiple times, we reuse the same buffer
@@ -779,6 +789,17 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
     }
 
     return true;
+}
+
+bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids) {
+    return ggml_gallocr_reserve_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, NULL);
+}
+
+void ggml_gallocr_measure_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph,
+        const int * node_buffer_ids, const int * leaf_buffer_ids, size_t * bytes) {
+    GGML_ASSERT(bytes != NULL);
+    ggml_gallocr_reserve_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, bytes);
 }
 
 bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {

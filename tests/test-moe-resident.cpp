@@ -240,6 +240,7 @@ static void test_cpu_quantized_masked_rows() {
     constexpr int width = 256, rows = 16, experts = 4, top_k = 4;
     auto cpu = ggml_backend_cpu_init();
     ggml_backend_cpu_set_n_threads(cpu, 4);
+    ggml_moe_cpu_workers persistent;
     for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
             GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
         for (const int tokens : {1, 2}) for (const int input_rows : {1, 2, top_k}) {
@@ -279,6 +280,22 @@ static void test_cpu_quantized_masked_rows() {
                 check(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS,
                         "quantized masked rows compute on a reused graph");
                 ggml_backend_tensor_get(out, values.data(), 0, ggml_nbytes(out));
+                // Reuse the native team across graphs and changing thread
+                // counts. Compare against ordinary execution before running
+                // the independent valid-route oracle below.
+                std::vector<float> native_values(values.size());
+                for (int threads : {1, 4, 2, 8, 1}) {
+                    ggml_backend_cpu_set_n_threads(cpu, threads);
+                    check(ggml_backend_cpu_graph_compute_executor(cpu, graph,
+                            ggml_moe_cpu_workers::execute, &persistent) == GGML_STATUS_SUCCESS,
+                            "persistent CPU executor completes with changing team sizes");
+                    ggml_backend_tensor_get(out, native_values.data(), 0, ggml_nbytes(out));
+                    bool equal = true;
+                    for (size_t j = 0; j < values.size(); ++j)
+                        equal &= std::abs(native_values[j] - values[j]) <= 1e-5f + 1e-5f * std::abs(values[j]);
+                    check(equal, "persistent quantized masked-row results match ordinary CPU execution");
+                }
+                ggml_backend_cpu_set_n_threads(cpu, 4);
                 // Quantization rounds even constant rows. Compare against the
                 // native unmasked path, replacing invalid experts with zero.
                 // Run it after the masked graph so it cannot prime that graph's
@@ -857,8 +874,10 @@ static void test_cuda_copy() {
 #endif
 
 #ifdef GGML_USE_CUDA
-static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false, bool skip_growth = false, bool grouping = true) {
+static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false, bool skip_growth = false, bool grouping = true, int verification_tokens = 0, bool overlap = false, bool prediction = false) {
     constexpr int width = 256, hidden = 512, experts = 16, top_k = 8, layers = 3;
+    const bool verify_batch = verification_tokens > 0;
+    const int tokens = verify_batch ? verification_tokens : 1;
     auto * cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
     check(cuda != nullptr, "complete FFN CUDA backend initializes");
     if (!cuda) return;
@@ -906,14 +925,14 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
     };
     for (int layer = 0; layer < layers; ++layer) for (int b = 0; b < 3; ++b)
         if (!combined || b != 1) make_bank(layer, b, hidden, 0);
-    auto * act = ggml_new_tensor_3d(sources, GGML_TYPE_F32, width, 1, 1);
-    auto * ids = ggml_new_tensor_2d(sources, GGML_TYPE_I32, top_k, 1);
-    auto * weights = ggml_new_tensor_3d(sources, GGML_TYPE_F32, 1, top_k, 1);
+    auto * act = ggml_new_tensor_3d(sources, GGML_TYPE_F32, width, 1, tokens);
+    auto * ids = ggml_new_tensor_2d(sources, GGML_TYPE_I32, verify_batch ? experts : top_k, tokens);
+    auto * weights = ggml_new_tensor_3d(sources, GGML_TYPE_F32, 1, top_k, tokens);
     for (auto * tensor : {act, ids, weights}) allocate(tensor, ggml_backend_cuda_host_buffer_type());
     ggml_set_input(ids); ggml_set_input(act); ggml_set_input(weights);
-    std::vector<float> activation(width), scaling(top_k);
-    for (int i = 0; i < width; ++i) activation[i] = 0.07f * (i % 17 - 8);
-    for (int i = 0; i < top_k; ++i) scaling[i] = float(i + 1) / 36;
+    std::vector<float> activation(width * tokens), scaling(top_k * tokens);
+    for (int i = 0; i < width * tokens; ++i) activation[i] = 0.07f * (i % 17 - 8);
+    for (int i = 0; i < top_k * tokens; ++i) scaling[i] = float(i + 1) / 36;
     ggml_backend_tensor_set(act, activation.data(), 0, ggml_nbytes(act));
     ggml_backend_tensor_set(weights, scaling.data(), 0, ggml_nbytes(weights));
     int32_t routes[][top_k] = {
@@ -921,11 +940,26 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         {0, 1, 2, 3, 0, 1, 4, 4}, {-1, 3, 3, 3, 8, 9, 9, 9},
         {14, 14, 14, 14, 14, 14, 14, 14}, {15, 14, 13, 12, 11, 10, 9, 8},
     };
+    auto pack_route = [&](const int32_t * route) {
+        std::vector<int32_t> packed(top_k * tokens);
+        for (int token = 0; token < tokens; ++token)
+            for (int row = 0; row < top_k; ++row)
+                packed[token * top_k + row] = route[(row + 3 * token) % top_k];
+        return packed;
+    };
+    auto pack_input_route = [&](const int32_t * route) {
+        const auto packed = pack_route(route);
+        const int stride = verify_batch ? experts : top_k;
+        std::vector<int32_t> input(stride * tokens, -777);
+        for (int token = 0; token < tokens; ++token)
+            std::copy_n(packed.begin() + token * top_k, top_k, input.begin() + token * stride);
+        return input;
+    };
     auto native = [&](ggml_backend_t backend, int layer, const int32_t * route) {
         auto * ctx = ggml_init({1024 * 1024, nullptr, true});
-        auto * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, 1);
-        auto * r = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, 1);
-        auto * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, top_k, 1);
+        auto * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, 1, tokens);
+        auto * r = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, tokens);
+        auto * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, top_k, tokens);
         auto ** wb = backend == cuda ? gpu_banks[layer] : banks[layer];
         auto * up = ggml_moe_up_gate(ctx, wb[0], wb[1], a, r, GGML_UNARY_OP_SILU);
         auto * down = ggml_mul_mat_id(ctx, wb[2], up, r);
@@ -935,7 +969,8 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         auto buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
         GGML_ASSERT(buffer);
         ggml_backend_tensor_set(a, activation.data(), 0, ggml_nbytes(a));
-        ggml_backend_tensor_set(r, route, 0, ggml_nbytes(r));
+        const auto packed = pack_route(route);
+        ggml_backend_tensor_set(r, packed.data(), 0, ggml_nbytes(r));
         ggml_backend_tensor_set(w, scaling.data(), 0, ggml_nbytes(w));
         check(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "complete FFN native reference computes");
         std::vector<float> result(ggml_nelements(out));
@@ -948,7 +983,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
     failed_buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t) -> ggml_backend_buffer_t { return nullptr; };
     bool injected = false;
     for (int r = 0; r < 6; ++r) {
-        if (!fail_cache && r == 3) {
+        if (!fail_cache && !verify_batch && r == 3) {
             // Replace the DOWN bank while this layer has a live cached expert.
             // Repeating that expert makes stale slot reuse observable.
             int cached_expert = -1;
@@ -974,14 +1009,36 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
         auto * graph = ggml_new_graph_custom(ctx, 256, false);
         ggml_tensor * outputs[layers]{};
+        ggml_tensor * shared[layers]{};
+        ggml_tensor * graph_ids = ids;
+        if (verify_batch) {
+            auto * selected = ggml_view_2d(ctx, ids, top_k, tokens, ids->nb[1], 0);
+            check(!ggml_is_contiguous(selected), "real batched top-k route has an argsort stride");
+            graph_ids = ggml_cont(ctx, selected);
+            ggml_set_name(graph_ids, "ffn_moe_topk-0");
+        }
         for (int layer = 0; layer < layers; ++layer) {
-            auto * up = ggml_moe_up_gate(ctx, banks[layer][0], banks[layer][1], act, ids, GGML_UNARY_OP_SILU);
-            auto * down = ggml_mul_mat_id(ctx, banks[layer][2], up, ids);
-            outputs[layer] = ggml_sqr(ctx, ggml_mul(ctx, down, weights));
+            auto * up = ggml_moe_up_gate(ctx, banks[layer][0], banks[layer][1], act, graph_ids, GGML_UNARY_OP_SILU);
+            auto * down = ggml_mul_mat_id(ctx, banks[layer][2], up, graph_ids);
+            auto * weighted = ggml_mul(ctx, down, weights);
+            if (overlap) {
+                down->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_MOE_RESIDENT_DEFERRED_DOWN;
+                weighted->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_MOE_RESIDENT_JOIN;
+                ggml_build_forward_expand(graph, down);
+                shared[layer] = ggml_sqr(ctx, act);
+                shared[layer]->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_MOE_RESIDENT_SHARED;
+                ggml_set_output(shared[layer]);
+                // One graph deliberately crosses to CPU: that branch must
+                // retire the job before reusing the CPU backend.
+                ggml_backend_sched_set_tensor_backend(sched, shared[layer], r == 1 ? cpu : cuda);
+                ggml_build_forward_expand(graph, shared[layer]);
+            }
+            outputs[layer] = ggml_sqr(ctx, weighted);
             ggml_set_output(outputs[layer]);
             ggml_build_forward_expand(graph, outputs[layer]);
         }
-        ggml_backend_tensor_set(ids, routes[r], 0, ggml_nbytes(ids));
+        const auto packed_route = pack_input_route(routes[r]);
+        ggml_backend_tensor_set(ids, packed_route.data(), 0, ggml_nbytes(ids));
         check(ggml_backend_sched_alloc_graph(sched, graph), "complete FFN graph allocates without bank staging");
         if (!fail_cache && !zero_fill && !skip_growth && r == 5) {
             check(!sched->moe_ffn->cache && sched->moe_ffn->slot_count() == 0,
@@ -1005,6 +1062,30 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                 GGML_ASSERT(f.cache);
                 ggml_backend_buffer_clear(f.cache, 0);
                 f.allocation_bytes = bytes;
+                if (verify_batch) {
+                    resident_history(sched);
+                    check(f.new_policy && f.graph_tasks.size() == 2 * layers,
+                            "two-token verification enters the new resident executor");
+                    check(ggml_backend_sched_moe_decode_buffer(f.slot_map, original_buft,
+                            f.mapping.size() * sizeof(int32_t)), "new policy lookup allocates");
+                    // Start with GPU hits in every layer and CPU misses in
+                    // both tokens. All bytes come from real host banks.
+                    for (int layer = 0; layer < layers; ++layer) for (int expert = 0; expert < 2; ++expert) {
+                        auto & task = *f.tasks[layer];
+                        auto & group = f.groups[task.group];
+                        const size_t position = size_t(2 * layer + expert);
+                        resident_upload(f, task, expert, position, cuda);
+                        auto & slot = group.slots[position];
+                        slot.layer = layer; slot.expert = expert;
+                        for (int b = 0; b < 3; ++b) {
+                            slot.banks[b] = task.banks[b];
+                            slot.data[b] = task.banks[b] ? task.banks[b]->data : nullptr;
+                        }
+                        group.slot_index[(uint64_t(layer) << 32) | uint32_t(expert)] = int(position);
+                    }
+                    resident_mapping(sched, cuda);
+                    ggml_backend_synchronize(cuda);
+                }
                 for (auto & task : f.tasks) if (task) {
                     auto & timing = ggml_backend_sched_moe_ffn_timing(f, *task, top_k);
                     for (size_t m = 1; m < timing.misses.size(); ++m) for (size_t q = 0; q <= m; ++q) {
@@ -1035,9 +1116,64 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         uint64_t old_zero_samples = 0;
         for (const auto & timing : state.timings)
             for (const auto & samples : timing.misses) old_zero_samples += samples[0].count;
+        if (verify_batch) std::fill(state.cpu_cost.begin(), state.cpu_cost.end(), 1000.0);
+        if (prediction) {
+            // Teach a route whose experts deliberately differ from the next
+            // actual route. Loading those weights must never change routing
+            // or arithmetic; the ordinary native references below prove it.
+            const int32_t future[] = {1234, 1234};
+            const int32_t hinted[] = {0, 1, 13, 14, 0, 1, 13, 14};
+            for (int layer = 0; layer < layers; ++layer) for (int sample = 0; sample < 4; ++sample)
+                state.observe_token_route(1234, layer, hinted, top_k, layers, experts);
+            ggml_backend_sched_moe_resident_predict(sched, future, tokens);
+            for (int layer = 0; layer < layers; ++layer) {
+                check(state.forecast_probability[size_t(layer) * experts] >= 0.75 &&
+                        state.forecast_probability[size_t(layer) * experts + 1] >= 0.75,
+                        "missing-expert upload shortlist retains protection for predicted resident experts");
+            }
+            ggml_backend_sched_moe_resident_set_tokens(sched, future, tokens);
+        }
+        if (overlap && r == 0) {
+            // Fail the independent branch after the CPU job is submitted.
+            // The real scheduler must join it on the error exit before graph
+            // descriptors can be reused or freed, then allow a clean retry.
+            static decltype(cuda->iface.graph_compute) original_compute;
+            static ggml_tensor * failed_node;
+            static ggml_backend_sched_t active_sched;
+            original_compute = cuda->iface.graph_compute;
+            failed_node = shared[0]; active_sched = sched;
+            cuda->iface.graph_compute = [](ggml_backend_t backend, ggml_cgraph * subgraph) {
+                for (int j = 0; j < subgraph->n_nodes; ++j) if (subgraph->nodes[j] == failed_node) {
+                    check(active_sched->moe_ffn->in_flight.owner != nullptr,
+                            "independent GPU failure occurs with a pending CPU job");
+                    return GGML_STATUS_FAILED;
+                }
+                return original_compute(backend, subgraph);
+            };
+            const auto failed_status = ggml_backend_sched_graph_compute(sched, graph);
+            cuda->iface.graph_compute = original_compute;
+            check(failed_status == GGML_STATUS_FAILED, "independent GPU failure reaches the caller");
+            check(!state.in_flight.owner && !state.busy,
+                    "error cleanup retires CPU ownership before a retry or graph reset");
+        }
+        const auto old_deferred = state.deferred_layers;
         check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
                 "complete FFN graph computes with masks and downstream weighting");
-        if (prefer_zero && !old_profiler) {
+        if (overlap) {
+            check(!state.in_flight.owner, "dependent graph completion retires CPU scratch ownership");
+            if (r == 1) check(state.deferred_layers == old_deferred,
+                    "an intervening CPU branch prevents deferred execution");
+            for (const auto * node : shared) {
+                std::vector<float> values(activation.size());
+                ggml_backend_tensor_get(node, values.data(), 0, values.size() * sizeof(float));
+                bool correct = true;
+                for (size_t j = 0; j < values.size(); ++j)
+                    correct &= fabsf(values[j] - activation[j] * activation[j]) < 1e-6f;
+                check(correct, "independent GPU branch retains its own output while CPU experts run");
+            }
+        }
+        if (verify_batch) state.finish_upload();
+        if (prefer_zero && !old_profiler && !verify_batch) {
             check(state.fills == old_fills && state.evictions == old_evictions && state.host_bytes == old_weights,
                     "zero fills preserves cache entries and uploads no expert weights");
             check(state.cpu_refs > old_cpu_refs, "zero fills executes misses on CPU");
@@ -1067,7 +1203,8 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                 expected_cpu[layer] = native(cpu, layer, routes[1]);
                 expected_gpu[layer] = native(cuda, layer, routes[1]);
             }
-            ggml_backend_tensor_set(ids, routes[1], 0, ggml_nbytes(ids));
+            const auto changed_route = pack_input_route(routes[1]);
+            ggml_backend_tensor_set(ids, changed_route.data(), 0, ggml_nbytes(ids));
             check(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS,
                     "complete FFN reuses an allocated graph with changed logical and physical IDs");
         }
@@ -1081,7 +1218,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             size_t bad = 0;
             for (size_t j = 0; j < actual.size(); ++j) {
                 const size_t row = j / width;
-                const bool gpu_row = !fail_cache && mask.size() == top_k && mask[row] >= 0;
+                const bool gpu_row = !fail_cache && mask.size() == size_t(top_k * tokens) && mask[row] >= 0;
                 const auto & expected = gpu_row ? expected_gpu[layer] : expected_cpu[layer];
                 if (!(std::fabs(actual[j] - expected[j]) <= 1e-5f + 1e-5f * std::fabs(expected[j]))) ++bad;
             }
@@ -1092,16 +1229,79 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                 "complete cache allocation failure requests a fresh graph");
         ggml_backend_sched_reset(sched); ggml_free(ctx);
     }
+    if (verify_batch) {
+        const auto & state = *sched->moe_ffn;
+        check((tokens == 2 ? state.batch2_layers : tokens == 3 ? state.batch3_layers : state.batch4_layers) > 0,
+                "verification window executes resident batches at its requested width");
+        check(state.token_layers == tokens * state.layers,
+                "batched history and execution account for all verification tokens");
+        check(sched->moe_ffn->promotions > 0, "batched misses exercise asynchronous promotion");
+        check(state.cpu_batch_rows > state.cpu_batch_experts && state.cpu_masked_quant_rows > 0,
+                "MTP CPU batch shares exact active experts and skips GPU-handled quantization rows");
+        if (overlap) check(sched->moe_ffn->deferred_layers > 0 && sched->moe_ffn->overlapped_gpu_splits > 0,
+                "numerical fixture queues independent GPU work before CPU join");
+        if (prediction) check(state.prediction_candidates > 0 && state.prediction_uploads > 0,
+                "target forecasts enter the real background cache uploader before actual routes");
+    }
     if (!fail_cache) {
         check(sched->moe_ffn->evictions > 0, "global cache evicts across layers");
         check(sched->moe_ffn->cpu_refs > 0 && sched->moe_ffn->gpu_refs > 0, "complete FFN executes both branches");
         check(sched->moe_ffn->fills > 0 && sched->moe_ffn->hits > 0, "complete slots admit and reuse experts");
+    }
+    if (verify_batch) {
+        const auto history = sched->moe_ffn->popularity;
+        const size_t arena_bytes = ggml_backend_sched_get_buffer_size(sched, cuda);
+        ggml_backend_sched_moe_resident_release_cache(sched);
+        check(!sched->moe_ffn->cache && sched->moe_ffn->slot_count() == 0,
+                "companion allocation reclaims target expert storage");
+        check(sched->moe_ffn->popularity == history && !sched->moe_ffn->upload.pending,
+                "companion reclaim retains history and completes uploads");
+        check(ggml_backend_sched_get_buffer_size(sched, cuda) == arena_bytes,
+                "companion reclaim preserves the target graph arena");
     }
     ggml_backend_sched_free(sched);
     for (auto buffer : buffers) ggml_backend_buffer_free(buffer);
     ggml_free(sources); ggml_backend_free(cpu); ggml_backend_free(cuda);
 }
 #endif
+
+static void test_route_predictions() {
+    ggml_backend_sched sched{};
+    sched.moe_resident_slots = -1; sched.moe_resident_zero_fill = true;
+    sched.moe_resident_layers = 3; sched.moe_resident_n_expert = 8;
+    ggml_backend_sched_moe_ffn state;
+    state.new_policy = true; sched.moe_ffn = &state;
+    const int32_t route[] = {2, 2, -1, 7};
+    int32_t next[] = {123};
+    for (int layer = 0; layer < 3; ++layer) for (int i = 0; i < 3; ++i)
+        state.observe_token_route(123, layer, route, 4, 3, 8);
+    ggml_backend_sched_moe_resident_predict(&sched, next, 1);
+    check(state.forecasts.empty(), "expert forecast waits for repeated target observations");
+    for (int layer = 0; layer < 3; ++layer) state.observe_token_route(123, layer, route, 4, 3, 8);
+    ggml_backend_sched_moe_resident_predict(&sched, next, 1);
+    check(state.forecasts.size() == 6, "drafted token forecasts independent target-layer experts");
+    for (const auto & c : state.forecasts) check((c.expert == 2 || c.expert == 7) && c.probability == 1,
+            "duplicate and masked routes do not inflate target forecast confidence");
+    ggml_backend_sched_moe_resident_set_tokens(&sched, next, 1);
+    next[0] = 456;
+    check(state.route_tokens.size() == 1 && state.route_tokens[0] == 123,
+            "prediction binding owns token IDs rather than caller storage");
+    ggml_backend_sched_moe_resident_set_tokens(&sched, next, 1);
+    check(state.forecasts.empty() && state.forecast_queue.empty() &&
+            std::all_of(state.forecast_probability.begin(), state.forecast_probability.end(), [](double p) { return p == 0; }),
+            "shortened or replaced verification input removes stale prediction protection");
+    const auto calls = state.prediction_calls;
+    sched.moe_resident_slots = 0;
+    ggml_backend_sched_moe_resident_predict(&sched, next, 1);
+    check(state.prediction_calls == calls, "master residency off disables expert prediction");
+    sched.moe_resident_slots = -1; sched.moe_resident_zero_fill = false;
+    ggml_backend_sched_moe_resident_predict(&sched, next, 1);
+    check(state.prediction_calls == calls, "old profiler disables expert prediction");
+    for (int token = 0; token < 520; ++token) state.observe_token_route(10000 + token, 0, route, 4, 3, 8);
+    check(state.learned_routes.size() == 512, "token-conditioned routing RAM is bounded");
+    check(!state.learned_routes.count(123), "least recently used token history expires");
+    sched.moe_ffn = nullptr;
+}
 
 #ifdef GGML_USE_CUDA
 static void test_cuda_budget_cap() {
@@ -1148,31 +1348,32 @@ static void test_layout_capacity() {
         f.tasks.emplace_back(new ggml_backend_sched_moe_ffn::task);
         f.tasks.back()->group = group;
     }
-    check(f.plan_cache(1200, 2), "mixed layouts fit their proportional shares");
-    check(f.groups[0].slots.size() == 6 && f.groups[1].slots.size() == 3,
+    std::vector<size_t> counts;
+    size_t bytes = 0;
+    check(f.plan_cache(1200, 2, 16, counts, bytes), "mixed layouts fit their proportional shares");
+    check(counts[0] == 6 && counts[1] == 3,
             "equal host-weight shares produce different whole-expert capacities");
-    check(f.allocation_bytes == 1200, "group allocations obey the aggregate budget");
-    f.clear_cache();
-    check(f.plan_cache(1251, 2) && f.allocation_bytes <= 1251,
+    check(bytes == 1200, "group allocations obey the aggregate budget");
+    check(f.slot_count() == 0 && f.allocation_bytes == 0,
+            "capacity planning does not mutate live storage");
+    check(f.plan_cache(1251, 2, 16, counts, bytes) && bytes <= 1251,
             "fractional group shares round down within the cap");
-    f.clear_cache();
-    check(!f.plan_cache(799, 2), "undersized layout working set safely rejects residency");
-    f.clear_cache();
+    check(!f.plan_cache(799, 2, 16, counts, bytes), "undersized layout working set safely rejects residency");
     f.groups.resize(3); // An obsolete layout with no layers gets no allocation.
     f.groups[2].strides[0] = 100000;
-    check(f.plan_cache(1200, 2) && f.groups[2].slots.empty() && f.allocation_bytes == 1200,
+    check(f.plan_cache(1200, 2, 16, counts, bytes) && counts[2] == 0 && bytes == 1200,
             "inactive layouts do not consume the shared budget");
-    f.clear_cache();
     f.groups.resize(1);
     f.tasks.resize(1);
-    check(f.plan_cache(5000, 2, 4) && f.slot_count() == 16,
-            "shared mode preserves the model-wide two-working-set bound");
-    f.clear_cache();
-    check(f.plan_cache(5000, 2) && f.slot_count() == 4,
-            "layout mode bounds capacity by its member layers");
+    check(f.plan_cache(5000, 2, 4, counts, bytes) && counts[0] == 4,
+            "capacity cannot exceed the actual experts of one member layer");
+    f.tasks.emplace_back(new ggml_backend_sched_moe_ffn::task);
+    check(f.plan_cache(5000, 2, 4, counts, bytes) && counts[0] == 8,
+            "shared layout capacity includes every member layer");
 }
 
 int main(int argc, char ** argv) {
+    test_route_predictions();
     test_layout_capacity();
     test_history();
     test_history_boundaries();
@@ -1180,6 +1381,25 @@ int main(int argc, char ** argv) {
     test_hybrid_placement();
     test_cpu_repeated_routes();
     test_cpu_quantized_masked_rows();
+    if (argc > 1 && strcmp(argv[1], "--cuda-resident-batch") == 0) {
+#ifdef GGML_USE_CUDA
+        for (const int tokens : {2, 3, 4}) {
+            test_complete_ffn(false, false, true, false, false, true, false, tokens);
+            test_complete_ffn(true, false, false, false, false, true, false, tokens);
+            test_complete_ffn(false, false, true, false, false, true, false, tokens, true);
+        }
+#else
+        check(false, "CUDA resident batch test requires a CUDA build");
+#endif
+    }
+    if (argc > 1 && strcmp(argv[1], "--cuda-resident-prediction") == 0) {
+#ifdef GGML_USE_CUDA
+        test_complete_ffn(false, false, true, false, false, true, false, 2, true, true);
+        test_complete_ffn(true, false, false, false, false, true, false, 2, false, true);
+#else
+        check(false, "CUDA resident prediction requires a CUDA build");
+#endif
+    }
     if (argc > 1 && strcmp(argv[1], "--cuda-profiler") == 0) {
 #ifdef GGML_USE_CUDA
         // Focused policy checks use the injected tiny cache and do not need

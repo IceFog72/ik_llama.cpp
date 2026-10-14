@@ -185,6 +185,11 @@ extern "C" {
 
     // Initialize backend buffers from a measure graph
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph);
+    // Idle adaptive-workspace transitions only. All old graph pointers become invalid.
+    GGML_API void                 ggml_backend_sched_release_compute(ggml_backend_sched_t sched);
+    // Measure a fresh graph without allocating physical compute buffers; bytes has n_backends entries.
+    GGML_API void                 ggml_backend_sched_measure(ggml_backend_sched_t sched, struct ggml_cgraph * graph, size_t * bytes);
+    GGML_API void                 ggml_backend_sched_set_moe_resident_adaptive(ggml_backend_sched_t sched, bool enabled);
 
     GGML_API int                  ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched);
     GGML_API ggml_backend_t       ggml_backend_sched_get_backend(ggml_backend_sched_t sched, int i);
@@ -224,6 +229,9 @@ extern "C" {
     // Allocated graphs retain their placement after a residency demotion.
     // When true, build a fresh caller-owned graph before its next allocation.
     GGML_API bool                 ggml_backend_sched_moe_resident_needs_rebuild(ggml_backend_sched_t sched);
+    // Start a response: refresh auto residency after allocating its next real graph.
+    // No-op when residency is disabled or uses fixed legacy slots.
+    GGML_API void                 ggml_backend_sched_moe_resident_begin_generation(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_set_moe_resident_model_info(ggml_backend_sched_t sched,
             int n_layers, int n_expert, int n_expert_used);
     GGML_API void                 ggml_backend_sched_set_split_mode_graph(ggml_backend_sched_t sched, bool on_or_off, bool async);

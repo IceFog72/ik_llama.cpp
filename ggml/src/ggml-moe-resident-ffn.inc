@@ -23,6 +23,17 @@ static bool ggml_backend_sched_moe_ffn_scratch(ggml_backend_sched_t sched,
     f.wait_io();
     const auto host = ggml_backend_cuda_host_buffer_type();
     const auto device = sched->bufts[0];
+    if (f.new_policy) {
+        const auto mapped = [](ggml_backend_buffer_t & buffer, size_t bytes) {
+            if (buffer && ggml_backend_buffer_get_size(buffer) >= bytes) return true;
+            auto replacement = ggml_backend_cuda_moe_host_buffer(bytes);
+            if (!replacement) return false;
+            ggml_backend_buffer_free(buffer); buffer = replacement;
+            return true;
+        };
+        if (!mapped(f.activation, ggml_nbytes(up->src[2])) ||
+                !mapped(f.ids, 2 * ggml_nbytes(up->src[3]))) return false;
+    }
     if (!f.completion) f.completion = ggml_backend_event_new(sched->backends[0]);
     return f.completion &&
         ggml_backend_sched_moe_decode_buffer(f.activation, host, ggml_nbytes(up->src[2])) &&
@@ -39,8 +50,10 @@ static bool ggml_backend_sched_moe_ffn_scratch(ggml_backend_sched_t sched,
 
 static void ggml_backend_sched_moe_ffn_scan(ggml_backend_sched_t sched, const ggml_cgraph * graph) {
     if (sched->moe_ffn) {
+        sched->moe_ffn->finish_upload();
         sched->moe_ffn->wait_io();
         sched->moe_ffn->graph_tasks.clear();
+        sched->moe_ffn->observations.clear();
     }
 auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
 
@@ -54,12 +67,23 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
         return;
     }
     std::unordered_map<const ggml_tensor *, int> uses;
+    const bool new_policy = sched->moe_resident_zero_fill && sched->moe_resident_n_expert_used <= 1024;
     std::set<int> repeated_layers;
+    std::set<int> seen_layers;
     for (int i = 0; i < graph->n_nodes; ++i)
         for (auto * src : graph->nodes[i]->src) if (src) ++uses[src];
     for (int i = 0; i + 1 < graph->n_nodes; ++i) {
         auto * up = graph->nodes[i], * down = graph->nodes[i + 1];
         if (up->op != GGML_OP_MOE_FUSED_UP_GATE) continue;
+        if (new_policy && up->src[0] && up->src[3] &&
+                up->src[3]->type == GGML_TYPE_I32 && ggml_is_contiguous(up->src[3])) {
+            int observed_layer = -1;
+            if (ggml_backend_sched_moe_parse_layer_id(up->src[0], sched->moe_resident_layers, observed_layer)) {
+                if (!sched->moe_ffn) sched->moe_ffn = new ggml_backend_sched_moe_ffn;
+                sched->moe_ffn->new_policy = true;
+                sched->moe_ffn->observations[up] = observed_layer;
+            }
+        }
         ++sched->moe_ffn_candidates;
         if (down->op != GGML_OP_MUL_MAT_ID || down->src[1] != up || down->src[2] != up->src[3]) {
             note(sched->MOE_FFN_R_OP_NOT_PAIR); continue;
@@ -78,8 +102,15 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
         if (act->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
             note(sched->MOE_FFN_R_ACT_IDS_DTYPE); continue;
         }
-        if (act->ne[2] != 1 || act->ne[3] != 1) { note(sched->MOE_FFN_R_ACT_BATCH); continue; }
-        if (ids->ne[1] != 1) { note(sched->MOE_FFN_R_IDS_BATCH); continue; }
+        // Up to three MTP drafts verify alongside the current token. Reuse
+        // the existing batched kernels for this bounded verification window.
+        const int64_t max_tokens = new_policy ? 4 : 1;
+        if (act->ne[2] < 1 || act->ne[2] > max_tokens || act->ne[3] != 1) {
+            note(sched->MOE_FFN_R_ACT_BATCH); continue;
+        }
+        if (ids->ne[1] != act->ne[2] || (new_policy && ggml_nelements(ids) > 1024)) {
+            note(sched->MOE_FFN_R_IDS_BATCH); continue;
+        }
         if (ids->ne[0] != sched->moe_resident_n_expert_used || ids->ne[0] <= 0) {
             note(sched->MOE_FFN_R_IDS_WIDTH); continue;
         }
@@ -131,8 +162,9 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
         }
         if (!sched->moe_ffn) sched->moe_ffn = new ggml_backend_sched_moe_ffn;
         auto & f = *sched->moe_ffn;
+        f.new_policy = new_policy;
         if (repeated_layers.count(layer)) { note(sched->MOE_FFN_R_REPEATED); continue; }
-        if (size_t(layer) < f.tasks.size() && f.tasks[layer] && f.graph_tasks.count(f.tasks[layer]->up)) {
+        if (!seen_layers.insert(layer).second) {
             f.graph_tasks.erase(f.tasks[layer]->up); f.graph_tasks.erase(f.tasks[layer]->down);
             repeated_layers.insert(layer); note(sched->MOE_FFN_R_REPEATED); continue;
         }
@@ -163,6 +195,7 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
             if (changed && f.cache) {
                 ggml_backend_sched_synchronize(sched);
                 f.wait_io();
+                f.remember_cache();
                 f.clear_cache();
             }
             if (new_group) f.groups.push_back(std::move(layout));
@@ -185,6 +218,7 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
             if (changed && f.cache) {
                 ggml_backend_sched_synchronize(sched);
                 f.wait_io();
+                f.remember_cache();
                 f.clear_cache();
             }
         }
@@ -193,6 +227,17 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
         if (!f.tasks[layer]) f.tasks[layer] = std::make_unique<ggml_backend_sched_moe_ffn::task>();
         auto & t = *f.tasks[layer];
         t.layer = layer; t.group = group; t.up = up; t.down = down;
+        t.join = nullptr; t.allow_defer = false;
+        if (new_policy && down->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_MOE_RESIDENT_DEFERRED_DOWN) {
+            for (int j = i + 2; j < graph->n_nodes; ++j) {
+                auto * consumer = graph->nodes[j];
+                if (consumer->src[0] == down &&
+                        consumer->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_MOE_RESIDENT_JOIN) {
+                    t.join = consumer;
+                    break;
+                }
+            }
+        }
         for (int b = 0; b < 3; ++b) t.banks[b] = banks[b];
         f.graph_tasks[up] = &t; f.graph_tasks[down] = &t;
     }
@@ -201,9 +246,59 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
 #endif
 }
 
+static size_t ggml_backend_sched_moe_ffn_budget(ggml_backend_sched_t sched, size_t available, size_t & reserve) {
+    reserve = sched->moe_resident_zero_fill ? 256ull * 1024 * 1024
+            : std::max<size_t>((sched->moe_resident_adaptive ? 512ull : 256ull) * 1024 * 1024, available / 8);
+    return ggml_backend_sched_moe_resident_cap_budget(sched, available > reserve ? available - reserve : 0);
+}
+
+static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched, ggml_backend_t gpu, bool resize = false);
+static void ggml_backend_sched_moe_new_collect(ggml_backend_sched_t sched);
+
+// Called after the real graph arena has been allocated, before any new GPU work.
+// begin_generation() has already waited and invalidated old CUDA captures.
+static void ggml_backend_sched_moe_ffn_refresh(ggml_backend_sched_t sched) {
+    if (!sched->moe_resident_refresh_pending) return;
+    sched->moe_resident_refresh_pending = false;
+#ifdef GGML_USE_CUDA
+    if (!sched->moe_ffn || !sched->moe_ffn->cache) return; // lazy first allocation uses current free memory
+    auto & f = *sched->moe_ffn;
+    f.finish(); f.wait_io();
+    if (f.new_policy) {
+        f.finish_upload();
+        ggml_backend_sched_moe_new_cache(sched, sched->backends[0], true);
+        return;
+    }
+    ggml_backend_synchronize(sched->backends[0]);
+    size_t free_bytes = 0, total_bytes = 0;
+    ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device(sched->backends[0]), &free_bytes, &total_bytes);
+    // Include our own live cache when calculating its replacement budget.
+    const size_t available = free_bytes + f.allocation_bytes;
+    f.budget_bytes = ggml_backend_sched_moe_ffn_budget(sched, available, f.reserve_bytes);
+    std::vector<size_t> counts;
+    size_t bytes = 0;
+    const bool planned = f.plan_cache(f.budget_bytes, sched->moe_resident_n_expert_used,
+            sched->moe_resident_n_expert, counts, bytes);
+    // Always shrink to respect the cap/headroom. Avoid reuploading the working
+    // set merely to gain a handful of slots after a small driver fluctuation.
+    const bool keep = planned && f.allocation_bytes <= f.budget_bytes && bytes >= f.allocation_bytes &&
+            bytes - f.allocation_bytes < 64ull * 1024 * 1024;
+    fprintf(stderr, "ggml_backend_sched: moe-resident generation refresh available=%zu MiB budget=%zu MiB reserve=%zu MiB cache=%zu MiB %s\n",
+            available / 1048576, f.budget_bytes / 1048576, f.reserve_bytes / 1048576,
+            f.allocation_bytes / 1048576, keep ? "retained" : "resize");
+    if (!keep) {
+        f.remember_cache();
+        f.clear_cache();
+        f.disabled = false;
+    }
+    GGML_UNUSED(total_bytes);
+#endif
+}
+
 static bool ggml_backend_sched_moe_ffn_cache(ggml_backend_sched_t sched, ggml_backend_t gpu) {
 #ifdef GGML_USE_CUDA
     auto & f = *sched->moe_ffn;
+    if (f.new_policy) return ggml_backend_sched_moe_new_cache(sched, gpu);
     if (f.cache) return true;
     if (f.disabled) return false;
     ggml_backend_synchronize(gpu);
@@ -214,17 +309,69 @@ static bool ggml_backend_sched_moe_ffn_cache(ggml_backend_sched_t sched, ggml_ba
         ggml_backend_sched_moe_resident_clear_storage(&pools.pools[p], &sched->moe_resident_budget[0]);
     size_t free_bytes = 0, total_bytes = 0;
     ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device(gpu), &free_bytes, &total_bytes);
-    f.reserve_bytes = std::max<size_t>(256 * 1024 * 1024, free_bytes / 8);
-    f.budget_bytes = ggml_backend_sched_moe_resident_cap_budget(sched,
-            free_bytes > f.reserve_bytes ? free_bytes - f.reserve_bytes : 0);
+    f.budget_bytes = ggml_backend_sched_moe_ffn_budget(sched, free_bytes, f.reserve_bytes);
+    std::vector<size_t> counts;
+    size_t bytes = 0;
     f.disabled = !f.plan_cache(f.budget_bytes, sched->moe_resident_n_expert_used,
-            sched->moe_resident_grouping ? 0 : size_t(sched->moe_resident_layers));
+            sched->moe_resident_n_expert, counts, bytes);
     if (!f.disabled) {
+        size_t offset = 0;
+        for (size_t i = 0; i < f.groups.size(); ++i) {
+            auto & g = f.groups[i];
+            g.slots.resize(counts[i]);
+            for (int b = 0; b < 3; ++b) { g.offsets[b] = offset; offset += counts[i] * g.strides[b]; }
+        }
+        f.allocation_bytes = bytes;
         f.cache = ggml_backend_buft_alloc_buffer(sched->bufts[0], f.allocation_bytes);
         if (f.cache) ggml_backend_buffer_clear(f.cache, 0);
         else f.disabled = true;
     }
     if (f.disabled) f.clear_cache();
+    if (f.cache && !f.remembered.empty()) {
+        // Refill the previous working set from authoritative host weights,
+        // hottest first. Old and new VRAM caches never coexist.
+        std::vector<size_t> next(f.groups.size(), 0);
+        size_t restored = 0;
+        for (const auto & saved : f.remembered) {
+            const auto & old = saved.entry;
+            if (saved.group >= f.groups.size() || old.layer < 0 || old.expert < 0 ||
+                    old.expert >= sched->moe_resident_n_expert || size_t(old.layer) >= f.tasks.size() ||
+                    !f.tasks[old.layer]) continue;
+            auto & t = *f.tasks[old.layer];
+            auto & g = f.groups[saved.group];
+            if (t.group != saved.group || next[saved.group] >= g.slots.size()) continue;
+            bool same = true;
+            for (int b = 0; b < 3; ++b) {
+                auto * bank = t.banks[b];
+                same = same && old.banks[b] == bank && old.data[b] == (bank ? bank->data : nullptr) &&
+                        (!bank || (bank->buffer && ggml_backend_buffer_is_host(bank->buffer) && bank->nb[2] <= g.strides[b]));
+            }
+            const uint64_t key = (uint64_t(old.layer) << 32) | uint32_t(old.expert);
+            if (!same || g.slot_index.count(key)) continue;
+            const size_t index = next[saved.group]++;
+            for (int b = 0; b < 3; ++b) {
+                auto * bank = t.banks[b];
+                if (!bank) continue;
+                ggml_moe_prefetch_wait(bank);
+                ggml_tensor dst = *bank;
+                dst.ne[2] = int64_t(g.slots.size());
+                dst.nb[2] = g.strides[b]; dst.nb[3] = g.strides[b] * g.slots.size();
+                ggml_backend_sched_moe_ffn_bind(dst, f.cache);
+                dst.data = static_cast<uint8_t *>(dst.data) + g.offsets[b];
+                ggml_backend_tensor_set_async(gpu, &dst,
+                        static_cast<const uint8_t *>(bank->data) + size_t(old.expert) * bank->nb[2],
+                        index * g.strides[b], bank->nb[2]);
+                f.host_bytes += bank->nb[2];
+            }
+            g.slots[index] = old;
+            g.slot_index[key] = int(index);
+            ++restored;
+        }
+        ggml_backend_synchronize(gpu); // every restored slot is ready before dispatch
+        fprintf(stderr, "ggml_backend_sched: moe-resident restored=%zu/%zu experts after cache resize\n",
+                restored, f.remembered.size());
+        f.remembered.clear();
+    }
     for (size_t i = 0; i < f.groups.size(); ++i) if (!f.groups[i].slots.empty()) {
         const auto & g = f.groups[i];
         fprintf(stderr, "ggml_backend_sched: moe-resident layout=%zu expert_bytes=%zu slots=%zu\n",
@@ -275,9 +422,12 @@ static ggml_backend_sched_moe_ffn::timing & ggml_backend_sched_moe_ffn_timing(
     return m;
 }
 
+#include "ggml-moe-resident-new.inc"
+
 static ggml_status ggml_backend_sched_moe_ffn_compute(ggml_backend_sched_t sched,
         ggml_backend_sched_moe_ffn::task & t, ggml_backend_t gpu) {
     auto & f = *sched->moe_ffn;
+    if (f.new_policy) return ggml_backend_sched_moe_new_compute(sched, t, gpu);
     const bool cache = ggml_backend_sched_moe_ffn_cache(sched, gpu);
     auto & g = f.groups[t.group];
     const int k = int(t.up->src[3]->ne[0]);

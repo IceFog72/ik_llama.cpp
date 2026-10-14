@@ -267,6 +267,7 @@ struct common_params_speculative {
     llama_model * model_dft = nullptr; // a llama_model that can be shared by multiple speculative contexts
 
     llama_context_params cparams_dft; // these are the parameters for the draft llama_context
+    std::shared_ptr<const std::string> adaptive_cuda_params_dft; // owns inherited options across MTP stage copies
 
     // draft affinity from --draft-params; empty = inherit the target
     std::vector<int32_t> cpu_affinity;
@@ -318,6 +319,7 @@ struct gpt_params {
     int32_t n_ctx                 =       0; // context size
     int32_t n_batch               =    2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =     512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    bool n_ubatch_explicit        =   false; // CLI supplied -ub; adaptive residency otherwise sizes prefill automatically
     int32_t n_keep                =       0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =      -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =       1; // number of parallel sequences to decode
@@ -478,7 +480,8 @@ struct gpt_params {
     bool only_active_exps  = true;  // if true, offload only active experts (relevant only for hybrid CPU/GPU)
     int  moe_resident      = 0;     // 0 = disabled, -1 = auto hybrid residency; positive legacy slot counts remain available to programmatic callers
     int  moe_resident_mib = 0; // auto cache cap per CUDA backend in MiB (0 = existing automatic budget)
-    bool moe_resident_zero_fill = false; // old profiler by default; true includes zero fills
+    uint32_t moe_resident_ubatch = 0; // generation workspace ceiling; 0 disables adaptive workspace
+    bool moe_resident_zero_fill = false; // false: old profiler; true: reuse-aware residency policy
     bool moe_resident_grouping = false; // layout-grouped complete cache; shared cache by default
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor

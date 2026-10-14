@@ -33,6 +33,7 @@
 
 #include "ggml.h"
 #include "ggml-alloc.h"
+#include "../ggml/src/ggml-moe-resident-control.h"
 #include "ggml-backend.h"
 
 #include <cmath>
@@ -904,6 +905,10 @@ llama_context::~llama_context() {
     ggml_backend_buffer_free(buf_output);
 
     auto & all_contexts = llama_all_contexts();
+    for (auto * ctx : all_contexts) {
+        if (ctx->adaptive_mtp_peer == this) ctx->adaptive_mtp_peer = nullptr;
+        if (ctx->cparams.moe_resident_ubatch && ctx->mtp_target_ctx == this) ctx->mtp_target_ctx = nullptr;
+    }
     for (auto it = all_contexts.begin(); it != all_contexts.end(); ++it) {
         if (*it == this) {
             all_contexts.erase(it);
@@ -7288,6 +7293,178 @@ static bool prepare_mtp_graph_inputs(
 // return positive int on warning
 // return negative int on error
 //
+// This changes compute allocation only. Persistent KV/SSM state and output
+// buffers remain owned by their contexts throughout the handoff.
+static llama_context * llama_resident_workspace_root(llama_context & ctx) {
+    return ctx.mtp_target_ctx && ctx.mtp_target_ctx->adaptive_mtp_peer == &ctx
+            ? ctx.mtp_target_ctx : &ctx;
+}
+
+static void llama_resident_workspace_reset(llama_context & ctx) {
+    // MTP resets its own predictor state during an existing conversation.
+    // Only clearing the target context may re-arm the target's large workspace.
+    if (ctx.cparams.moe_resident_ubatch && llama_resident_workspace_root(ctx) == &ctx) {
+        if (!ctx.resident_initial_prompt) LLAMA_LOG_INFO(
+                "%s: full context reset; initial-prompt workspace growth enabled\n", __func__);
+        ctx.resident_initial_prompt = true;
+    }
+}
+
+static void llama_resident_workspace_generation(llama_context & ctx) {
+    auto * root = llama_resident_workspace_root(ctx);
+    if (root->cparams.moe_resident_ubatch && root->resident_initial_prompt) {
+        LLAMA_LOG_INFO("%s: workspace capped at %u tokens until full context reset\n",
+                __func__, root->cparams.moe_resident_ubatch);
+        root->resident_initial_prompt = false;
+    }
+}
+
+static bool llama_adapt_resident_workspace(llama_context & lctx, uint32_t demand) {
+    if (!lctx.cparams.moe_resident_ubatch) return true;
+#ifdef GGML_USE_CUDA
+    llama_context * root = llama_resident_workspace_root(lctx);
+    const uint32_t small = root->cparams.moe_resident_ubatch;
+    // API clients without the server's explicit generation notification usually
+    // enter generation with a single token in a nonempty target context.
+    if (root == &lctx && demand == 1 && root->kv_self.used > 0) {
+        llama_resident_workspace_generation(*root);
+    }
+    // Once generation starts, even a large follow-up must be chunked through
+    // the small workspace. Batch demand alone must never flush resident experts.
+    const bool prefill = root->resident_initial_prompt && demand > small;
+    auto ready = [prefill, small](const llama_context * ctx) {
+        return prefill ? ctx->prefill_ubatch != 0 : ctx->prefill_ubatch == 0 && ctx->active_ubatch == small;
+    };
+    if (ready(root) && (!root->adaptive_mtp_peer || ready(root->adaptive_mtp_peer))) return true;
+    std::vector<llama_context *> contexts{root};
+    if (root->adaptive_mtp_peer) contexts.push_back(root->adaptive_mtp_peer);
+
+    const int64_t started = ggml_time_us();
+    size_t old_bytes = 0, scratch_bytes = 0;
+    for (auto * ctx : contexts) {
+        llama_synchronize(ctx);
+        old_bytes += ggml_backend_sched_get_buffer_size(ctx->sched, ctx->backends[0]);
+        ctx->reset_scheduler();
+        ggml_backend_sched_release_compute(ctx->sched);
+        ctx->active_ubatch = ctx->prefill_ubatch = 0;
+    }
+    // Captures are invalidated before any new graph can reuse the old addresses.
+    for (auto * ctx : contexts) scratch_bytes += ggml_backend_cuda_trim_compute(ctx->backends[0]);
+
+    auto build = [](llama_context & ctx, uint32_t n) {
+        ctx.reset_scheduler();
+        llama_token token = llama_token_bos(&ctx.model);
+        auto batch = llama_batch_get_one(&token, n, ctx.cparams.n_ctx - n, 0);
+        return llm_build_context::llama_build_graph(ctx, batch, true, ctx.cparams.worst_graph_tokens);
+    };
+    // Predictor warmup can use the whole microbatch. Its one-token generation
+    // graph must not be used to estimate the prefill allocation.
+    auto measure = [&](uint32_t n, size_t & bytes) {
+        bytes = 0;
+        for (auto * ctx : contexts) {
+            const auto op = ctx->cparams.mtp_op_type;
+            if (ctx->mtp_target_ctx) ctx->cparams.mtp_op_type = MTP_OP_WARMUP;
+            auto * graph = build(*ctx, n);
+            std::vector<size_t> sizes(ctx->backends.size());
+            if (graph) ggml_backend_sched_measure(ctx->sched, graph, sizes.data());
+            bool ok = graph != nullptr;
+            if (ok && ctx->mtp_target_ctx) {
+                ctx->cparams.mtp_op_type = MTP_OP_DRAFT_GEN;
+                graph = build(*ctx, 1);
+                std::vector<size_t> draft_sizes(ctx->backends.size());
+                if (graph) ggml_backend_sched_measure(ctx->sched, graph, draft_sizes.data());
+                ok = graph != nullptr;
+                for (size_t i = 0; i < sizes.size(); ++i) sizes[i] = std::max(sizes[i], draft_sizes[i]);
+            }
+            ctx->cparams.mtp_op_type = op;
+            if (!ok) return false;
+            bytes += sizes[0];
+        }
+        return true;
+    };
+    size_t free_bytes = 0, total_bytes = 0;
+    ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device(root->backends[0]), &free_bytes, &total_bytes);
+    // Graph measurement does not include transient kernel scratch or driver
+    // allocations. Keep the same headroom when allocating expert slots later.
+    const size_t guard = root->cparams.moe_resident_zero_fill ? 256ull * 1024 * 1024
+            : std::max<size_t>(512ull * 1024 * 1024, free_bytes / 8);
+    const size_t usable = free_bytes > guard ? free_bytes - guard : 0;
+    uint32_t chosen = small;
+    if (prefill && root->cparams.moe_resident_ubatch_auto) {
+        const uint32_t first = (small + 511) / 512;
+        uint32_t best = 0;
+        // Check descending: graph shapes/kernel choices need not be monotonic.
+        for (uint32_t units = root->cparams.n_ubatch / 512; units >= first; --units) {
+            size_t bytes = 0;
+            if (!measure(units * 512, bytes)) return false;
+            if (bytes <= usable) { best = units; break; }
+        }
+        if (!best) {
+            LLAMA_LOG_ERROR("%s: no automatic prefill workspace fits with CUDA headroom; reduce -b, context, or other GPU allocations\n", __func__);
+            return false;
+        }
+        chosen = best * 512;
+    } else if (prefill) {
+        chosen = root->cparams.n_ubatch;
+        for (;;) {
+            size_t bytes = 0;
+            if (!measure(chosen, bytes)) return false;
+            if (bytes <= usable) break;
+            if (chosen == small) {
+                LLAMA_LOG_ERROR("%s: generation workspace does not fit with CUDA headroom\n", __func__);
+                return false;
+            }
+            chosen = std::max(small, (chosen - 1) / 512 * 512);
+        }
+    }
+
+    // Rebuild after measuring: scheduler splitting rewrites graph sources.
+    // Never allocate a candidate graph that has already been split.
+    bool allocated = false;
+    while (!allocated) {
+        allocated = true;
+        for (auto * ctx : contexts) {
+            const auto op = ctx->cparams.mtp_op_type;
+            if (ctx->mtp_target_ctx) ctx->cparams.mtp_op_type = MTP_OP_WARMUP;
+            auto * graph = build(*ctx, chosen);
+            bool ok = graph && ggml_backend_sched_reserve(ctx->sched, graph);
+            if (ok && ctx->mtp_target_ctx) {
+                ctx->cparams.mtp_op_type = MTP_OP_DRAFT_GEN;
+                graph = build(*ctx, 1);
+                ok = graph && ggml_backend_sched_reserve(ctx->sched, graph);
+            }
+            ctx->cparams.mtp_op_type = op;
+            if (!ok) { allocated = false; break; }
+        }
+        if (!allocated) {
+            for (auto * ctx : contexts) {
+                ctx->reset_scheduler();
+                ggml_backend_sched_release_compute(ctx->sched);
+            }
+            if (!prefill || chosen == small) {
+                LLAMA_LOG_ERROR("%s: cannot reserve adaptive workspace (%u tokens)\n", __func__, chosen);
+                return false;
+            }
+            chosen = std::max(small, (chosen - 1) / 512 * 512);
+        }
+    }
+    size_t new_bytes = 0;
+    for (auto * ctx : contexts) {
+        ctx->active_ubatch = chosen;
+        ctx->prefill_ubatch = prefill ? chosen : 0;
+        new_bytes += ggml_backend_sched_get_buffer_size(ctx->sched, ctx->backends[0]);
+    }
+    LLAMA_LOG_INFO("%s: %s ubatch=%u contexts=%zu context=%u compute=%.2f->%.2f MiB idle_scratch_released=%.2f MiB handoff=%.2f ms\n",
+            __func__, prefill ? "prefill" : "generation", chosen, contexts.size(), root->cparams.n_ctx,
+            old_bytes / 1048576.0, new_bytes / 1048576.0, scratch_bytes / 1048576.0, (ggml_time_us() - started) / 1000.0);
+    GGML_UNUSED(total_bytes);
+    return true;
+#else
+    GGML_UNUSED(demand);
+    return false; // rejected during context initialization
+#endif
+}
+
 static int llama_decode_internal(
          llama_context & lctx,
            llama_batch   batch_all) { // TODO: rename back to batch
@@ -7315,6 +7492,8 @@ static int llama_decode_internal(
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    if (!llama_adapt_resident_workspace(lctx, n_tokens_all)) return -2;
+
     if (lctx.t_compute_start_us == 0) {
         lctx.t_compute_start_us = ggml_time_us();
     }
@@ -7330,7 +7509,7 @@ static int llama_decode_internal(
     uint32_t n_outputs_embd = 0;
     uint32_t n_outputs_prev_embd = 0;
 
-    const auto n_ubatch = cparams.n_ubatch;
+    const auto n_ubatch = cparams.moe_resident_ubatch ? lctx.active_ubatch : cparams.n_ubatch;
 
     // TODO: simplify or deprecate
     std::vector<llama_pos> pos;
@@ -7606,7 +7785,11 @@ static int llama_decode_internal(
 #if IK_PRINT_TIMING
             tim1 = ggml_time_us();
 #endif
-            ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            const bool graph_allocated = ggml_backend_sched_alloc_graph(lctx.sched, gf);
+            if (!graph_allocated && cparams.moe_resident_ubatch) {
+                LLAMA_LOG_ERROR("%s: adaptive graph allocation failed\n", __func__);
+                return -2;
+            }
 #if IK_PRINT_TIMING
             tim2 = ggml_time_us();
             printf("sched_alloc_graph(...): %d us\n", int(tim2-tim1));
@@ -7707,6 +7890,15 @@ static int llama_decode_internal(
         tim1 = ggml_time_us();
 #endif
         //fprintf(stderr, "%s: invoking llama_graph_compute\n", __func__);
+        if (cparams.moe_resident < 0 && cparams.moe_resident_zero_fill) {
+            bool single_sequence = u_batch.token && u_batch.n_tokens <= 4 && cparams.mtp_op_type == MTP_OP_NONE;
+            for (int i = 0; single_sequence && i < u_batch.n_tokens; ++i) {
+                single_sequence = u_batch.n_seq_id[i] == 1 &&
+                        u_batch.seq_id[i][0] == u_batch.seq_id[0][0];
+            }
+            ggml_backend_sched_moe_resident_set_tokens(lctx.sched,
+                    single_sequence ? u_batch.token : nullptr, single_sequence ? u_batch.n_tokens : 0);
+        }
         llama_graph_compute(lctx, gf, n_threads);
 
         if (llm_arch_is_dsv4(lctx.model.arch) &&
@@ -8492,7 +8684,8 @@ static int32_t llama_kv_cache_update_internal(struct llama_context & lctx) {
     if (need_reserve) {
         // TODO: extract to a function
         // build worst-case graph
-        int n_tokens = (int)std::min(lctx.cparams.n_ctx, lctx.cparams.n_ubatch);
+        int n_tokens = (int)std::min(lctx.cparams.n_ctx,
+                lctx.cparams.moe_resident_ubatch ? lctx.active_ubatch : lctx.cparams.n_ubatch);
         if (llm_arch_is_dflash_family(lctx.model.arch)) {
             n_tokens = std::min(n_tokens, (int) lctx.model.hparams.dflash_block_size);
         }
@@ -8870,6 +9063,8 @@ struct llama_context_params llama_context_default_params() {
         /*.dflash_query_capacity       =*/ 0,
         /*.cpu_affinity                =*/ nullptr,
         /*.n_cpu_affinity              =*/ 0,
+        /*.moe_resident_ubatch         =*/ 0,
+        /*.moe_resident_ubatch_auto    =*/ false,
     };
 
     return result;
@@ -9201,6 +9396,11 @@ struct llama_context * llama_init_from_model(
                  struct llama_model * model,
         struct llama_context_params   params) {
 
+    if (params.moe_resident_ubatch && params.moe_resident > 0) {
+        LLAMA_LOG_ERROR("%s: adaptive residency workspace requires auto residency\n", __func__);
+        return nullptr;
+    }
+
     if (params.moe_resident_mib < 0 ||
             uint64_t(params.moe_resident_mib) > SIZE_MAX / (1024 * 1024) ||
             (params.moe_resident_mib > 0 && params.moe_resident != -1)) {
@@ -9393,6 +9593,8 @@ struct llama_context * llama_init_from_model(
     cparams.thresh_experts   = params.thresh_experts;
     cparams.moe_resident     = params.moe_resident;
     cparams.moe_resident_mib = params.moe_resident_mib;
+    cparams.moe_resident_ubatch = params.moe_resident < 0 ? params.moe_resident_ubatch : 0;
+    cparams.moe_resident_ubatch_auto = cparams.moe_resident_ubatch && params.moe_resident_ubatch_auto;
     cparams.moe_resident_zero_fill = params.moe_resident_zero_fill;
     cparams.moe_resident_grouping = params.moe_resident_grouping;
     cparams.cuda_params      = params.cuda_params;
@@ -9441,6 +9643,21 @@ struct llama_context * llama_init_from_model(
     }
 
     cparams.n_ubatch         = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    if (cparams.moe_resident_ubatch &&
+            (model->arch != LLM_ARCH_QWEN35MOE || cparams.n_seq_max != 1 ||
+             params.cb_eval || model->split_mode == LLAMA_SPLIT_MODE_GRAPH ||
+             model->split_mode == LLAMA_SPLIT_MODE_ATTN ||
+             cparams.n_ubatch > uint32_t(INT_MAX) ||
+             cparams.moe_resident_ubatch > cparams.n_ubatch ||
+             (cparams.moe_resident_ubatch_auto &&
+                ((cparams.moe_resident_ubatch + 511ull) / 512) * 512 > cparams.n_ubatch))) {
+        LLAMA_LOG_ERROR("%s: adaptive residency workspace requires Qwen3.5 MoE, -np 1, ordinary layer scheduling, "
+                "no evaluation callback, and a generation ceiling within the prefill limit (-b for auto, -ub otherwise)\n", __func__);
+        llama_free(ctx);
+        return nullptr;
+    }
+    ctx->active_ubatch = cparams.moe_resident_ubatch ? cparams.moe_resident_ubatch : cparams.n_ubatch;
 
     cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
@@ -9566,7 +9783,7 @@ struct llama_context * llama_init_from_model(
     }
     if (cparams.moe_resident < 0) {
         LLAMA_LOG_INFO("%s: moe_resident profiler = %s\n", __func__,
-                cparams.moe_resident_zero_fill ? "new (zero fills allowed)" : "old (positive fills only)");
+                cparams.moe_resident_zero_fill ? "new (reuse-aware cache)" : "old (positive fills only)");
         LLAMA_LOG_INFO("%s: moe_resident grouping = %s\n", __func__, cparams.moe_resident_grouping ? "layout" : "off");
     }
     if (cparams.moe_resident != 0) {
@@ -9766,6 +9983,20 @@ struct llama_context * llama_init_from_model(
         }
         ctx->backends.push_back(ctx->backend_cpu);
 
+        if (cparams.moe_resident_ubatch) {
+            bool supported = false;
+#ifdef GGML_USE_CUDA
+            supported = ctx->backends.size() == 2 && ggml_backend_is_cuda(ctx->backends[0]) && cparams.causal_attn;
+#endif
+            if (!supported) {
+                LLAMA_LOG_ERROR("%s: adaptive residency workspace requires one CUDA backend and causal attention\n", __func__);
+                llama_free(ctx);
+                return nullptr;
+            }
+            LLAMA_LOG_INFO("%s: adaptive residency workspace generation=%u prefill_limit=%u%s context=%u\n", __func__,
+                    ctx->active_ubatch, cparams.n_ubatch, cparams.moe_resident_ubatch_auto ? " (automatic, step 512)" : "", cparams.n_ctx);
+        }
+
         if (params.cpu_affinity != NULL && params.n_cpu_affinity > 0) {
             llama_set_cpu_affinity(ctx, params.cpu_affinity, params.n_cpu_affinity);
         }
@@ -9926,6 +10157,7 @@ struct llama_context * llama_init_from_model(
             ggml_backend_sched_set_moe_resident_grouping(ctx->sched, cparams.moe_resident_grouping);
             ggml_backend_sched_set_moe_resident_budget(ctx->sched, size_t(cparams.moe_resident_mib) * 1024 * 1024);
             ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
+            ggml_backend_sched_set_moe_resident_adaptive(ctx->sched, cparams.moe_resident_ubatch != 0);
 
             if (pipeline_parallel) {
                 LLAMA_LOG_INFO("%s: pipeline parallelism enabled (n_copies=%d)\n", __func__, ggml_backend_sched_get_n_copies(ctx->sched));
@@ -9934,6 +10166,7 @@ struct llama_context * llama_init_from_model(
             llama_repack_up_gate_exps(*ctx);
 
             // build worst-case graph
+            if (cparams.moe_resident_ubatch) n_tokens = ctx->active_ubatch;
             int n_past = cparams.n_ctx - n_tokens;
             llama_token token = llama_token_bos(&ctx->model); // not actually used by llama_build_graph, but required to choose between token and embedding inputs graph
             llama_batch reserve_batch = llama_batch_get_one(&token, n_tokens, n_past, 0);
@@ -9960,10 +10193,28 @@ struct llama_context * llama_init_from_model(
                     ggml_backend_sched_set_moe_resident_grouping(ctx->sched, cparams.moe_resident_grouping);
                     ggml_backend_sched_set_moe_resident_budget(ctx->sched, size_t(cparams.moe_resident_mib) * 1024 * 1024);
                     ggml_backend_sched_set_moe_resident(ctx->sched, cparams.moe_resident);
+                    ggml_backend_sched_set_moe_resident_adaptive(ctx->sched, cparams.moe_resident_ubatch != 0);
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }
                 if (!gf_success) {
                     LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+                    llama_free(ctx);
+                    return nullptr;
+                }
+            }
+
+            if (cparams.moe_resident_ubatch && cparams.mtp_op_type != MTP_OP_NONE) {
+                // Warmup and one-token prediction have different output heads.
+                // Reserve both before a target cache can consume spare VRAM.
+                const auto op = cparams.mtp_op_type;
+                cparams.mtp_op_type = MTP_OP_DRAFT_GEN;
+                ctx->reset_scheduler();
+                reserve_batch = llama_batch_get_one(&token, 1, cparams.n_ctx - 1, 0);
+                gf = llm_build_context::llama_build_graph(*ctx, reserve_batch, true, cparams.worst_graph_tokens);
+                const bool ok = gf && ggml_backend_sched_reserve(ctx->sched, gf);
+                cparams.mtp_op_type = op;
+                if (!ok) {
+                    LLAMA_LOG_ERROR("%s: failed to reserve adaptive predictor generation buffers\n", __func__);
                     llama_free(ctx);
                     return nullptr;
                 }
@@ -10570,6 +10821,7 @@ int32_t llama_get_kv_cache_used_cells(const struct llama_context * ctx) {
 void llama_kv_cache_clear(struct llama_context * ctx) {
     llama_kv_cache_clear(ctx->kv_self);
     llama_reset_dsv4_state(ctx);
+    llama_resident_workspace_reset(*ctx);
 }
 
 // Unified speculative-checkpoint
@@ -10900,6 +11152,9 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     const bool result = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+    if (result && p0 <= 0 && p1 < 0 && ctx->kv_self.used == 0) {
+        llama_resident_workspace_reset(*ctx);
+    }
     if (result && llm_arch_is_dsv4(ctx->model.arch) && p0 <= 0 && p1 < 0) {
         llama_reset_dsv4_state(ctx, seq_id);
     }
@@ -12525,6 +12780,10 @@ struct llama_data_read {
             }
             throw std::runtime_error("failed to restore kv cache");
         }
+        // Restoring a populated conversation is continuation, not permission
+        // to reclaim its expert working set for a fresh large prompt workspace.
+        if (kv_self.used > 0 && llama_resident_workspace_root(*ctx) == ctx)
+            llama_resident_workspace_generation(*ctx);
     }
 };
 
@@ -13235,6 +13494,26 @@ void llama_set_mtp_step_idx(llama_context * ctx, int32_t mtp_step_idx) {
 
 void llama_set_mtp_n_heads(llama_context * ctx, int32_t mtp_n_heads) {
     ctx->set_mtp_n_heads(mtp_n_heads);
+}
+
+void llama_moe_resident_release_cache(struct llama_context * ctx) {
+    if (!ctx || ctx->cparams.moe_resident >= 0 || !ctx->cparams.moe_resident_zero_fill) return;
+    llama_synchronize(ctx);
+    ctx->reset_scheduler();
+    ggml_backend_sched_moe_resident_release_cache(ctx->sched);
+    LLAMA_LOG_INFO("%s: expert storage released before companion allocation\n", __func__);
+}
+
+void llama_moe_resident_predict(struct llama_context * ctx, const llama_token * tokens, int32_t n) {
+    if (!ctx || ctx->cparams.moe_resident >= 0 || !ctx->cparams.moe_resident_zero_fill) return;
+    ggml_backend_sched_moe_resident_predict(ctx->sched, tokens, n);
+}
+
+void llama_moe_resident_begin_generation(struct llama_context * ctx) {
+    if (!ctx || ctx->cparams.moe_resident >= 0) return;
+    llama_resident_workspace_generation(*ctx);
+    llama_synchronize(ctx); // complete prefill and host readback before invalidating captures
+    ggml_backend_sched_moe_resident_begin_generation(ctx->sched);
 }
 
 void llama_synchronize(struct llama_context * ctx) {
@@ -14651,6 +14930,14 @@ void llama_set_draft_input_hidden_state(struct llama_context * ctx, const float 
 
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx) {
     ctx->mtp_target_ctx = target_ctx;
+    if (target_ctx && ctx->cparams.moe_resident_ubatch && target_ctx->cparams.moe_resident_ubatch &&
+            &ctx->model == &target_ctx->model &&
+            ctx->cparams.n_ubatch == target_ctx->cparams.n_ubatch &&
+            ctx->cparams.moe_resident_ubatch == target_ctx->cparams.moe_resident_ubatch &&
+            ctx->cparams.moe_resident_ubatch_auto == target_ctx->cparams.moe_resident_ubatch_auto) {
+        GGML_ASSERT(!target_ctx->adaptive_mtp_peer || target_ctx->adaptive_mtp_peer == ctx);
+        target_ctx->adaptive_mtp_peer = ctx;
+    }
 }
 
 size_t llama_fill_from_utf8(void* utf8, void* cpts, void* scripts) {

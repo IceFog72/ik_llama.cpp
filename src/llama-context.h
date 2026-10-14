@@ -411,6 +411,10 @@ struct llama_context {
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;
     ggml_backend_sched_t sched = nullptr;
+    uint32_t active_ubatch = 0; // physical workspace ceiling, separate from configured cparams.n_ubatch
+    uint32_t prefill_ubatch = 0; // active initial-prompt workspace; zero after shrinking
+    bool resident_initial_prompt = true; // only a full target-context reset re-arms growth
+    llama_context * adaptive_mtp_peer = nullptr; // non-owning, registered by the embedded predictor
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;

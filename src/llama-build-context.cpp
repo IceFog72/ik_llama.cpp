@@ -1,4 +1,5 @@
 #include "llama-build-context.h"
+#include "ggml-moe-resident-control.h"
 #include "llama-hparams.h"
 #include "llama-cparams.h"
 #include "llama-model.h"
@@ -1611,6 +1612,13 @@ llm_expert_gating_func_type   gating_op,
             selected_experts = ggml_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
         }
     }
+    // top_k is a view of the full argsort and retains its expert-count
+    // stride. Compact only the small new-policy verification route so all
+    // tokens can use complete-FFN residency without reading the padding.
+    if (lctx.cparams.moe_resident < 0 && lctx.cparams.moe_resident_zero_fill &&
+            n_tokens > 1 && n_tokens <= 4 && !ggml_is_contiguous(selected_experts)) {
+        selected_experts = ggml_cont(ctx, selected_experts);
+    }
     cb(selected_experts, "ffn_moe_topk", il);
     ggml_tensor * weights = ggml_get_rows(ctx,
             ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
@@ -1845,11 +1853,28 @@ llm_expert_gating_func_type   gating_op,
                     type_op, norm_w, scale_w, w_scale,
                     gating_op, cb, il, graph, false, up_gate_exps, up_gate_exps_b);
         cb(routed_out, "routed_out", il);
+        // Build the independent shared branch between the routed projections
+        // and their reduction. The allocator sees this order and retains both
+        // branches' live tensors; the scheduler can overlap CPU misses with it.
+        auto * routed_down = routed_out->op == GGML_OP_MUL_MULTI_ADD ? routed_out->src[0] : nullptr;
+        const auto gpu_weight = [](const ggml_tensor * t) {
+            return t && t->buffer && !t->extra && !ggml_backend_buffer_is_host(t->buffer);
+        };
+        const bool overlap_shared = lctx.cparams.moe_resident < 0 && lctx.cparams.moe_resident_zero_fill &&
+                cur->ne[1] >= 1 && cur->ne[1] <= 4 &&
+                gpu_weight(up_shexp) && gpu_weight(gate_shexp) && gpu_weight(down_shexp) &&
+                (!shexp_gate || gpu_weight(shexp_gate)) && routed_down &&
+                routed_down->op == GGML_OP_MUL_MAT_ID && routed_down->src[1] &&
+                routed_down->src[1]->op == GGML_OP_MOE_FUSED_UP_GATE;
+        if (overlap_shared) {
+            routed_down->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_MOE_RESIDENT_DEFERRED_DOWN;
+            routed_out->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_MOE_RESIDENT_JOIN;
+        }
         if (add_input) {
             routed_out = ggml_add(ctx, routed_out, input);
             cb(routed_out, "routed_out_with_inp", il);
         }
-        ggml_build_forward_expand(graph, routed_out);
+        ggml_build_forward_expand(graph, overlap_shared ? routed_down : routed_out);
 
         bool handled_add_extra = false;
         if (up_shexp && gate_shexp && down_shexp) {
@@ -1937,6 +1962,10 @@ llm_expert_gating_func_type   gating_op,
                         shared_out = ggml_mul(ctx, shared_out, shared_gate);
                     }
                     cb(shared_out, "ffn_shexp_gated", il);
+                }
+                if (overlap_shared) {
+                    shared_out->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_MOE_RESIDENT_SHARED;
+                    ggml_build_forward_expand(graph, shared_out);
                 }
                 cur = ggml_add(ctx, routed_out, shared_out);
                 cb(cur, "ffn_out", il);

@@ -549,6 +549,7 @@ void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_to
 }
 
 void server_slot::reset() {
+    moe_resident_generation_started = false;
     n_prompt_tokens = 0;
     last_gentxt_len = 0;
     generated_text = "";
@@ -5017,6 +5018,11 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 slot.release();
                 slot.i_batch = -1;
                 continue; // continue loop of slots
+            }
+
+            if (!slot.moe_resident_generation_started) {
+                llama_moe_resident_begin_generation(slot.ctx);
+                slot.moe_resident_generation_started = true;
             }
 
             if (slot.n_decoded == 0 && slot.can_speculate()) {

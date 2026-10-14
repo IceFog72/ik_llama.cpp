@@ -821,6 +821,7 @@ struct ggml_cuda_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+    virtual size_t trim() = 0; // idle buffers only; returns released physical bytes
 };
 
 template<typename T>
@@ -883,6 +884,8 @@ struct ggml_tensor_extra_gpu {
 struct ggml_cuda_graph;
 
 struct ggml_backend_cuda_context {
+    uint32_t * resident_histogram = nullptr;
+    int resident_profile_layers = 0, resident_profile_experts = 0;
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;

@@ -46,6 +46,7 @@ struct server_slot {
     int32_t n_past = 0;
     int32_t n_past_prompt = 0;
     int32_t n_decoded = 0;
+    bool moe_resident_generation_started = false;
     int32_t n_remaining = -1;
     int32_t n_discarded_prompt = 0;
     int32_t n_kept_prompt = 0;

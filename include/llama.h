@@ -535,6 +535,8 @@ extern "C" {
         // pinned to cpu_affinity[t % n_cpu_affinity], NULL = no pinning
         const int32_t * cpu_affinity;
         int32_t         n_cpu_affinity;
+        uint32_t moe_resident_ubatch; // adaptive generation workspace ceiling; 0 disables it
+        bool moe_resident_ubatch_auto; // choose prefill workspace in multiples of 512 up to n_ubatch
     };
 
     // model quantization parameters
@@ -1158,6 +1160,21 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    // Notify auto expert residency that a new response is starting after prefill.
+    // Preserves model/KV state; refreshes cache capacity on the next decode.
+    // Adaptive ubatching latches the small workspace until a full context reset.
+    // No-op if --moe-resident is disabled. llama-server calls this once per response.
+    LLAMA_API void llama_moe_resident_begin_generation(struct llama_context * ctx);
+
+    // Reclaim the new policy's expert cache before allocating another context.
+    // Preserves model, KV, routing history and the compute arena; no-op otherwise.
+    LLAMA_API void llama_moe_resident_release_cache(struct llama_context * ctx);
+
+    // Predict target-layer cache needs from upcoming token IDs (e.g. MTP).
+    // Copies the IDs. Opt-in auto residency/profiler=new only; otherwise a no-op.
+    // Passing NULL/zero clears the pending forecast. Never changes inference IDs.
+    LLAMA_API void llama_moe_resident_predict(struct llama_context * ctx, const llama_token * tokens, int32_t n);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
