@@ -1384,7 +1384,35 @@ static void test_layout_capacity() {
             "shared layout capacity includes every member layer");
 }
 
+static void test_cpu_worker_handoffs() {
+    ggml_moe_cpu_workers workers;
+    struct job {
+        int threads;
+        std::atomic<int> calls[16]{};
+        std::atomic<bool> invalid{false};
+    };
+    const int widths[] = {1, 8, 2, 16, 1, 4};
+    for (int round = 0; round < 240; ++round) {
+        job current{};
+        current.threads = widths[round % 6];
+        workers.run([](void * ptr, int ith) {
+            auto & j = *static_cast<job *>(ptr);
+            if (ith < 0 || ith >= j.threads) { j.invalid.store(true); return; }
+            if (ith & 1) std::this_thread::yield();
+            j.calls[ith].fetch_add(1);
+        }, &current, current.threads);
+        check(!current.invalid.load(), "changing CPU team never reads a stale job descriptor");
+        for (int ith = 0; ith < 16; ++ith)
+            check(current.calls[ith].load() == (ith < current.threads ? 1 : 0),
+                    "each active CPU worker completes exactly once before descriptor reuse");
+        // Exercise both the hot handoff and the parked predicate path. The
+        // pool is also destroyed immediately after a hot completion below.
+        if (round % 24 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 int main(int argc, char ** argv) {
+    test_cpu_worker_handoffs();
     test_route_predictions();
     test_layout_capacity();
     test_history();

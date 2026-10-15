@@ -33,6 +33,9 @@
 #include <memory>
 #include <atomic>
 #include <unordered_map>
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
 #endif
@@ -1266,6 +1269,26 @@ struct ggml_backend_sched_moe_decode {
 
 // Native team for the opt-in complete-FFN executor. Job metadata is protected by
 // one mutex; all graph workers join before stack-owned graph state is released.
+// Adjacent decode jobs are short enough that parking the whole CPU team at
+// every layer can expose OS wake-up latency. Spin only for a bounded hot gap;
+// the caller still takes its ownership mutex and uses a predicate wait after
+// the deadline. No job descriptor is read through this advisory atomic.
+template <typename T>
+static void ggml_moe_wait_hot(const std::atomic<T> & value, T previous) {
+    if (value.load(std::memory_order_acquire) != previous) return;
+    const int64_t deadline = ggml_time_us() + 500;
+    do {
+        for (int i = 0; i < 32; ++i) {
+            if (value.load(std::memory_order_acquire) != previous) return;
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+            _mm_pause();
+#else
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+        }
+    } while (ggml_time_us() < deadline);
+}
+
 class ggml_moe_cpu_workers {
     std::mutex mutex;
     std::condition_variable posted, done;
@@ -1273,6 +1296,7 @@ class ggml_moe_cpu_workers {
     ggml_compute_worker_fn worker = nullptr;
     void * data = nullptr;
     uint64_t generation = 0;
+    std::atomic<uint64_t> advertised{0};
     int active = 0, pending = 0;
     bool stopping = false;
 public:
@@ -1290,8 +1314,9 @@ public:
                 const uint64_t initial = generation;
                 threads.emplace_back([this, ith, initial] {
                     uint64_t seen = initial;
-                    std::unique_lock<std::mutex> lock(mutex);
                     for (;;) {
+                        ggml_moe_wait_hot(advertised, seen);
+                        std::unique_lock<std::mutex> lock(mutex);
                         posted.wait(lock, [&] { return stopping || generation != seen; });
                         if (stopping) break;
                         seen = generation;
@@ -1307,6 +1332,7 @@ public:
             }
             worker = fn; data = job; active = n_threads; pending = n_threads - 1;
             ++generation;
+            advertised.store(generation, std::memory_order_release);
         }
         posted.notify_all();
         fn(job, 0);
@@ -1737,7 +1763,8 @@ struct ggml_backend_sched_moe_ffn {
     std::thread worker;
     ggml_backend_t cpu = nullptr;
     task * job = nullptr;
-    bool stop = false, busy = false;
+    bool stop = false;
+    std::atomic<bool> busy{false};
     ggml_status status = GGML_STATUS_SUCCESS;
     int64_t cpu_finished_us = 0; // published with busy=false under mutex
 
@@ -1749,9 +1776,14 @@ struct ggml_backend_sched_moe_ffn {
         GGML_ASSERT(!busy);
         job = &t; busy = true;
         if (!worker.joinable()) {
-            worker = std::thread([this] {
+            worker = std::thread([this, hot_policy = new_policy] {
                 std::unique_lock<std::mutex> lock(mutex);
                 for (;;) {
+                    if (hot_policy) {
+                        lock.unlock();
+                        ggml_moe_wait_hot(busy, false);
+                        lock.lock();
+                    }
                     wake.wait(lock, [this] { return stop || busy; });
                     if (stop) break;
                     auto * current = job;
