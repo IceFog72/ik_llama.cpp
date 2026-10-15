@@ -18,6 +18,30 @@ A draft model is the most used approach in speculative decoding.
 An n-gram is a sequence of n tokens. The n-gram cache implementation maintains statistics about short n-gram sequences.
 A draft is computed using probabilities derived from these statistics. External statistics can also be loaded from files for improved accuracy.
 
+The context cache is rebuilt at the beginning of each request and updated from
+the target's committed token history plus its already sampled carry token.
+Rejected proposals are not learned. Appended tokens retain n-grams crossing the
+old/new history boundary; edited or shortened histories rebuild their counts.
+The stage uses the effective `n_max` on each call, including zero to disable
+proposals. Context lookup uses CPU RAM and needs no additional GPU model.
+
+Start with one proposed token when comparing against ordinary decoding:
+
+```sh
+--spec-type ngram-cache:n_max=1,n_min=1
+```
+
+The existing two-stage chain can use MTP when lookup produces no usable draft:
+
+```sh
+--spec-type ngram-cache:n_max=1,n_min=1 --spec-type mtp:n_max=1,p_min=0.0
+```
+
+Both stages require target verification; MTP still allocates predictor state
+even when lookup succeeds. These are comparison settings, not a guaranteed
+speedup. This change does not add persistent cache saving or modify target
+residency, sampling, or checkpoint handling.
+
 See:
 
 - #5479, #6828, #6848

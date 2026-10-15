@@ -73,6 +73,14 @@ typedef std::unordered_map<common_ngram, common_ngram_cache_part, common_ngram_h
 void common_ngram_cache_update(
     common_ngram_cache & ngram_cache, int ngram_min, int ngram_max, std::vector<llama_token> & inp_data, int nnew, bool print_progress);
 
+// Synchronize a context-only cache with the target's committed prompt plus its
+// already sampled carry token. Append updates retain cross-boundary n-grams;
+// edits, truncation and carry replacement rebuild counts instead of retaining
+// transitions from obsolete history. Proposals must never be passed here.
+void common_ngram_cache_sync(
+    common_ngram_cache & cache, std::vector<llama_token> & history,
+    const std::vector<llama_token> & prompt, llama_token carry);
+
 // Try to draft tokens from ngram caches.
 // inp:                the tokens generated so far.
 // draft:              the token sequence to draft. Expected to initially contain the previously sampled token.

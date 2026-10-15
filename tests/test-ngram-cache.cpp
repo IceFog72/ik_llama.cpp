@@ -26,6 +26,18 @@ static common_ngram key(std::initializer_list<llama_token> tokens) {
     return common_ngram(values.data(), values.size());
 }
 
+static void check_context(common_ngram_cache & cache, std::vector<llama_token> & history,
+                          const std::vector<llama_token> & prompt, llama_token carry) {
+    common_ngram_cache_sync(cache, history, prompt, carry);
+    auto expected_history = prompt;
+    expected_history.push_back(carry);
+    common_ngram_cache expected;
+    common_ngram_cache_update(expected, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                              expected_history, int(expected_history.size()), false);
+    assert(history == expected_history);
+    assert(cache == expected);
+}
+
 int main() {
     // Empty caches still construct lookup keys. Cover every supported range and the short-history boundary.
     for (int length = 0; length <= LLAMA_NGRAM_MAX + 1; ++length) {
@@ -53,6 +65,8 @@ int main() {
     }
     check_draft({1, 2}, 1, 4, 1, cache, {}, {}, {2, 3});
     check_draft({1, 2}, 1, 4, 0, cache, {}, {}, {2});
+    check_draft({1, 2}, 1, 4, 2, cache, {}, {}, {2, 3, 4});
+    check_draft({1, 2}, 1, 4, 3, cache, {}, {}, {2, 3, 4, 5});
 
     common_ngram_cache corpus;
     corpus[key({1, 2})][3] = 2;
@@ -60,5 +74,40 @@ int main() {
     // No primary n-gram fits yet, but static fallback can grow the history.
     check_draft({1, 2}, 4, 4, 4, {}, {}, corpus, {2, 3, 4});
     check_draft({1}, 1, 4, 4, cache, {}, corpus, {1});
-    std::puts("PASS: n-gram short history, cache fallbacks, growing history, limits, and cache immutability");
+
+    common_ngram_cache context;
+    std::vector<llama_token> history;
+    const std::vector<llama_token> sequence{1, 2, 3, 4, 5, 1, 2, 3, 4, 5};
+    for (size_t i = 0; i < sequence.size(); ++i) {
+        const std::vector<llama_token> prompt(sequence.begin(), sequence.begin() + i);
+        check_context(context, history, prompt, sequence[i]);
+        check_context(context, history, prompt, sequence[i]); // repeated calls must not inflate counts
+    }
+
+    check_context(context, history, {1, 2}, 3); // truncation / regeneration
+    check_context(context, history, {1, 2, 3, 4}, 5); // append crosses a multi-token boundary
+    assert(context.at(key({1, 2, 3, 4})).at(5) == 1);
+    check_context(context, history, {9, 2, 3, 4}, 5); // same-length prefix edit
+    assert(context.count(key({1, 2, 3, 4})) == 0);
+    check_context(context, history, {9, 2, 3, 4}, 7); // same-length carry replacement
+    assert(context.at(key({9, 2, 3, 4})).count(5) == 0);
+    check_context(context, history, {2, 3, 4, 7}, 8); // shifted context
+    check_context(context, history, {}, 1);
+
+    // Drafting reads context; rejected proposals must not enter its counts.
+    auto accepted = sequence;
+    accepted.push_back(1);
+    check_context(context, history, accepted, 2);
+    const auto committed_history = history;
+    const auto committed_cache = context;
+    std::vector<llama_token> proposal{2};
+    common_ngram_cache empty;
+    common_ngram_cache_draft(history, proposal, 3, 1, 4, context, empty, empty);
+    assert(proposal == std::vector<llama_token>({2, 3, 4, 5}));
+    assert(history == committed_history && context == committed_cache);
+    accepted.push_back(2);
+    check_context(context, history, accepted, 99); // target rejected the proposed 3
+    assert(context.at(key({1, 2})).at(99) == 1);
+
+    std::puts("PASS: n-gram history edits, append boundaries, regeneration, limits, and committed-only learning");
 }

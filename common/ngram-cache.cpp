@@ -2,6 +2,7 @@
 #include "common.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <fstream>
 
@@ -48,6 +49,30 @@ void common_ngram_cache_update(common_ngram_cache & ngram_cache, int ngram_min, 
             }
         }
     }
+}
+
+void common_ngram_cache_sync(
+        common_ngram_cache & cache, std::vector<llama_token> & history,
+        const std::vector<llama_token> & prompt, llama_token carry) {
+    const size_t size = prompt.size() + 1;
+    const size_t prefix = std::min(history.size(), prompt.size());
+    const bool append = history.size() <= size &&
+        std::equal(history.begin(), history.begin() + prefix, prompt.begin()) &&
+        (history.size() != size || history.back() == carry);
+
+    if (!append) {
+        cache.clear();
+        history.clear();
+    }
+    const size_t previous_size = history.size();
+    if (previous_size == size) {
+        return; // Same committed history: do not count it a second time.
+    }
+
+    history.insert(history.end(), prompt.begin() + previous_size, prompt.end());
+    history.push_back(carry);
+    common_ngram_cache_update(cache, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
+                             history, int(history.size() - previous_size), false);
 }
 
 // Helper function to get a token from the combined, speculative sequence of inp and draft.
