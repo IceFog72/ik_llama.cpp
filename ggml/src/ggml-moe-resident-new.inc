@@ -650,13 +650,30 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     ggml_backend_tensor_get_async(gpu, t.up->src[2], t.host_act.data, 0, ggml_nbytes(&t.host_act));
     ++f.fallback_routes;
     ggml_backend_event_record(f.router_ready);
+    // The readback event deliberately precedes cached-expert execution. Queue
+    // GPU hits using the device lookup before blocking the host: CPU input
+    // readiness must not wait for those hits to finish. Neither the lookup nor
+    // its slots can be replaced until resident_finish_ffn() fences this work.
+    auto status = GGML_STATUS_SUCCESS;
+    if (has_resident) {
+        const int64_t started = ggml_time_us();
+        if (!ggml_backend_cuda_moe_route(gpu, t.up->src[3], device_map, &t.device_ids,
+                t.up->src[2], nullptr, nullptr, experts)) {
+            ggml_backend_synchronize(gpu);
+            return GGML_STATUS_FAILED;
+        }
+        status = resident_gpu_ffn(f, t, gpu);
+        f.gpu_enqueue_us += ggml_time_us() - started;
+        if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }
+        ++f.early_gpu_layers;
+    }
     if (!has_resident) ++f.empty_gpu_layers;
     const int64_t router_started = ggml_time_us();
     ggml_backend_event_synchronize(f.router_ready);
     f.router_wait_us += ggml_time_us() - router_started;
     f.pending = false; // the prior result's DMA precedes this routing event
+    t.route_experts.assign(ids, ids + k);
     f.cpu_ids.assign(ids, ids + k); f.gpu_ids.assign(size_t(k), -1);
-    resident_record_token_routes(sched, t, ids, tokens, k / tokens);
     std::vector<bool> protected_slots(g.slots.size(), false);
     std::vector<int> missing;
     size_t cpu_count = 0, gpu_count = 0;
@@ -664,8 +681,6 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         const int e = ids[row];
         if (e < 0 || e >= experts) { f.cpu_ids[row] = -1; continue; }
         const size_t i = size_t(t.layer) * experts + e;
-        f.popularity[i] = f.score(t.layer, e, experts) + 1;
-        f.observed_at[i] = f.policy_clock;
         const int p = cache ? f.mapping[i] : -1;
         if (p >= 0) {
             f.gpu_ids[row] = p; f.cpu_ids[row] = -1; protected_slots[p] = true;
@@ -679,7 +694,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     t.route_gpu = f.gpu_ids;
     f.activation_bytes += ggml_nbytes(&t.host_act);
     if (!gpu_count) ++f.cpu_only_layers;
-    auto status = GGML_STATUS_SUCCESS;
+    if (has_resident && !gpu_count) ++f.early_gpu_empty_layers;
     const bool cpu_work = cpu_count || !gpu_count;
     const int64_t cpu_started = ggml_time_us();
     if (cpu_work) {
@@ -711,15 +726,16 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         f.cpu = sched->backends[1];
         f.submit(t);
     }
-    // CPU misses start first. Submit only the actual GPU hits, concurrently
-    // with that CPU job; an all-miss route launches no masked GPU FFN.
-    if (gpu_count) {
-        auto * pinned_gpu_ids = ids + k;
-        std::memcpy(pinned_gpu_ids, f.gpu_ids.data(), size_t(k) * sizeof(int32_t));
-        const int64_t started = ggml_time_us();
-        ggml_backend_tensor_set_async(gpu, &t.device_ids, pinned_gpu_ids, 0, ggml_nbytes(&t.device_ids));
-        status = resident_gpu_ffn(f, t, gpu);
-        f.gpu_enqueue_us += ggml_time_us() - started;
+    // Policy learning is not an input to this invocation's arithmetic. Run it
+    // after submitting misses so its scans/allocations overlap the CPU job.
+    // ids now contains the CPU mask; the task retains the actual original IDs.
+    resident_record_token_routes(sched, t, t.route_experts.data(), tokens, k / tokens);
+    for (int row = 0; row < k; ++row) {
+        const int e = t.route_experts[row];
+        if (e < 0 || e >= experts) continue;
+        const size_t i = size_t(t.layer) * experts + e;
+        f.popularity[i] = f.score(t.layer, e, experts) + 1;
+        f.observed_at[i] = f.policy_clock;
     }
     auto & call = f.in_flight;
     call.owner = &t; call.gpu = gpu; call.tokens = tokens; call.k = k;

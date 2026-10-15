@@ -1062,12 +1062,18 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                 GGML_ASSERT(f.cache);
                 ggml_backend_buffer_clear(f.cache, 0);
                 f.allocation_bytes = bytes;
-                if (verify_batch) {
+                // A manually injected new-policy cache needs its device lookup
+                // even at width 1; a cache pointer alone is not a valid state.
+                if (f.new_policy) {
                     resident_history(sched);
-                    check(f.new_policy && f.graph_tasks.size() == 2 * layers,
-                            "two-token verification enters the new resident executor");
                     check(ggml_backend_sched_moe_decode_buffer(f.slot_map, original_buft,
                             f.mapping.size() * sizeof(int32_t)), "new policy lookup allocates");
+                    resident_mapping(sched, cuda);
+                    ggml_backend_synchronize(cuda);
+                }
+                if (verify_batch) {
+                    check(f.new_policy && f.graph_tasks.size() == 2 * layers,
+                            "two-token verification enters the new resident executor");
                     // Start with GPU hits in every layer and CPU misses in
                     // both tokens. All bytes come from real host banks.
                     for (int layer = 0; layer < layers; ++layer) for (int expert = 0; expert < 2; ++expert) {
@@ -1249,6 +1255,12 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         check(sched->moe_ffn->fills > 0 && sched->moe_ffn->hits > 0, "complete slots admit and reuse experts");
     }
     if (verify_batch) {
+        if (!fail_cache) {
+            check(sched->moe_ffn->early_gpu_layers > 0,
+                    "partial resident batches dispatch device-mapped GPU work before host routing wait");
+            check(sched->moe_ffn->early_gpu_empty_layers > 0,
+                    "early dispatch tolerates an all-miss selection in a partially resident layer");
+        }
         const auto history = sched->moe_ffn->popularity;
         const size_t arena_bytes = ggml_backend_sched_get_buffer_size(sched, cuda);
         ggml_backend_sched_moe_resident_release_cache(sched);

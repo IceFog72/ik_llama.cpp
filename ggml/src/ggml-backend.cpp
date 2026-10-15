@@ -1343,6 +1343,7 @@ struct ggml_backend_sched_moe_ffn {
         ggml_tensor * host_nodes[2]{}, * device_nodes[2]{};
         ggml_cgraph host_graph{}, device_graph{};
         std::vector<int32_t> route_gpu;
+        std::vector<int32_t> route_experts; // original IDs, independent of the CPU mask
     };
     struct slot {
         int layer = -1, expert = -1;
@@ -1373,6 +1374,7 @@ struct ggml_backend_sched_moe_ffn {
         std::vector<bool> protected_slots;
     } in_flight;
     uint64_t deferred_layers = 0, overlapped_gpu_splits = 0, deferred_join_us = 0;
+    uint64_t early_gpu_layers = 0, early_gpu_empty_layers = 0;
     struct token_routes {
         struct layer {
             uint8_t samples = 0;
@@ -1546,6 +1548,9 @@ struct ggml_backend_sched_moe_ffn {
                 "ggml_backend_sched: moe-resident new overlap deferred_layers=%llu gpu_splits=%llu join_wait=%.1f us/deferred-layer\n",
                 (unsigned long long)deferred_layers, (unsigned long long)overlapped_gpu_splits,
                 double(deferred_join_us) / deferred_layers);
+        if (early_gpu_layers) fprintf(stderr,
+                "ggml_backend_sched: moe-resident new early_gpu layers=%llu empty_routes=%llu\n",
+                (unsigned long long)early_gpu_layers, (unsigned long long)early_gpu_empty_layers);
         if (prediction_calls) fprintf(stderr,
                 "ggml_backend_sched: moe-resident new prediction calls=%llu candidates=%llu selected=%llu correct=%llu uploads=%llu used=%llu learned_tokens=%zu\n",
                 (unsigned long long)prediction_calls, (unsigned long long)prediction_candidates,
