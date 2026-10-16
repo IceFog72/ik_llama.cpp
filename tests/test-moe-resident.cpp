@@ -2,6 +2,7 @@
 // implementation, rather than reimplementing admission in a policy simulator.
 // Like other private-implementation tests, this target is not built on Windows.
 #include "../ggml/src/ggml-backend.cpp"
+#include <ctime>
 
 static int failures = 0;
 
@@ -1122,7 +1123,54 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         uint64_t old_zero_samples = 0;
         for (const auto & timing : state.timings)
             for (const auto & samples : timing.misses) old_zero_samples += samples[0].count;
-        if (verify_batch) std::fill(state.cpu_cost.begin(), state.cpu_cost.end(), 1000.0);
+        if (verify_batch) {
+            std::fill(state.cpu_cost.begin(), state.cpu_cost.end(), 1000.0);
+            std::fill(state.cpu_exposed_cost.begin(), state.cpu_exposed_cost.end(), 1000.0);
+            std::fill(state.cpu_marginal_cost.begin(), state.cpu_marginal_cost.end(), 1000.0);
+            // Controlled economics in this numerical/ownership fixture, not a
+            // performance claim: enough per-pass credit to exercise two slots.
+            state.traffic_epoch = (state.policy_clock + uint64_t(tokens)) / state.history_layers;
+            state.traffic_remaining = 0;
+            for (const auto stride : state.groups[0].strides) state.traffic_remaining += 2 * stride;
+            if (r == 0) {
+                auto & future = *state.tasks[layers - 1];
+                auto & active = *state.tasks[0];
+                auto & group = state.groups[future.group];
+                std::vector<bool> protected_slots(group.slots.size(), false);
+                state.forecast_queue = {{1234, layers - 1, 13, 1}, {1234, layers - 1, 14, 1}};
+                for (const int expert : {13, 14}) {
+                    const size_t id = size_t(layers - 1) * experts + expert;
+                    state.popularity[id] = 128; state.recent_popularity[id] = 8;
+                    state.observed_at[id] = state.policy_clock;
+                    state.forecast_probability.resize(size_t(layers) * experts);
+                    state.forecast_probability[id] = 1;
+                }
+                const auto before_bytes = state.host_bytes;
+                const auto before_mapping = state.mapping;
+                active.upload_fenced = false; // no safe overlap window
+                resident_prefetch_prediction(sched, cuda, 0, &active, &protected_slots, ggml_time_us());
+                check(!state.upload.pending && state.host_bytes == before_bytes && state.mapping == before_mapping,
+                        "zero-window active admission performs no upload or mapping mutation");
+                check(state.forecast_queue.size() == 2, "zero-window admission retains hints for later opportunity");
+                // This controlled window exercises a real two-expert transfer
+                // and publication fence; it is not evidence of idle hardware.
+                state.traffic_epoch = state.policy_clock / state.history_layers;
+                state.traffic_remaining = 0;
+                for (const auto stride : group.strides) state.traffic_remaining += 2 * stride;
+                const std::vector<int> candidates{13, 14};
+                check(resident_promote(sched, future, candidates, protected_slots, cuda, true, false, 1e9) ==
+                        resident_admission::submitted && state.upload.entries.size() == 2,
+                        "the same deferred hints upload when a sufficient window is supplied");
+                state.finish_upload();
+                resident_mapping(sched, cuda, true);
+                ggml_backend_synchronize(cuda);
+                const auto uploaded_bytes = state.host_bytes;
+                resident_prefetch_prediction(sched, cuda);
+                check(state.forecast_queue.empty() && state.host_bytes == uploaded_bytes,
+                        "real prefetch consumes fulfilled deferred hints without reuploading");
+                std::fill(state.forecast_probability.begin(), state.forecast_probability.end(), 0);
+            }
+        }
         if (prediction) {
             // Teach a route whose experts deliberately differ from the next
             // actual route. Loading those weights must never change routing
@@ -1256,6 +1304,11 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
     }
     if (verify_batch) {
         if (!fail_cache) {
+            check(sched->moe_ffn->batched_experts > sched->moe_ffn->upload_batches,
+                    "bounded replacement uploads multiple experts under one completion fence");
+            check(sched->moe_ffn->mapping_bytes < sched->moe_ffn->mapping_uploads *
+                    sched->moe_ffn->mapping.size() * sizeof(int32_t),
+                    "incremental mapping updates transfer fewer bytes than full-map rebuilds");
             check(sched->moe_ffn->early_gpu_layers > 0,
                     "partial resident batches dispatch device-mapped GPU work before host routing wait");
             check(sched->moe_ffn->early_gpu_empty_layers > 0,
@@ -1384,6 +1437,100 @@ static void test_layout_capacity() {
             "shared layout capacity includes every member layer");
 }
 
+static void test_resident_reuse_value() {
+    ggml_backend_sched_moe_ffn f;
+    f.history_layers = 40;
+    f.popularity = {128, 32}; f.recent_popularity = {0, 8};
+    f.observed_at = {f.policy_clock, f.policy_clock};
+    f.cpu_cost = {100}; f.cpu_exposed_cost = {100}; f.cpu_marginal_cost = {50};
+    f.cpu_samples.resize(1); f.forecast_probability = {0, 0};
+    const size_t bytes = 2 * 1024 * 1024;
+    check(f.score(0, 0, 2) > f.score(0, 1, 2), "short recent bursts do not replace stable history");
+    check(f.reuse_value(0, 0, 2, bytes) == 0, "recent inactivity discounts obsolete stable history");
+    const double recent = f.recent_score(0, 1, 2);
+    f.policy_clock += 8 * f.history_layers;
+    check(std::abs(f.recent_score(0, 1, 2) - recent / 2) < 1e-9,
+            "recent history decays on model passes rather than layer calls");
+    f.popularity.assign(2, 0); f.recent_popularity.assign(2, 0);
+    f.observed_at.assign(2, f.policy_clock); f.forecast_probability[1] = 1;
+    check(f.reuse_value(0, 1, 2, bytes) == 0, "forecast does not inflate stable residency value");
+    check(f.reuse_value(0, 1, 2, bytes, true) * bytes <= f.cpu_marginal_cost[0],
+            "forecast accounts for at most one imminent use");
+    f.recent_popularity[1] = 8;
+    check(f.reuse_value(0, 1, 2, bytes) == 0, "recent-only burst cannot invent a stable thirty-two-token horizon");
+    f.popularity[1] = 128;
+    const double value = f.reuse_value(0, 1, 2, bytes);
+    f.cpu_marginal_cost[0] *= 2;
+    check(std::abs(f.reuse_value(0, 1, 2, bytes) - 2 * value) < 1e-9,
+            "replacement benefit weights marginal exposed savings");
+    check(f.upload_cost(bytes) > bytes * f.upload_us_per_byte, "admission cost includes host staging and policy overhead");
+    f.traffic_remaining = 2 * bytes;
+    const double cost = 1.25 * f.upload_cost(bytes);
+    check(f.upload_limit(bytes, 0) == 0 && f.upload_limit(bytes, cost - 1) == 0,
+            "an insufficient known window permits zero uploads");
+    check(f.upload_limit(bytes, cost + 1) == 1 && f.upload_limit(bytes, 1.25 * f.upload_cost(2 * bytes) + 1) == 2,
+            "one- and two-expert batches must fit full estimated cost with margin");
+    check(f.upload_limit(bytes) == 1, "absence of an active window limits the burst to one expert");
+    f.traffic_remaining = bytes - 1;
+    check(f.upload_limit(bytes) == 0, "post-join and between-invocation admissions also obey the traffic cap");
+    ggml_backend_sched_moe_ffn::slot incumbent;
+    incumbent.layer = 0; incumbent.expert = 0;
+    f.popularity = {20, 30}; f.recent_popularity = {20, 30};
+    f.cpu_marginal_cost[0] = 10000; // enough absolute benefit; history ratio remains decisive
+    check(!f.admission_allows(0, 1, incumbent, 2, bytes, false), "modest popularity gains do not churn a live slot");
+    f.popularity[1] = 100;
+    check(f.admission_allows(0, 1, incumbent, 2, bytes, false), "sustained material reuse can replace an incumbent");
+    incumbent.admitted_at = f.policy_clock; incumbent.admission_cost_us = 100;
+    check(f.slot_protected(incumbent), "unpaid new residency receives a bounded grace period");
+    incumbent.saved_us = 100;
+    check(!f.slot_protected(incumbent), "estimated repayment releases grace protection");
+    incumbent.saved_us = 0; f.policy_clock += 8 * f.history_layers;
+    check(!f.slot_protected(incumbent), "unused admissions cannot pin slots beyond eight model passes");
+    f.cpu_cost[0] = f.cpu_exposed_cost[0] = f.cpu_marginal_cost[0] = 100;
+    for (int n = 0; n < 32; ++n) {
+        f.observe_cpu_cost(0, 1, 1, 100, 100, 8);
+        f.observe_cpu_cost(0, 1, 2, 120, 120, 8);
+    }
+    check(f.cpu_marginal_cost[0] < 60, "adjacent miss-count samples use marginal CPU savings rather than full row cost");
+    for (int n = 0; n < 32; ++n) f.observe_cpu_cost(0, 1, 2, 120, 0, 8);
+    check(f.cpu_marginal_cost[0] >= 0 && f.cpu_marginal_cost[0] < 1,
+            "hidden or noisy CPU work cannot create a positive turnaround-cost floor");
+}
+
+static void test_resident_occupied_cache_economics() {
+    ggml_backend_sched_moe_ffn f;
+    f.history_layers = 41;
+    f.popularity.resize(2); f.recent_popularity.resize(2);
+    f.observed_at.assign(2, f.policy_clock);
+    f.cpu_marginal_cost = {60};
+    f.upload_policy_us = 90;
+    f.upload_host_us_per_byte = .297 / 1000;
+    f.upload_us_per_byte = .192 / 1000;
+    constexpr size_t bytes = 1900544;
+    ggml_backend_sched_moe_ffn::slot incumbent;
+    incumbent.layer = 0; incumbent.expert = 0;
+    const auto frequency = [&](int expert, double probability) {
+        f.popularity[expert] = probability * 128 / std::log(2.0);
+        f.recent_popularity[expert] = probability * 8 / std::log(2.0);
+    };
+    frequency(0, .03); frequency(1, .20);
+    check(f.admission_allows(0, 1, incumbent, 2, bytes, false),
+            "realistic hot demand can replace an occupied cold slot at measured end-to-end costs");
+    f.cpu_marginal_cost[0] = 30;
+    check(!f.admission_allows(0, 1, incumbent, 2, bytes, false),
+            "even frequent reuse rejects when its critical-path savings cannot pay measured costs");
+    f.cpu_marginal_cost[0] = 60;
+    frequency(1, .03);
+    check(!f.admission_allows(0, 1, incumbent, 2, bytes, false),
+            "low-frequency routes cannot churn occupied capacity");
+    for (int step = 0; step < 32; ++step) {
+        frequency(0, step % 2 ? .15 : .16);
+        frequency(1, step % 2 ? .16 : .15);
+        check(!f.admission_allows(0, 1, incumbent, 2, bytes, false),
+                "oscillating near-equal candidates preserve a stable working set");
+    }
+}
+
 static void test_cpu_worker_handoffs() {
     ggml_moe_cpu_workers workers;
     struct job {
@@ -1409,9 +1556,35 @@ static void test_cpu_worker_handoffs() {
         // pool is also destroyed immediately after a hot completion below.
         if (round % 24 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    workers.run([](void *, int) {}, nullptr, 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto cpu_started = std::clock();
+    const int64_t wall_started = ggml_time_us();
+    for (int round = 0; round < 160; ++round) {
+        workers.run([](void *, int) {}, nullptr, 1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const double cpu_us = 1e6 * double(std::clock() - cpu_started) / CLOCKS_PER_SEC;
+    const double wall_us = ggml_time_us() - wall_started;
+    fprintf(stderr, "resident inactive-worker CPU/wall=%.3f\n", cpu_us / wall_us);
+    check(cpu_us < 1.5 * wall_us, "workers inactive after a sixteen-to-one shrink park instead of hot-spinning");
+    for (const int width : {16, 8, 16, 2, 1}) {
+        job current{}; current.threads = width;
+        workers.run([](void * ptr, int ith) {
+            auto & j = *static_cast<job *>(ptr);
+            if (ith < 0 || ith >= j.threads) j.invalid = true;
+            else ++j.calls[ith];
+        }, &current, width);
+        check(!current.invalid, "reactivated workers preserve the current width");
+        for (int ith = 0; ith < 16; ++ith) check(current.calls[ith] == (ith < width ? 1 : 0),
+                "reactivation executes the current job exactly once per active worker");
+    }
+
 }
 
 int main(int argc, char ** argv) {
+    test_resident_reuse_value();
+    test_resident_occupied_cache_economics();
     test_cpu_worker_handoffs();
     test_route_predictions();
     test_layout_capacity();

@@ -20,9 +20,13 @@ static void resident_history(ggml_backend_sched_t sched) {
     else if (f.popularity.empty()) f.history_layers = std::max(1, sched->moe_resident_layers);
     if (f.popularity.size() != n) {
         f.popularity.assign(n, 0);
+        f.recent_popularity.assign(n, 0);
         f.observed_at.assign(n, f.policy_clock);
         f.mapping.assign(n, -1);
         f.cpu_cost.assign(size_t(sched->moe_resident_layers), 100.0);
+        f.cpu_exposed_cost.assign(size_t(sched->moe_resident_layers), 100.0);
+        f.cpu_marginal_cost.assign(size_t(sched->moe_resident_layers), 50.0);
+        f.cpu_samples.resize(size_t(sched->moe_resident_layers));
     }
 }
 
@@ -48,7 +52,8 @@ static void ggml_backend_sched_moe_new_collect(ggml_backend_sched_t sched) {
         const double scale = std::min(1.0, double(64 * sched->moe_resident_n_expert_used) / total);
         for (int e = 0; e < experts; ++e) {
             const size_t i = size_t(layer) * experts + e;
-            f.popularity[i] = f.score(layer, e, experts) * 0.5 + counts[i] * scale;
+            f.popularity[i] = f.session_score(layer, e, experts) * 0.5 + counts[i] * scale;
+            f.recent_popularity[i] = f.recent_score(layer, e, experts) * 0.5 + counts[i] * scale / 16;
             f.observed_at[i] = f.policy_clock;
         }
     }
@@ -83,7 +88,8 @@ static void ggml_backend_sched_moe_new_observe(ggml_backend_sched_t sched,
         const double scale = std::min(1.0, 64.0 / std::max<int64_t>(1, ids->ne[1]));
         for (int64_t j = 0; j < ggml_nelements(ids); ++j) if (values[j] >= 0 && values[j] < experts) {
             const size_t i = size_t(found->second) * experts + values[j];
-            f.popularity[i] = f.score(found->second, values[j], experts) + scale;
+            f.popularity[i] = f.session_score(found->second, values[j], experts) + scale;
+            f.recent_popularity[i] = f.recent_score(found->second, values[j], experts) + scale;
             f.observed_at[i] = f.policy_clock;
         }
     }
@@ -112,16 +118,28 @@ static void resident_upload(ggml_backend_sched_moe_ffn & f,
     }
 }
 
-static void resident_mapping(ggml_backend_sched_t sched, ggml_backend_t gpu) {
+static void resident_mapping(ggml_backend_sched_t sched, ggml_backend_t gpu, bool incremental = false) {
     auto & f = *sched->moe_ffn;
-    std::fill(f.mapping.begin(), f.mapping.end(), -1);
+    f.mapping_scratch.assign(f.mapping.size(), -1);
     for (auto & g : f.groups) for (size_t p = 0; p < g.slots.size(); ++p) {
         const auto & s = g.slots[p];
         if (s.layer >= 0 && s.expert >= 0)
-            f.mapping[size_t(s.layer) * sched->moe_resident_n_expert + s.expert] = int32_t(p);
+            f.mapping_scratch[size_t(s.layer) * sched->moe_resident_n_expert + s.expert] = int32_t(p);
     }
     auto map = resident_vector(f.slot_map, GGML_TYPE_I32, f.mapping.size());
-    ggml_backend_tensor_set_async(gpu, &map, f.mapping.data(), 0, f.mapping.size() * sizeof(int32_t));
+    // Keep the reusable DMA source at its stable address. Callers fence the
+    // previous source before this update; batch retirement fences reservation.
+    for (size_t begin = 0; begin < f.mapping.size();) {
+        if (incremental && f.mapping[begin] == f.mapping_scratch[begin]) { ++begin; continue; }
+        size_t end = begin + 1;
+        if (!incremental) end = f.mapping.size();
+        else while (end < f.mapping.size() && f.mapping[end] != f.mapping_scratch[end]) ++end;
+        std::copy(f.mapping_scratch.begin() + begin, f.mapping_scratch.begin() + end, f.mapping.begin() + begin);
+        const size_t bytes = (end - begin) * sizeof(int32_t);
+        ggml_backend_tensor_set_async(gpu, &map, f.mapping.data() + begin, begin * sizeof(int32_t), bytes);
+        f.mapping_bytes += bytes;
+        begin = end;
+    }
     f.mapping_dirty = false;
     ++f.mapping_uploads;
 }
@@ -134,8 +152,8 @@ static std::vector<resident_candidate> resident_candidates(ggml_backend_sched_t 
         size_t bytes = 0; for (size_t stride : f.groups[t->group].strides) bytes += stride;
         if (!bytes) continue;
         for (int e = 0; e < sched->moe_resident_n_expert; ++e) {
-            const double score = f.score(t->layer, e, sched->moe_resident_n_expert);
-            if (score > 0) candidates.push_back({t->layer, e, t->group, score * f.cpu_cost[t->layer] / bytes});
+            const double value = f.reuse_value(t->layer, e, sched->moe_resident_n_expert, bytes);
+            if (value > 0) candidates.push_back({t->layer, e, t->group, value});
         }
     }
     std::stable_sort(candidates.begin(), candidates.end(), [](const resident_candidate & a, const resident_candidate & b) {
@@ -328,112 +346,156 @@ static ggml_status resident_gpu_ffn(ggml_backend_sched_moe_ffn & f,
     return ggml_backend_graph_compute_async(gpu, &t.device_graph);
 }
 
-static void resident_promote(ggml_backend_sched_t sched, ggml_backend_sched_moe_ffn::task & t,
+enum class resident_admission { rejected, deferred, submitted };
+
+static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_backend_sched_moe_ffn::task & t,
         const std::vector<int> & missing, const std::vector<bool> & protected_slots, ggml_backend_t gpu,
-        bool prediction = false) {
+        bool prediction = false, bool early_fence = false, double window_us = -1) {
     auto & f = *sched->moe_ffn;
-    if (!f.cache || f.upload.pending || missing.empty()) return;
+    if (!f.cache || missing.empty()) return resident_admission::rejected;
+    if (f.upload.pending) return resident_admission::deferred;
+    const int64_t admission_started = ggml_time_us();
     auto & g = f.groups[t.group];
-    const int n_expert = sched->moe_resident_n_expert;
+    const int experts = sched->moe_resident_n_expert;
     size_t bytes = 0; for (size_t stride : g.strides) bytes += stride;
-    const auto value = [&](int layer, int expert) {
-        if (layer < 0) return 0.0;
-        const size_t i = size_t(layer) * n_expert + expert;
-        const double forecast = i < f.forecast_probability.size() ? f.forecast_probability[i] : 0;
-        return (f.score(layer, expert, n_expert) + 32 * forecast) * f.cpu_cost[layer] / bytes;
-    };
-    const int expert = *std::max_element(missing.begin(), missing.end(), [&](int a, int b) {
-        return value(t.layer, a) < value(t.layer, b);
-    });
-    size_t victim = g.slots.size();
-    double weakest = std::numeric_limits<double>::infinity();
-    // Rank once per approximate model sweep, not an O(cache-size) exponential
-    // scan for every layer. Recheck a bounded shortlist against current use.
+    if (!bytes) return resident_admission::deferred;
     const uint64_t epoch = f.policy_clock / f.history_layers;
+    if (f.traffic_epoch != epoch) {
+        f.traffic_epoch = epoch;
+        // At most 1/128 cache turnover per model pass, capped at 16 MiB.
+        // Tiny caches still permit one expert. No credits accumulate across
+        // passes, widths or the active/post-join/between-invocation call sites.
+        f.traffic_remaining = std::max(bytes, std::min<size_t>(16 * 1024 * 1024, f.allocation_bytes / 128));
+    }
+    const size_t batch_limit = f.upload_limit(bytes, window_us);
+    if (!batch_limit) {
+        if (f.traffic_remaining < bytes) ++f.traffic_deferred;
+        else ++f.window_deferred;
+        return resident_admission::deferred;
+    }
+    const auto value = [&](int layer, int expert) { return f.reuse_value(layer, expert, experts, bytes); };
+    auto & candidates = f.admission_candidates;
+    candidates.clear();
+    for (const int e : missing) if (e >= 0 && e < experts &&
+            !g.slot_index.count((uint64_t(t.layer) << 32) | uint32_t(e)) &&
+            std::none_of(candidates.begin(), candidates.end(), [e](const auto & c) { return c.second == e; }))
+        candidates.emplace_back(f.reuse_value(t.layer, e, experts, bytes, prediction), e);
+    if (candidates.empty()) return resident_admission::rejected;
+    // Cheap absolute rejection avoids a cache-wide ranking for one-off hints.
+    const double minimum = 1.25 * f.upload_cost(bytes) / bytes;
+    if (std::none_of(candidates.begin(), candidates.end(), [minimum](const auto & c) { return c.first > minimum; })) {
+        ++f.admission_rejected; return resident_admission::rejected;
+    }
     if (g.victims.empty() || g.victim_epoch != epoch) {
         g.victims.clear();
-        for (size_t p = 0; p < g.slots.size(); ++p) if (g.slots[p].layer != -2)
-            g.victims.emplace_back(value(g.slots[p].layer, g.slots[p].expert), p);
-        std::sort(g.victims.begin(), g.victims.end());
+        for (size_t pos = 0; pos < g.slots.size(); ++pos) if (g.slots[pos].layer != -2)
+            g.victims.emplace_back(value(g.slots[pos].layer, g.slots[pos].expert), pos);
+        const size_t count = std::min<size_t>(64, g.victims.size());
+        std::partial_sort(g.victims.begin(), g.victims.begin() + count, g.victims.end());
+        g.victims.resize(count);
         g.victim_epoch = epoch;
     }
-    const size_t shortlist = std::min<size_t>(64, g.victims.size());
-    for (size_t i = 0; i < shortlist; ++i) {
-        const size_t p = g.victims[i].second;
-        if (p >= g.slots.size() || protected_slots[p] || g.slots[p].layer == -2) continue;
-        if (g.slots[p].layer >= 0) {
-            const size_t i = size_t(g.slots[p].layer) * n_expert + g.slots[p].expert;
-            if (i < f.forecast_probability.size() && f.forecast_probability[i] >= 0.75) continue;
+    std::vector<ggml_backend_sched_moe_ffn::promotion::item> admitted;
+    while (!candidates.empty() && admitted.size() < batch_limit) {
+        const auto best = std::max_element(candidates.begin(), candidates.end());
+        const int expert = best->second;
+        const double candidate_value = best->first;
+        const double candidate_history = f.session_score(t.layer, expert, experts);
+        candidates.erase(best);
+        size_t victim = g.slots.size();
+        // Snapshot ranks are at most one pass old. Validate identity, protection
+        // and current value only for this bounded shortlist, without repeated
+        // exponentials in a sort comparator or a full slot scan per layer.
+        for (const auto & ranked : g.victims) {
+            const size_t pos = ranked.second;
+            if (pos >= g.slots.size() || protected_slots[pos] || g.slots[pos].layer == -2 ||
+                    std::any_of(admitted.begin(), admitted.end(), [&](const auto & item) { return item.position == pos; })) continue;
+            const auto & slot = g.slots[pos];
+            if (f.slot_protected(slot)) continue;
+            if (slot.layer >= 0) {
+                const size_t id = size_t(slot.layer) * experts + slot.expert;
+                if (id < f.forecast_probability.size() && f.forecast_probability[id] >= 0.75) continue;
+            }
+            if (f.admission_allows(candidate_value, candidate_history, slot, experts, bytes, prediction)) { victim = pos; break; }
         }
-        const double score = value(g.slots[p].layer, g.slots[p].expert);
-        if (score < weakest) { weakest = score; victim = p; }
+        if (victim == g.slots.size()) { ++f.admission_rejected; continue; }
+        ggml_backend_sched_moe_ffn::promotion::item item;
+        item.group = t.group; item.position = victim;
+        item.entry.layer = t.layer; item.entry.expert = expert; item.entry.predicted = prediction;
+        item.entry.admitted_at = f.policy_clock;
+        item.entry.admission_cost_us = f.upload_cost(bytes);
+        for (int bank = 0; bank < 3; ++bank) {
+            item.entry.banks[bank] = t.banks[bank];
+            item.entry.data[bank] = t.banks[bank] ? t.banks[bank]->data : nullptr;
+        }
+        admitted.push_back(item);
     }
-    // Require repeated use and amortize a conservative upload estimate before
-    // replacing a live expert. Empty slots do not evict a useful working set.
-    const bool history_allows = prediction || victim == g.slots.size() || g.slots[victim].layer < 0 ||
-            f.score(t.layer, expert, n_expert) >=
-                    2 * f.score(g.slots[victim].layer, g.slots[victim].expert, n_expert) + 2;
-    if (victim == g.slots.size() || (g.slots[victim].layer >= 0 &&
-            (!history_allows || value(t.layer, expert) <=
-                    weakest * (prediction ? 1.1 : 2.0) + f.upload_us_per_byte))) {
-        ++f.admission_rejected; return;
-    }
+    if (admitted.empty()) return resident_admission::rejected;
+    size_t staging_bytes = 0;
+    for (auto * bank : t.banks) if (bank) staging_bytes += bank->nb[2];
+    const bool setup = !f.uploader || !f.upload_worker.joinable() || !f.upload_staging ||
+            ggml_backend_buffer_get_size(f.upload_staging) < staging_bytes * admitted.size();
+    const int64_t setup_started = setup ? ggml_time_us() : 0;
     if (!f.uploader) {
-        // Distinct registry identity: do not replace the model's compute context.
         f.uploader = ggml_backend_cuda_init(ggml_backend_cuda_get_device(gpu), nullptr, &f);
-        if (!f.uploader) return;
+        if (!f.uploader) return resident_admission::deferred;
         f.upload_started = ggml_backend_cuda_moe_timed_event(f.uploader);
         f.upload_ready = ggml_backend_cuda_moe_timed_event(f.uploader);
         f.upload_fence = ggml_backend_event_new(gpu);
-        if (!f.upload_ready || !f.upload_fence) return;
     }
-    if (!f.upload_ready || !f.upload_fence) return;
-    size_t staging_bytes = 0;
-    for (auto * bank : t.banks) if (bank) staging_bytes += bank->nb[2];
+    if (!f.upload_started || !f.upload_ready || !f.upload_fence) return resident_admission::deferred;
     if (!ggml_backend_sched_moe_decode_buffer(f.upload_staging,
-            ggml_backend_cuda_host_buffer_type(), staging_bytes)) return;
+            ggml_backend_cuda_host_buffer_type(), staging_bytes * admitted.size())) return resident_admission::deferred;
     f.ensure_upload_worker();
-    auto & slot = g.slots[victim];
-    if (slot.layer >= 0) {
-        g.slot_index.erase((uint64_t(slot.layer) << 32) | uint32_t(slot.expert));
-        ++f.evictions;
-    }
-    f.upload = {};
-    f.upload.group = t.group; f.upload.position = victim;
-    f.upload.entry.layer = t.layer; f.upload.entry.expert = expert; f.upload.entry.used = ++f.clock;
-    f.upload.entry.predicted = prediction;
-    for (int b = 0; b < 3; ++b) {
-        f.upload.entry.banks[b] = t.banks[b];
-        f.upload.entry.data[b] = t.banks[b] ? t.banks[b]->data : nullptr;
-        auto & copy = f.upload_copies[b];
-        copy = {};
-        if (t.banks[b]) {
-            copy.destination = *t.banks[b];
-            resident_bank(f, t.group, b, copy.destination);
-            copy.bank = t.banks[b];
-            copy.source = static_cast<const uint8_t *>(t.banks[b]->data) + size_t(expert) * t.banks[b]->nb[2];
-            copy.bytes = t.banks[b]->nb[2];
-            copy.offset = victim * g.strides[b];
-            f.upload.bytes += copy.bytes;
+    const int64_t setup_us = setup ? ggml_time_us() - setup_started : 0;
+    f.upload_setup_us += setup_us;
+    for (auto & item : admitted) item.entry.admission_cost_us += double(setup_us) / admitted.size();
+    f.upload = {}; f.upload.entries = std::move(admitted);
+    f.upload_copies.clear();
+    for (auto & item : f.upload.entries) {
+        auto & slot = g.slots[item.position];
+        if (slot.layer >= 0) {
+            g.slot_index.erase((uint64_t(slot.layer) << 32) | uint32_t(slot.expert));
+            ++f.evictions;
         }
+        item.entry.used = ++f.clock;
+        for (int bank = 0; bank < 3; ++bank) if (t.banks[bank]) {
+            ggml_backend_sched_moe_ffn::upload_copy copy;
+            copy.destination = *t.banks[bank]; resident_bank(f, t.group, bank, copy.destination);
+            copy.bank = t.banks[bank];
+            copy.source = static_cast<const uint8_t *>(copy.bank->data) + size_t(item.entry.expert) * copy.bank->nb[2];
+            copy.bytes = copy.bank->nb[2]; copy.offset = item.position * g.strides[bank];
+            f.upload.bytes += copy.bytes; f.upload_copies.push_back(copy);
+        }
+        slot = {}; slot.layer = -2;
     }
-    slot = {}; slot.layer = -2; // unavailable on both host and device until published
-    resident_mapping(sched, gpu);
-    ggml_backend_event_record(f.upload_fence);
+    // One reservation phase and one fence cover the whole bounded batch.
+    // Old slot readers precede this fence; the uploader cannot overwrite them
+    // until it passes, even when admission overlaps the current CPU job.
+    resident_mapping(sched, gpu, true);
+    if (!early_fence) ggml_backend_event_record(f.upload_fence);
     f.host_bytes += f.upload.bytes;
+    f.traffic_remaining -= bytes * f.upload.entries.size();
+    ++f.upload_batches; f.batched_experts += f.upload.entries.size();
+    if (prediction) f.prediction_uploads += f.upload.entries.size();
     f.upload_queued.store(false, std::memory_order_release);
     f.upload.pending = true;
-    if (prediction) ++f.prediction_uploads;
+    // Charge one-time setup to these entries, not to every future upload.
+    f.upload.policy_us = ggml_time_us() - admission_started - setup_us;
     {
         std::lock_guard<std::mutex> lock(f.upload_mutex);
         f.upload_job = true;
     }
     f.upload_wake.notify_one();
+    return resident_admission::submitted;
 }
 
-static void resident_prefetch_prediction(ggml_backend_sched_t sched, ggml_backend_t gpu, int completed_layer = -1) {
+static void resident_prefetch_prediction(ggml_backend_sched_t sched, ggml_backend_t gpu, int completed_layer = -1,
+        const ggml_backend_sched_moe_ffn::task * active = nullptr,
+        const std::vector<bool> * active_slots = nullptr, int64_t cpu_started = 0) {
     auto & f = *sched->moe_ffn;
-    // Forecast protection expires when that layer's actual result is queued.
+    // Forecast protection expires when the actual route takes over; an active
+    // invocation supplies its own slot protection until its reader fence.
     // Upload-queue consumption must not erase the independent accuracy plan.
     for (const auto & c : f.forecasts) if (c.layer <= completed_layer) {
         const size_t i = size_t(c.layer) * sched->moe_resident_n_expert + c.expert;
@@ -452,14 +514,39 @@ static void resident_prefetch_prediction(ggml_backend_sched_t sched, ggml_backen
                 ggml_backend_sched_moe_ffn_match(g.slots[found->second], t, c.expert)) {
             it = f.forecast_queue.erase(it); continue;
         }
-        // Current execution has retired. The existing background uploader
-        // owns copied descriptors and fences its victim before writing it.
+        // The uploader owns copied descriptors and fences every old reader
+        // before writing. Active invocation slots remain protected as well.
         // No new arena, blocking weight upload, or router substitution.
-        std::vector<bool> protected_slots(g.slots.size(), false);
-        const std::vector<int> expert{c.expert};
+        auto & protected_slots = f.prediction_protected_slots;
+        protected_slots.assign(g.slots.size(), false);
+        if (active && active_slots && active->group == t.group) protected_slots = *active_slots;
+        auto & experts = f.prediction_experts;
+        experts.clear();
+        for (auto q = it; q != f.forecast_queue.end() && experts.size() < 2; ++q) {
+            if (q->layer != c.layer) continue;
+            const auto key = (uint64_t(q->layer) << 32) | uint32_t(q->expert);
+            if (!g.slot_index.count(key)) experts.push_back(q->expert);
+        }
         const auto uploads = f.prediction_uploads;
-        resident_promote(sched, t, expert, protected_slots, gpu, true);
-        it = f.forecast_queue.erase(it); // a rejected forecast cannot stall later layers
+        double window_us = -1;
+        if (active) {
+            const size_t cpu_rows = std::count_if(f.cpu_ids.begin(), f.cpu_ids.end(), [](int e) { return e >= 0; });
+            // CPU running is overlap opportunity, not evidence of idle RAM or
+            // PCIe. Reserve half the estimated remainder for required work;
+            // the shared per-pass byte budget independently limits contention.
+            window_us = active->upload_fenced ? 0.5 * std::max(0.0,
+                    f.cpu_cost[active->layer] * cpu_rows - double(ggml_time_us() - cpu_started)) : 0;
+        }
+        const auto result = resident_promote(sched, t, experts, protected_slots, gpu, true,
+                active && active->upload_fenced, window_us);
+        if (result == resident_admission::deferred) return; // keep hints for a later window
+        f.forecast_queue.erase(std::remove_if(f.forecast_queue.begin(), f.forecast_queue.end(), [&](const auto & hint) {
+            if (hint.layer != c.layer) return false;
+            if (result == resident_admission::submitted) return std::any_of(f.upload.entries.begin(), f.upload.entries.end(),
+                    [&](const auto & item) { return item.entry.layer == hint.layer && item.entry.expert == hint.expert; });
+            return std::find(experts.begin(), experts.end(), hint.expert) != experts.end();
+        }), f.forecast_queue.end());
+        it = f.forecast_queue.begin(); // rejected hints cannot stall later layers
         if (f.prediction_uploads != uploads || ++attempts >= 2) return;
     }
 }
@@ -498,13 +585,14 @@ static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
     if (cpu_count || !gpu_count) {
         const int64_t join_started = ggml_time_us();
         const auto cpu_status = f.finish();
-        if (t.allow_defer) f.deferred_join_us += ggml_time_us() - join_started;
+        const int64_t exposed = std::max<int64_t>(1, ggml_time_us() - join_started);
+        if (t.allow_defer) f.deferred_join_us += exposed;
         // Independent GPU work may outlast this job. Admission must use CPU
         // execution time, not the later time at which its consumer joins it.
         const int64_t elapsed = std::max<int64_t>(1, f.cpu_finished_us - cpu_started);
         f.cpu_wait_us += elapsed;
-        if (cpu_count) f.cpu_cost[t.layer] = 0.8 * f.cpu_cost[t.layer] +
-                0.2 * double(std::max<int64_t>(1, elapsed)) / cpu_count;
+        f.observe_cpu_cost(t.layer, tokens, cpu_count, double(elapsed), double(exposed),
+                sched->moe_resident_n_expert_used);
         if (status == GGML_STATUS_SUCCESS) status = cpu_status;
         if (status == GGML_STATUS_SUCCESS && gpu_count) {
             if (!ggml_backend_sched_moe_decode_buffer(f.packed_output,
@@ -559,6 +647,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     auto & f = *sched->moe_ffn;
     GGML_ASSERT(!f.in_flight.owner);
     const int64_t host_started = ggml_time_us();
+    t.upload_fenced = false;
     const bool cache = ggml_backend_sched_moe_new_cache(sched, gpu);
     auto & g = f.groups[t.group];
     const int tokens = int(t.up->src[3]->ne[1]);
@@ -577,7 +666,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         const int64_t started = ggml_time_us();
         f.wait_io(); // mapping is a reusable asynchronous DMA source
         f.mapping_wait_us += ggml_time_us() - started;
-        resident_mapping(sched, gpu);
+        resident_mapping(sched, gpu, true);
     }
     // A rebuilt graph can contain different bank descriptors. Never reuse a
     // mapping whose source weight identity no longer matches the current task.
@@ -605,7 +694,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
             g.slot_index.erase((uint64_t(t.layer) << 32) | uint32_t(e));
             if (size_t(position) < g.slots.size()) g.slots[position] = {};
         }
-        resident_mapping(sched, gpu);
+        resident_mapping(sched, gpu, true);
     }
     t.device_ids = *t.up->src[3];
     ggml_backend_sched_moe_ffn_bind(t.device_ids, f.device_ids);
@@ -650,6 +739,14 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     ggml_backend_tensor_get_async(gpu, t.up->src[2], t.host_act.data, 0, ggml_nbytes(&t.host_act));
     ++f.fallback_routes;
     ggml_backend_event_record(f.router_ready);
+    if (!f.upload.pending && f.upload_fence) {
+        // All previous readers precede input readiness. Current GPU hits
+        // are protected explicitly, so optional writes to other slots need
+        // not wait behind the entire current GPU FFN. Never re-record a
+        // fence still owned by a pending uploader job.
+        ggml_backend_event_record(f.upload_fence);
+        t.upload_fenced = true;
+    }
     // The readback event deliberately precedes cached-expert execution. Queue
     // GPU hits using the device lookup before blocking the host: CPU input
     // readiness must not wait for those hits to finish. Neither the lookup nor
@@ -685,7 +782,9 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         if (p >= 0) {
             f.gpu_ids[row] = p; f.cpu_ids[row] = -1; protected_slots[p] = true;
             if (g.slots[p].predicted) { ++f.prediction_used; g.slots[p].predicted = false; }
-            g.slots[p].used = ++f.clock; ++gpu_count; ++f.hits;
+            g.slots[p].used = ++f.clock;
+            g.slots[p].saved_us += f.cpu_marginal_cost[t.layer];
+            ++gpu_count; ++f.hits;
         } else {
             ++cpu_count;
             if (std::find(missing.begin(), missing.end(), e) == missing.end()) missing.push_back(e);
@@ -734,9 +833,14 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         const int e = t.route_experts[row];
         if (e < 0 || e >= experts) continue;
         const size_t i = size_t(t.layer) * experts + e;
-        f.popularity[i] = f.score(t.layer, e, experts) + 1;
+        f.popularity[i] = f.session_score(t.layer, e, experts) + 1;
+        f.recent_popularity[i] = f.recent_score(t.layer, e, experts) + 1;
         f.observed_at[i] = f.policy_clock;
     }
+    // Submit only optional future-layer replacement here. Its old-reader
+    // fence precedes current GPU hits, which remain protected; DMA may overlap this CPU job
+    // and subsequently queued shared work. Current hits remain protected.
+    if (cpu_work && cache) resident_prefetch_prediction(sched, gpu, t.layer, &t, &protected_slots, cpu_started);
     auto & call = f.in_flight;
     call.owner = &t; call.gpu = gpu; call.tokens = tokens; call.k = k;
     call.cpu_count = cpu_count; call.gpu_count = gpu_count;
