@@ -203,7 +203,54 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_hs(ggml_backend_cuda_context
     }
 }
 
+// This first specialization matches the measured Qwen decode path. Keep all
+// other shapes on the existing implementation, including prompt processing.
+static bool try_fattn_quant_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (!ctx.fa_quant_tile) return false;
+    const auto * Q = dst->src[0];
+    const auto * K = dst->src[1];
+    const auto * V = dst->src[2];
+    const auto * mask = dst->src[3];
+    float max_bias, softcap;
+    memcpy(&max_bias, dst->op_params + 1, sizeof(float));
+    memcpy(&softcap, dst->op_params + 2, sizeof(float));
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!new_mma_available(cc) || Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 ||
+            Q->ne[1] != 1 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
+            K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 || (Q->ne[2] / K->ne[2]) % 8 != 0 ||
+            V->ne[1] != K->ne[1] || V->ne[2] != K->ne[2] ||
+            K->ne[1] < FATTN_KQ_STRIDE || K->ne[1] % FATTN_KQ_STRIDE != 0 ||
+            K->type != GGML_TYPE_Q4_0 || (V->type != GGML_TYPE_Q4_0 && V->type != GGML_TYPE_Q8_0) ||
+            !mask || mask->type != GGML_TYPE_F16 || mask->ne[0] < K->ne[1] || mask->ne[3] != 1 ||
+            max_bias != 0.0f || softcap != 0.0f || dst->op_params[3] != GGML_PREC_DEFAULT ||
+            dst->op_params[4] != 0 ||
+            Q->nb[0] != sizeof(float) || K->nb[0] != ggml_type_size(K->type) ||
+            V->nb[0] != ggml_type_size(V->type) ||
+            K->nb[1] % sizeof(half2) || K->nb[2] % sizeof(half2) ||
+            V->nb[1] % sizeof(half2) || V->nb[2] % sizeof(half2) ||
+            uintptr_t(K->data) % sizeof(half2) || uintptr_t(V->data) % sizeof(half2)) {
+        return false;
+    }
+
+    // Log actual selection once per V type, rather than merely acknowledging
+    // the option. No synchronization or repeated per-layer logging is needed.
+    const unsigned variant = V->type == GGML_TYPE_Q4_0 ? 1u : 2u;
+    if (!(ctx.fa_quant_tile_logged & variant)) {
+        ggml_cuda_log(GGML_LOG_LEVEL_INFO, "%s: fa-quant-tile active K=q4_0 V=%s head=256 query=1 gqa=%lld (MMA, no full KV expansion)\n",
+                __func__, ggml_type_name(V->type), (long long)(Q->ne[2] / K->ne[2]));
+        ctx.fa_quant_tile_logged |= variant;
+    }
+    if (V->type == GGML_TYPE_Q4_0) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+    } else {
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>(ctx, dst);
+    }
+    return true;
+}
+
 void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (try_fattn_quant_tile(ctx, dst)) return;
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];

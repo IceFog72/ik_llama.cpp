@@ -148,6 +148,12 @@ if (LLAMA_LLGUIDANCE)
     llama_target_and_test(test-grammar-llguidance.cpp ARGS ${CMAKE_CURRENT_SOURCE_DIR}/../models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+if (GGML_CUDA)
+    # Manual CUDA correctness gate; no model needed. Not part of CPU-only CTest.
+    add_executable(test-cuda-fa-quant-tile test-cuda-fa-quant-tile.cpp)
+    target_link_libraries(test-cuda-fa-quant-tile PRIVATE ggml)
+endif ()
+
 if (NOT WIN32)
     add_executable(test-q2-0 test-q2-0.cpp)
     target_include_directories(test-q2-0 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)

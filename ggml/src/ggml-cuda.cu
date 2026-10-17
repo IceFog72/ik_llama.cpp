@@ -117,7 +117,7 @@ GGML_CALL void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback
 #define GGML_CUDA_LOG_DEBUG(...) ggml_cuda_log(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 
 GGML_ATTRIBUTE_FORMAT(2, 3)
-static void ggml_cuda_log(enum ggml_log_level level, const char * format, ...) {
+void ggml_cuda_log(enum ggml_log_level level, const char * format, ...) {
     if (ggml_cuda_log_callback != NULL) {
         va_list args;
         va_start(args, format);
@@ -5770,6 +5770,7 @@ struct cuda_params {
     int  mmq_id_thresh = 32;
     float fa_offset = 0.6931f;
     bool  fabsum = false;
+    bool  fa_quant_tile = false;
 #ifdef USE_CUDA_GRAPH
     bool use_cuda_graph = true;
 #else
@@ -5831,6 +5832,10 @@ static cuda_params ggml_cuda_parse_params(const char * params_string) {
             }
             else if (parsed[0] == "fa-fabsum") {
                 is_good = read_value(parsed[1], params.fabsum);
+            }
+            else if (parsed[0] == "fa-quant-tile") {
+                is_good = parsed[1] == "0" || parsed[1] == "1";
+                if (is_good) params.fa_quant_tile = parsed[1] == "1";
             }
             else if (parsed[0] == "enable-p2p") {
                 is_good = read_value(parsed[1], params.enable_p2p);
@@ -5903,6 +5908,10 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
         if (params.fabsum != ctx->fabsum) {
             GGML_CUDA_LOG_INFO(" =========================== %s: setting fabsum to %d\n", __func__, params.fabsum);
             ctx->fabsum = params.fabsum;
+        }
+        if (params.fa_quant_tile != ctx->fa_quant_tile) {
+            GGML_CUDA_LOG_INFO("%s: fa-quant-tile=%d (opt-in quantized KV tile loading for decode)\n", __func__, params.fa_quant_tile);
+            ctx->fa_quant_tile = params.fa_quant_tile;
         }
         enable_p2p = params.enable_p2p;
 #ifdef USE_CUDA_GRAPH

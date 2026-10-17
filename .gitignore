@@ -168,3 +168,4 @@ GATES1.md
 examples/ft-bench-bw/
 bench_baseline.sh
 .skills/benchmarks/
+.repowise/

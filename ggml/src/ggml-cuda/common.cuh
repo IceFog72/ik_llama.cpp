@@ -73,6 +73,9 @@
 [[noreturn]]
 void ggml_cuda_error(const char * stmt, const char * func, const char * file, int line, const char * msg);
 
+GGML_ATTRIBUTE_FORMAT(2, 3)
+void ggml_cuda_log(enum ggml_log_level level, const char * format, ...);
+
 #define CUDA_CHECK_GEN(err, success, error_fn)                                      \
      do {                                                                           \
         auto err_ = (err);                                                          \
@@ -901,6 +904,8 @@ struct ggml_backend_cuda_context {
     int   mmq_id_thresh = 32;
     float fa_offset = 0.6931f; // ln(2)
     bool  fabsum = false;      // opt-in: bound the fp16 accumulation error in the tile FA kernel
+    bool  fa_quant_tile = false; // opt-in: unpack quantized KV directly into MMA shared-memory tiles
+    unsigned fa_quant_tile_logged = 0;
 #ifdef USE_CUDA_GRAPH
     bool use_cuda_graph = true;
 

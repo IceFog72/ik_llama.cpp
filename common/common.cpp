@@ -3634,7 +3634,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "--context-shift (auto|on|off|0|1)", "set context-shift (default: %s)", params.ctx_shift ? "on" : "off" });
     options.push_back({ "backend" });
     options.push_back({ "*",           "       --rpc SERVERS",          "comma separated list of RPC servers" });
-    options.push_back({ "*",           "-cuda, --cuda-params",          "comma separate list of cuda parameters" });
+    options.push_back({ "*",           "-cuda, --cuda-params",          "comma separated CUDA parameters; fa-quant-tile=1 enables experimental tiled Q4_0 K / Q4_0 or Q8_0 V decode attention (default: 0)" });
     options.push_back({ "*",           "-draft, --draft-params",        "comma separate list of draft model parameters (--cpu-affinity pins the draft to E-cores on Intel hybrid CPUs, -cr LIST picks CPUs)" });
     if (llama_supports_mlock()) {
         options.push_back({ "*",           "       --mlock",                "force system to keep model in RAM rather than swapping or compressing" });
