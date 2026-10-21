@@ -831,7 +831,7 @@ static ggml_tensor * build_top_k_mask(
     }
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
     //ggml_tensor * kq_mask_top_k = ggml_blend(ctx0, kq_mask_all, top_k, 0.0f);
-    // Fo siome reason the above is not faster than this
+    // For some reason the above is not faster than this
     kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
             kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
 
@@ -1053,6 +1053,16 @@ static void ds4_build_comp(ggml_tensor * cur, llm_build_context & llm, ggml_cont
 
     if (dep) {
         ggml_build_forward_expand(gf, dep);
+    }
+    llm.lctx.dsv4.persisted_rings.insert(cache_state);
+    llm.lctx.dsv4.persisted_rings.insert(cache_score);
+    // per-step checkpoint capture reads these per-token rows after compute (only for batches it covers)
+    if (llama_dsv4_per_step_capture_active(llm.lctx) &&
+        plan.state_delta_src_idxs.size() <= (size_t) DSV4_PER_STEP_MAX_STATE_ROWS) {
+        ggml_set_output(state_kv);
+        ggml_set_output(state_score);
+        llm.lctx.dsv4.capture_rows[cache_state] = state_kv;
+        llm.lctx.dsv4.capture_rows[cache_score] = state_score;
     }
     ggml_tensor * persist_kv = ggml_get_rows(ctx0, state_kv, inputs.state_persist_src_idxs);
     llm.cb(persist_kv, (tag + "_persist_kv").c_str(), il);
@@ -1563,6 +1573,8 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
 
 ggml_cgraph * llm_build_context::build_deepseek4() {
     ggml_cgraph * gf = new_graph_custom();
+    lctx.dsv4.capture_rows.clear();
+    lctx.dsv4.persisted_rings.clear();
     std::vector<dsv4_mask_view> mask_views;
 
     const bool is_mtp = lctx.cparams.mtp_op_type != MTP_OP_NONE;
@@ -2643,6 +2655,8 @@ static ggml_tensor * dsv4_build_v41_index_key(
 
 ggml_cgraph * llm_build_context::build_deepseek41() {
     ggml_cgraph * gf = new_graph_custom();
+    lctx.dsv4.capture_rows.clear();
+    lctx.dsv4.persisted_rings.clear();
     std::vector<dsv4_mask_view> mask_views;
 
     const int64_t n_embd_head = hparams.n_embd_head_k(0);

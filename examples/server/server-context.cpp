@@ -777,10 +777,22 @@ result_timings server_slot::get_timings() const {
 const common_chat_msg& server_slot::update_chat_msg(bool is_partial, std::vector<common_chat_msg_diff>& diffs,
     bool filter_tool_calls) {
     auto msg_prv_copy = chat_msg;
-    auto new_msg = common_chat_parse(
-        generated_text,
-        /* is_partial= */ stop != STOP_TYPE_EOS,
-        params.chat_parser_params);
+    common_chat_msg new_msg;
+    try {
+        new_msg = common_chat_parse(
+            generated_text,
+            /* is_partial= */ is_partial,
+            params.chat_parser_params);
+    } catch (const std::exception & e) {
+        // An output the chat parser rejects must not kill the server. Surface it as content so
+        // the request still completes with what the model generated.
+        LOG_ERROR("chat parse failed, returning raw text", {
+            {"id_slot", id},
+            {"error",   e.what()},
+        });
+        new_msg.role    = "assistant";
+        new_msg.content = generated_text;
+    }
     if (!new_msg.empty()) {
         //new_msg.ensure_tool_call_ids_set(generated_tool_call_ids, gen_tool_call_id);
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
@@ -1169,6 +1181,11 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
 
     // Sampling parameter defaults are loaded from the global server context (but individual requests can still override them)
     common_params_sampling default_sparams = params_base.sparams;
+    // start each request from the defaults so per-request state that is only
+    // conditionally overwritten below (logit_bias, elb_params,
+    // dry_sequence_breakers, preserved_tokens, ...) cannot leak in from a
+    // previous request served on this slot
+    slot.sparams = default_sparams;
     auto& data = task.data;
     const llama_vocab* vocab = llama_model_get_vocab(model);
     if (data.count("__oaicompat") != 0) {
@@ -1768,7 +1785,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
                 slot.n_buffer = slot.n_buffer + 1; // buffer is longest string/regex + 1
             }
         }
-		slot.logit_bias = slot.sparams.logit_bias; // keep a copy to restore
+        slot.logit_bias = slot.sparams.logit_bias; // keep a copy to restore
         slot.ban_phrases_bias = json_value(data, "banned_bias", params_base.ban_phrases_bias);
         slot.banned_n = json_value(data, "banned_n", params_base.banned_n);
     }
@@ -1883,10 +1900,15 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
          llama_kv_cache_is_compacted(slot.ctx));
 
     if (llama_model_has_recurrent(llama_get_model(slot.ctx))) {
-        params_base.can_ban_phrases = false;
-        if (slot.n_buffer != 0) {
-            LLAMA_LOG_WARN("banned strings is not supported by recurrent model, it will be disabled.\n");
+        if (slot.n_buffer != 0 && params_base.speculative.type != COMMON_SPECULATIVE_TYPE_NONE) {
+            params_base.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+            params_base.speculative.stages.clear();
+            params_base.has_mtp = false;
+            llama_spec_ckpt_discard(slot.ctx);
+            LLAMA_LOG_WARN("banned strings cannot be used together with speculative decoding with recurrent model, speculative decoding will be disabled.\n");
         }
+    }
+    if (llama_model_has_recurrent(llama_get_model(slot.ctx))) {
         if (params_base.ctx_shift) {
             params_base.ctx_shift = false;
             LOG_WARNING("%s\n", "ctx_shift is not supported by recurrent model, it will be disabled");
@@ -2795,11 +2817,7 @@ static size_t save_checkpoints_to_file(const std::string & filename, const std::
     for (const auto & checkpoint : checkpoints) {
         file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
         file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
-        // Save the legacy fields from old file format
-        llama_pos pos_min_prompt = 0;
-        llama_pos pos_max_prompt = 0;
-        file.write(reinterpret_cast<const char *>(&pos_min_prompt), sizeof(pos_min_prompt));
-        file.write(reinterpret_cast<const char *>(&pos_max_prompt), sizeof(pos_max_prompt));
+        file.write(reinterpret_cast<const char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
         size_t data_len = checkpoint.data.size();
         file.write(reinterpret_cast<const char *>(&data_len), sizeof(data_len));
         if (data_len > 0) {
@@ -2838,11 +2856,10 @@ static size_t load_checkpoints_from_file(const std::string & filename, std::list
             server_prompt_checkpoint checkpoint;
             file.read(reinterpret_cast<char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
             file.read(reinterpret_cast<char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
-            // Read and discard legacy fields from old file format
-            llama_pos pos_min_prompt = 0;
-            llama_pos pos_max_prompt = 0;
-            file.read(reinterpret_cast<char *>(&pos_min_prompt), sizeof(pos_min_prompt));
-            file.read(reinterpret_cast<char *>(&pos_max_prompt), sizeof(pos_max_prompt));
+            // n_tokens occupies the same 8-byte slot as the old-format legacy
+            // pos_min_prompt/pos_max_prompt pair; files saved before this change
+            // read back n_tokens = 0
+            file.read(reinterpret_cast<char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
 
             size_t data_len;
             file.read(reinterpret_cast<char *>(&data_len), sizeof(data_len));
@@ -4318,7 +4335,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     && slot.prompt_tokens[slot.n_past_prompt] == LLAMA_TOKEN_NULL) {
                     // process the image
                     size_t n_tokens_out = 0;
-                    llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past; // add offset to prompt
+                    llama_pos p1 = slot.cache_tokens.pos_next();
                     server_mtp_warmup mtp_media_warmup {
                         ctx,
                         slot.uses_mtp() && slot.spec ? &slot : nullptr,
@@ -4808,8 +4825,16 @@ void server_context::rewind_context(server_slot& slot, int32_t ban_pos) {
     slot.cache_tokens.keep_first(n_keep_cache);
     slot.n_past = slot.cache_tokens.n_tokens();
 
-    // Remove from KV cache
-    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
+    if (llama_model_has_recurrent(llama_get_model(slot.ctx))) {
+        auto n_past = slot.cache_tokens.pos_next(slot.n_past);
+        auto result = llama_spec_ckpt_restore(slot.ctx, slot.id, n_past, 0); // restore recurrent layers
+        if (!result) {
+            LLAMA_LOG_ERROR("--- Restoring checkpoint for string ban failed. \n");
+        }
+    } else {
+        // Remove from KV cache
+        llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
+    }
 
     // Truncate buffer
     slot.token_buffer.resize(n_keep_buffer);
@@ -4839,7 +4864,10 @@ void server_context::buffer_and_check_string_ban(server_slot & slot, completion_
     }
 
     bool allow_rewind = true;
-
+    if (slot.n_decoded==1 && llama_model_has_recurrent(llama_get_model(slot.ctx))) {
+        // take a snapshat before generation
+        llama_rewind_ckpt_save(slot.ctx, slot.id, slot.n_buffer);
+    }
     if (ban_pos >= 0) {
         if (slot.rewind_count_max == -1) {
             // Automatic / Heuristic logic
@@ -4876,6 +4904,9 @@ void server_context::buffer_and_check_string_ban(server_slot & slot, completion_
         else {
             // send 1 token from the front (FIFO)
             send_token_results(slot.token_buffer, slot, 1);
+        }
+        if (llama_model_has_recurrent(llama_get_model(slot.ctx))) {
+            llama_rewind_ckpt_save(slot.ctx, slot.id, slot.n_buffer);
         }
     }
     else {
@@ -4925,7 +4956,7 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;
                 if (ret == user_cancel) {
-                    LLAMA_LOG_INFO("Decode process is cancelled by user.\n");
+                    LLAMA_LOG_INFO("Decode process is canceled by user.\n");
                 }
                 else {
                     // if you get here, it means the KV cache is full - try increasing it via the context size

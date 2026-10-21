@@ -59,6 +59,7 @@ struct llama_cparams {
     bool moe_resident_ubatch_auto = false;
     bool moe_resident_zero_fill; // new profiler includes zero fills; false selects the old profiler
     bool moe_resident_grouping; // layout-grouped complete cache (default: false)
+    size_t moe_cache_size = 0;
     bool mtp;
     int  worst_graph_tokens;
     int  dflash_query_capacity = 0; // internal DFlash query capacity override

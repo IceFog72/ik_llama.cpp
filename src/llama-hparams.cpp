@@ -373,7 +373,7 @@ void llm_load_hparams(
 
                 if (model.type == MODEL_17B_128E) {
                     hparams.use_kq_norm = false;
-                    }
+                }
             } break;
         case LLM_ARCH_DECI:
             {
@@ -381,7 +381,7 @@ void llm_load_hparams(
                 switch (hparams.n_layer) {
                     case 32: model.type = e_model::MODEL_7B; break;
                     case 80: model.type = e_model::MODEL_70B; break;
-	            case 162: model.type = e_model::MODEL_405B; break;
+                    case 162: model.type = e_model::MODEL_405B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
             } break;
@@ -656,6 +656,35 @@ void llm_load_hparams(
                     case 28: model.type = e_model::MODEL_12B_A2_5B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }
+            } break;
+        case LLM_ARCH_MAPLE:
+            {
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa, false);
+
+                if (hparams.n_swa > 0) {
+                    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+                    hparams.rope_freq_scale_train_swa = 1; //hparams.rope_freq_scale_train;
+
+                    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false)) {
+                        for (uint32_t i = 0; i < hparams.n_layer; ++i) {
+                            hparams.swa_layers[i] = ((i + 1) % 4 != 0);
+                        }
+                    }
+
+                    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA, hparams.rope_freq_base_train_swa, false);
+                }
+
+                hparams.expert_gating_func = LLM_EXPERT_GATING_FUNC_SOFTMAX;
+                ml.get_key(LLM_KV_EXPERT_GATING_FUNC,   hparams.expert_gating_func,   false);
+                hparams.expert_weights_norm = true;
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,  hparams.expert_weights_norm,  false);
+                ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE, hparams.expert_weights_scale, false);
+
+                ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP, hparams.swiglu_limits, hparams.n_layer, false);
+
+                model.type = e_model::MODEL_UNKNOWN;
             } break;
         case LLM_ARCH_LFM2:
         case LLM_ARCH_LFM2MOE:
@@ -1352,7 +1381,7 @@ void llm_load_hparams(
                         LLAMA_LOG_ERROR("Detected incompatible DeepSeek model without a known way to fix it.\n");
                         LLAMA_LOG_ERROR("Consider making your own ik_llama.cpp compatible model or\n");
                         LLAMA_LOG_ERROR("ask the model provider to make one for you,\n\n");
-                        LLAMA_LOG_ERROR("Sorry, uknown model => cannot fix it => bailing out\n");
+                        LLAMA_LOG_ERROR("Sorry, unknown model => cannot fix it => bailing out\n");
                         LLAMA_LOG_ERROR("==========================================================================\n");
                         GGML_ABORT("Fatal error");
                     }
@@ -1737,7 +1766,7 @@ void llm_load_hparams(
 
                 model.type = e_model::MODEL_UNKNOWN;
             } break;
-	    case LLM_ARCH_DOTS1:
+        case LLM_ARCH_DOTS1:
             {
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
                 ml.get_key(LLM_KV_LEADING_DENSE_BLOCK_COUNT,   hparams.n_layer_dense_lead);
@@ -1813,6 +1842,8 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,        hparams.expert_weights_scale, false);
                 ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,         hparams.expert_weights_norm, false);
                 ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head,    false);
+                ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size, false);
 
                 model.type = e_model::MODEL_UNKNOWN;
             } break;
@@ -2025,7 +2056,6 @@ void llm_load_hparams(
                     if (hparams.dflash_target_layer_ids[i] == 0) {
                         throw std::runtime_error("dflash2: target_layers must use one-based IDs");
                     }
-                    --hparams.dflash_target_layer_ids[i];
                 }
                 hparams.dflash_n_target_features = hparams.n_embd * hparams.dflash_n_target_layers;
                 if (hparams.dflash_selector_top_k == 0 ||
@@ -2406,7 +2436,7 @@ void llm_load_hparams(
                         hparams.n_rot != 64) {
                         LLAMA_LOG_ERROR("==========================================================================\n");
                         LLAMA_LOG_ERROR("Detected incompatible DeepSeek model without a known way to fix it.\n");
-                        LLAMA_LOG_ERROR("Sorry, uknown model => cannot fix it => bailing out\n");
+                        LLAMA_LOG_ERROR("Sorry, unknown model => cannot fix it => bailing out\n");
                         LLAMA_LOG_ERROR("==========================================================================\n");
                         GGML_ABORT("Fatal error");
                     }

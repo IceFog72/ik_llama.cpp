@@ -7,9 +7,11 @@
 #include "llama-spec-features.h"
 
 struct llama_model;
+class llama_moe_cache;
 
 #include <vector>
 #include <map>
+#include <tuple>
 #include <set>
 #include <memory>
 
@@ -138,7 +140,7 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> kr_l;
 
     // Pooled block keys for Qwen sparse attention: [indexer_head_size, kv_size/compress_ratio],
-    // already normalised and rotated. Empty unless the model scores blocks.
+    // already normalized and rotated. Empty unless the model scores blocks.
     std::vector<struct ggml_tensor *> kp_l;
 
     // When true, the delta_net graph builder will enable per-step SSM state saves
@@ -214,7 +216,7 @@ struct llama_kv_cache {
         int fixed_spec_mode = LLAMA_SPEC_CKPT_NONE;
         int32_t fixed_max_tokens = 0;
 
-        // Serialised sequence state for CPU mode
+        // Serialized sequence state for CPU mode
         std::vector<uint8_t> cpu_state_data;
 
         // Private DSV4 state snapshot used by GPU/CPU fallback modes.
@@ -323,13 +325,24 @@ struct llama_control_vector {
         return tensors[il];
     }
 
+    // split mode graph: a copy of each layer's direction on every device, [il][device]
+    std::vector<std::vector<struct ggml_tensor *>> dev_tensors;
+    // graph currently being built (set by llm_build_context::new_graph_custom), used by apply_to
+    struct ggml_cgraph * graph = nullptr;
+
     struct ggml_tensor * apply_to(struct ggml_context * ctx, struct ggml_tensor * cur, int  il) const {
         ggml_tensor * layer_dir = tensor_for(il);
-        if (layer_dir != nullptr) {
-            cur = ggml_add(ctx, cur, layer_dir);
+        if (layer_dir == nullptr) {
+            return cur;
         }
-        return cur;
+        if (ggml_tensor * res = apply_to_reduce(ctx, cur, il)) {
+            return res;
+        }
+        return ggml_add(ctx, cur, layer_dir);
     }
+
+    struct ggml_tensor * apply_to_device(struct ggml_context * ctx, struct ggml_tensor * cur, int il, int id) const;
+    struct ggml_tensor * apply_to_reduce(struct ggml_context * ctx, struct ggml_tensor * cur, int il) const;
 
     ~llama_control_vector() {
         for (struct ggml_context * ctx : ctxs) {
@@ -360,6 +373,7 @@ struct llama_context {
     std::unordered_map<struct llama_lora_adapter *, float> lora_adapters;
 
     std::vector<ggml_backend_t> backends;
+    std::unique_ptr<llama_moe_cache> moe_cache;
 #ifdef GGML_USE_METAL
     ggml_backend_t backend_metal = nullptr;
 #endif
@@ -415,6 +429,9 @@ struct llama_context {
     uint32_t prefill_ubatch = 0; // active initial-prompt workspace; zero after shrinking
     bool resident_initial_prompt = true; // only a full target-context reset re-arms growth
     llama_context * adaptive_mtp_peer = nullptr; // non-owning, registered by the embedded predictor
+
+    static bool sched_copy_moe_cache(ggml_backend_t backend, const ggml_tensor * src,
+            ggml_tensor * dst, ggml_cgraph * graph, ggml_backend_sched_copy_phase phase, void * user_data);
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
@@ -637,6 +654,10 @@ struct llama_context {
         comp_plan csa_plan;
         comp_plan hca_plan;
         comp_plan lid_plan;
+        // compressor state ring -> per-token state rows of the current graph (per-step checkpoint capture)
+        std::map<const ggml_tensor *, ggml_tensor *> capture_rows;
+        // compressor state rings the current graph persists into
+        std::set<const ggml_tensor *> persisted_rings;
 
         std::vector<float> csa_mask_data;
         std::vector<float> hca_mask_data;
@@ -698,6 +719,12 @@ struct llama_context {
 
     // token at each position of a sequence, read by the PLE n-gram hash
     std::map<llama_seq_id, std::vector<llama_token>> ple_hist;
+
+    // per-graph memo of Hadamard-rotated activations (prism.hadamard folded weights):
+    // several folded weights consume the same input activation; rotate it once per graph.
+    // Keyed by content (signs tensor + transform params), not by the per-weight transform
+    // pointer, so weights sharing one rotation reuse a single rotated tensor.
+    std::map<std::tuple<const struct ggml_tensor *, const struct ggml_tensor *, int64_t, int64_t, int64_t, int64_t>, struct ggml_tensor *> hadamard_memo;
 
     struct swa_window_view_state {
         bool active       = false;

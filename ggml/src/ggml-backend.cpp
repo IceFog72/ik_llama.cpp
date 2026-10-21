@@ -2068,6 +2068,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    ggml_backend_sched_copy_callback callback_copy;
+    void * callback_copy_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -4419,10 +4421,20 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t last_input_backend = nullptr;
     bool synced_on_input = false;
-    for (int j = 0; j < split->n_inputs; j++) {
+    const int n_input_passes = sched->callback_copy ? 2 : 1;
+    for (int pass_input = 0; pass_input < n_input_passes*split->n_inputs; ++pass_input) {
+        const bool callback_copy_pass = pass_input >= split->n_inputs;
+        const int j = pass_input % split->n_inputs;
         ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[j]);
         struct ggml_tensor * input = split->inputs[j];
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+        const bool callback_handles_copy = !(input->flags & GGML_TENSOR_FLAG_INPUT) && sched->callback_copy &&
+                sched->callback_copy(split_backend, input, input_cpy, &split->graph,
+                        GGML_BACKEND_SCHED_COPY_PHASE_QUERY,
+                        sched->callback_copy_user_data);
+        if (callback_handles_copy != callback_copy_pass) {
+            continue;
+        }
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
             // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -4445,6 +4457,11 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     ggml_backend_synchronize(split_backend);
                 }
                 needs_sync[split_backend_id] = k_set_sync;
+            }
+
+            if (callback_handles_copy && sched->callback_copy(split_backend, input, input_cpy,
+                    &split->graph, GGML_BACKEND_SCHED_COPY_PHASE_EXECUTE, sched->callback_copy_user_data)) {
+                continue;
             }
 
             ggml_tensor * node = split->graph.nodes[0];
@@ -4910,6 +4927,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct moe_split_info {
         int split;
         int64_t n_tokens;
+        bool multi_layer;                        // host-computed MoE of more than one layer (e.g. CPU-only)
         std::vector<ggml_tensor *> host_weights; // originals (host mmap)
         std::vector<ggml_tensor *> nodes;        // MoE nodes computed on a host buffer
     };
@@ -4925,6 +4943,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             moe_split_info info;
             info.split = i;
             info.n_tokens = 0;
+            info.multi_layer = false;
+            const ggml_tensor * host_ids = nullptr;
             for (int n = 0; n < splits[i].graph.n_nodes; ++n) {
                 ggml_tensor * node = splits[i].graph.nodes[n];
                 if (node->op != GGML_OP_MUL_MAT_ID && node->op != GGML_OP_MOE_FUSED_UP_GATE) {
@@ -4941,7 +4961,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         node_on_host = true;
                     }
                 }
-                if (node_on_host) {
+                // up/gate and down of a layer share one ids tensor
+                if (node_on_host && node_ids) {
+                    info.multi_layer |= host_ids && host_ids != node_ids;
+                    host_ids = node_ids;
+                }
+                // ids computed inside this split are stale before it runs
+                bool ids_final = false;
+                for (int j = 0; node_ids && j < splits[i].n_inputs; ++j) {
+                    if (node_ids == tensor_copy(splits[i].inputs[j], splits[i].backend_id, sched->cur_copy)) {
+                        ids_final = true;
+                        break;
+                    }
+                }
+                if (node_on_host && ids_final) {
                     info.nodes.push_back(node);
                 }
             }
@@ -4988,7 +5021,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             // keep the next `moe_ahead` MoE-bearing splits streaming in
             const size_t want_end = std::min(moe_next + moe_ahead, moe_infos.size());
             for (size_t k = std::max(moe_enq, moe_next); k < want_end; ++k) {
-                if (moe_infos[k].n_tokens >= 32) { // batch graphs touch most experts (min batch offload)
+                // batch graphs touch most experts (min batch offload); multi-layer splits would fetch everything at once
+                if (moe_infos[k].n_tokens >= 32 && !moe_infos[k].multi_layer) {
                     for (ggml_tensor * w : moe_infos[k].host_weights) {
                         ggml_moe_prefetch_tensor(w);
                     }
@@ -5546,6 +5580,12 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
 void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data) {
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched,
+        ggml_backend_sched_copy_callback callback, void * user_data) {
+    sched->callback_copy = callback;
+    sched->callback_copy_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

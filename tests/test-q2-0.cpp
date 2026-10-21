@@ -46,7 +46,10 @@ static void test_format() {
     check(ggml_row_size(GGML_TYPE_Q2_0, 640) == 180, "640-wide row size");
     auto traits = ggml_internal_get_type_traits(GGML_TYPE_Q2_0);
     check(traits.to_float && traits.from_float && traits.vec_dot, "CPU traits");
-    check(traits.vec_dot_type == GGML_TYPE_Q8_0, "activation type");
+    // upstream registers the X4 activation layouts (iqk mul_mat_q2_0_q8_2_x4 on AVX2,
+    // mul_mat_q2_0_q8_0_x4 elsewhere); the registered vec_dot stays the scalar kernel
+    check(traits.vec_dot_type == GGML_TYPE_Q8_2_X4 || traits.vec_dot_type == GGML_TYPE_Q8_0_X4,
+            "activation type");
     auto data = weights(640, 1);
     std::vector<float> decoded(640);
     traits.to_float(data.data(), decoded.data(), 640);
