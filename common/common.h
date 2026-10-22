@@ -267,7 +267,10 @@ struct common_params_speculative {
     llama_model * model_dft = nullptr; // a llama_model that can be shared by multiple speculative contexts
 
     llama_context_params cparams_dft; // these are the parameters for the draft llama_context
-    std::shared_ptr<const std::string> adaptive_cuda_params_dft; // owns inherited options across MTP stage copies
+    // cparams_dft is built from a temporary gpt_params. These own the options its
+    // raw pointers reference, across stage copies, until the draft context exists.
+    std::shared_ptr<const std::string> cuda_params_dft;
+    std::shared_ptr<const std::vector<std::pair<int,int>>> offload_policy_dft;
 
     // draft affinity from --draft-params; empty = inherit the target
     std::vector<int32_t> cpu_affinity;

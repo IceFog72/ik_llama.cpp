@@ -1533,7 +1533,7 @@ GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buf
     munmap(buffer->context, buffer->size);
 }
 
-static void * ggml_cuda_host_malloc(size_t size, bool mapped = false) {
+static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
@@ -1578,13 +1578,7 @@ static void * ggml_cuda_host_malloc(size_t size, bool mapped = false) {
         }
     }
 
-    unsigned int flags = cudaHostRegisterPortable;
-#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
-    if (mapped) flags |= cudaHostRegisterMapped;
-#else
-    GGML_UNUSED(mapped);
-#endif
-    cudaError_t err = cudaHostRegister(ptr, size, flags);
+    cudaError_t err = cudaHostRegister(ptr, size, cudaHostRegisterPortable);
     if (err != cudaSuccess) {
         cudaGetLastError(); // clear the error
         GGML_CUDA_LOG_WARN("%s: cudaHostRegister of %.2f MiB failed: %s\n", __func__,
@@ -1615,7 +1609,7 @@ static size_t ggml_cuda_pinned_cap() {
     return cap;
 }
 
-static void * ggml_cuda_host_malloc(size_t size, bool mapped = false) {
+static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
@@ -1641,14 +1635,7 @@ static void * ggml_cuda_host_malloc(size_t size, bool mapped = false) {
         GGML_CUDA_LOG_INFO("But if it takes too long for your model and amount of patience, kill the process and run using\n\n");
         GGML_CUDA_LOG_INFO("GGML_CUDA_NO_PINNED=1 your_command_goes_here\n");
     }
-    cudaError_t err;
-#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
-    if (mapped) err = cudaHostAlloc((void **)&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
-    else err = cudaMallocHost((void **)&ptr, size);
-#else
-    GGML_UNUSED(mapped);
-    err = cudaMallocHost((void **)&ptr, size);
-#endif
+    cudaError_t err = cudaMallocHost((void **) &ptr, size);
     if (size_GiB > k_warn_limit) {
         auto tim2 = ggml_time_us();
         GGML_CUDA_LOG_INFO("    done allocating %.2f GiB in %.1f ms\n\n", size_GiB, 1e-3*(tim2-tim1));
@@ -1710,16 +1697,6 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_
     buffer->iface.get_name = ggml_backend_cuda_host_buffer_name;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
 
-    return buffer;
-}
-
-ggml_backend_buffer_t ggml_backend_cuda_moe_host_buffer(size_t size) {
-    void * ptr = ggml_cuda_host_malloc(size, true);
-    if (!ptr) return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-    auto * buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-    buffer->buft = ggml_backend_cuda_host_buffer_type();
-    buffer->iface.get_name = ggml_backend_cuda_host_buffer_name;
-    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
     return buffer;
 }
 
@@ -4760,50 +4737,23 @@ void ggml_backend_cuda_moe_histogram(ggml_backend_t backend, const ggml_tensor *
 }
 
 static __global__ void resident_route_kernel(const int32_t * ids, const int32_t * slots,
-        int32_t * mapped, int32_t * host_ids, int k, int experts) {
+        int32_t * mapped, int k, int experts) {
     const int i = threadIdx.x;
     if (i < k) {
         const int expert = ids[i];
         mapped[i] = expert >= 0 && expert < experts ? slots[expert] : -1;
-        if (host_ids) host_ids[i] = expert;
     }
 }
 
-static __global__ void resident_activation_kernel(const float * activation, float * host,
-        const int32_t * mapped, int k, int64_t n) {
-    bool missing = false;
-    for (int i = 0; i < k; ++i) missing |= mapped[i] < 0;
-    const int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (missing && i < n) host[i] = activation[i];
-}
-
-bool ggml_backend_cuda_moe_route(ggml_backend_t backend, const ggml_tensor * ids,
-        const int32_t * slots, ggml_tensor * mapped, const ggml_tensor * activation,
-        int32_t * host_ids, float * host_activation, int experts) {
+void ggml_backend_cuda_moe_route(ggml_backend_t backend, const ggml_tensor * ids,
+        const int32_t * slots, ggml_tensor * mapped, int experts) {
     auto * ctx = (ggml_backend_cuda_context *)backend->context;
     ggml_cuda_set_device(ctx->device);
-    int32_t * device_host_ids = nullptr;
-    float * device_host_act = nullptr;
-#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
-    // Host pinning may fall back to ordinary RAM. Fail before launching any work.
-    if (host_ids && cudaHostGetDevicePointer((void **)&device_host_ids, host_ids, 0) != cudaSuccess) {
-        cudaGetLastError(); return false;
-    }
-    if (host_activation && cudaHostGetDevicePointer((void **)&device_host_act, host_activation, 0) != cudaSuccess) {
-        cudaGetLastError(); return false;
-    }
-#else
-    if (host_ids || host_activation) return false;
-#endif
     const int k = int(ggml_nelements(ids));
     GGML_ASSERT(k > 0 && k <= 1024);
     resident_route_kernel<<<1, k, 0, ctx->stream()>>>((const int32_t *)ids->data, slots,
-            (int32_t *)mapped->data, device_host_ids, k, experts);
-    if (host_activation) resident_activation_kernel<<<(ggml_nelements(activation) + 255) / 256,
-            256, 0, ctx->stream()>>>((const float *)activation->data, device_host_act,
-                    (const int32_t *)mapped->data, k, ggml_nelements(activation));
+            (int32_t *)mapped->data, k, experts);
     CUDA_CHECK(cudaGetLastError());
-    return true;
 }
 
 static __global__ void resident_scatter_kernel(float * dst, const float * src,

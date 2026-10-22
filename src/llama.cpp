@@ -7459,11 +7459,13 @@ static bool llama_adapt_resident_workspace(llama_context & lctx, uint32_t demand
             : std::max<size_t>(512ull * 1024 * 1024, free_bytes / 8);
     const size_t usable = free_bytes > guard ? free_bytes - guard : 0;
     uint32_t chosen = small;
+    // A larger workspace than this prompt needs would only displace expert slots.
+    const uint32_t demand_units = uint32_t((uint64_t(demand) + 511) / 512);
     if (prefill && root->cparams.moe_resident_ubatch_auto) {
         const uint32_t first = (small + 511) / 512;
         uint32_t best = 0;
         // Check descending: graph shapes/kernel choices need not be monotonic.
-        for (uint32_t units = root->cparams.n_ubatch / 512; units >= first; --units) {
+        for (uint32_t units = std::min(root->cparams.n_ubatch / 512, demand_units); units >= first; --units) {
             size_t bytes = 0;
             if (!measure(units * 512, bytes)) return false;
             if (bytes <= usable) { best = units; break; }
@@ -7474,7 +7476,7 @@ static bool llama_adapt_resident_workspace(llama_context & lctx, uint32_t demand
         }
         chosen = best * 512;
     } else if (prefill) {
-        chosen = root->cparams.n_ubatch;
+        chosen = uint32_t(std::min<uint64_t>(root->cparams.n_ubatch, uint64_t(demand_units) * 512));
         for (;;) {
             size_t bytes = 0;
             if (!measure(chosen, bytes)) return false;

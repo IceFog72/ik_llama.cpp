@@ -178,7 +178,10 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
     resident_history(sched);
     ggml_backend_sched_moe_new_collect(sched);
     const int device = ggml_backend_cuda_get_device(gpu);
-    if (!ggml_backend_sched_moe_decode_buffer(f.slot_map, sched->bufts[0], f.mapping.size() * sizeof(int32_t))) return false;
+    if (!ggml_backend_sched_moe_decode_buffer(f.slot_map, sched->bufts[0], f.mapping.size() * sizeof(int32_t))) {
+        // Same CPU fallback as a failed cache plan; the next response retries.
+        f.remember_cache(); f.clear_cache(); f.disabled = true; return false;
+    }
     size_t free_bytes = 0, total = 0;
     ggml_backend_cuda_get_device_memory(device, &free_bytes, &total);
     f.budget_bytes = ggml_backend_sched_moe_ffn_budget(sched, free_bytes + f.allocation_bytes, f.reserve_bytes);
@@ -702,8 +705,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
             size_t(t.layer) * experts : nullptr;
     if (complete) {
         // A fully resident layer needs neither host routing nor activation I/O.
-        if (!ggml_backend_cuda_moe_route(gpu, t.up->src[3], device_map, &t.device_ids,
-                t.up->src[2], nullptr, nullptr, experts)) return GGML_STATUS_FAILED;
+        ggml_backend_cuda_moe_route(gpu, t.up->src[3], device_map, &t.device_ids, experts);
         const int64_t started = ggml_time_us();
         const auto status = resident_gpu_ffn(f, t, gpu);
         f.gpu_enqueue_us += ggml_time_us() - started;
@@ -754,11 +756,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     auto status = GGML_STATUS_SUCCESS;
     if (has_resident) {
         const int64_t started = ggml_time_us();
-        if (!ggml_backend_cuda_moe_route(gpu, t.up->src[3], device_map, &t.device_ids,
-                t.up->src[2], nullptr, nullptr, experts)) {
-            ggml_backend_synchronize(gpu);
-            return GGML_STATUS_FAILED;
-        }
+        ggml_backend_cuda_moe_route(gpu, t.up->src[3], device_map, &t.device_ids, experts);
         status = resident_gpu_ffn(f, t, gpu);
         f.gpu_enqueue_us += ggml_time_us() - started;
         if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }

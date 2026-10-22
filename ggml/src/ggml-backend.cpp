@@ -4301,15 +4301,13 @@ static ggml_status ggml_backend_sched_moe_decode_compute(ggml_backend_sched_t sc
     device_graph.nodes = device_nodes;
     auto status = ggml_backend_graph_compute_async(gpu, &device_graph);
     if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }
-    if (cpu_count) {
-        // CUDA remains in flight while the CPU reads its expert weights in place.
-        status = ggml_backend_graph_compute(cpu, &host_graph);
-        if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }
-        for (size_t row = 0; row < route.ids.size(); ++row) {
-            if (cpu_ids[row] >= 0) {
-                ggml_backend_tensor_set_async(gpu, node, static_cast<const uint8_t *>(host_out.data) + row * node->nb[1],
-                        row * node->nb[1], node->nb[1]);
-            }
+    // CUDA remains in flight while the CPU reads its expert weights in place.
+    status = ggml_backend_graph_compute(cpu, &host_graph);
+    if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }
+    for (size_t row = 0; row < route.ids.size(); ++row) {
+        if (cpu_ids[row] >= 0) {
+            ggml_backend_tensor_set_async(gpu, node, static_cast<const uint8_t *>(host_out.data) + row * node->nb[1],
+                    row * node->nb[1], node->nb[1]);
         }
     }
     // Stack tensor descriptors must outlive CUDA graph inspection and uploads.

@@ -5052,7 +5052,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             }
 
             if (!slot.moe_resident_generation_started) {
-                llama_moe_resident_begin_generation(slot.ctx);
+                // The refresh flushes CUDA graphs and resizes the shared expert
+                // cache. Skip it while another slot on this context is generating.
+                const bool others_generating = std::any_of(slots.begin(), slots.end(), [&](const server_slot & other) {
+                    return &other != &slot && other.ctx == slot.ctx && other.is_processing() && other.n_decoded > 0;
+                });
+                if (!others_generating) {
+                    llama_moe_resident_begin_generation(slot.ctx);
+                }
                 slot.moe_resident_generation_started = true;
             }
 

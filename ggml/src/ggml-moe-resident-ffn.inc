@@ -23,17 +23,6 @@ static bool ggml_backend_sched_moe_ffn_scratch(ggml_backend_sched_t sched,
     f.wait_io();
     const auto host = ggml_backend_cuda_host_buffer_type();
     const auto device = sched->bufts[0];
-    if (f.new_policy) {
-        const auto mapped = [](ggml_backend_buffer_t & buffer, size_t bytes) {
-            if (buffer && ggml_backend_buffer_get_size(buffer) >= bytes) return true;
-            auto replacement = ggml_backend_cuda_moe_host_buffer(bytes);
-            if (!replacement) return false;
-            ggml_backend_buffer_free(buffer); buffer = replacement;
-            return true;
-        };
-        if (!mapped(f.activation, ggml_nbytes(up->src[2])) ||
-                !mapped(f.ids, 2 * ggml_nbytes(up->src[3]))) return false;
-    }
     if (!f.completion) f.completion = ggml_backend_event_new(sched->backends[0]);
     return f.completion &&
         ggml_backend_sched_moe_decode_buffer(f.activation, host, ggml_nbytes(up->src[2])) &&

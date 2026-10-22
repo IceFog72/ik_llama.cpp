@@ -2054,6 +2054,19 @@ static void common_speculative_apply_draft_affinity(const gpt_params & parsed, c
     }
 }
 
+// Build cparams_dft from a temporary gpt_params, copying the options its raw
+// pointers reference so the later draft-context creation never reads freed memory.
+static void common_speculative_set_cparams_dft(common_params_speculative & params, const gpt_params & params_dft) {
+    params.cparams_dft = common_context_params_to_llama(params_dft);
+    params.cparams_dft.moe_cache_size = 0;
+    params.cuda_params_dft = std::make_shared<const std::string>(params_dft.cuda_params);
+    params.cparams_dft.cuda_params = params.cuda_params_dft->empty() ? nullptr
+            : const_cast<char *>(params.cuda_params_dft->c_str());
+    params.offload_policy_dft = std::make_shared<const std::vector<std::pair<int,int>>>(params_dft.offload_policy);
+    params.cparams_dft.offload_policy = params.offload_policy_dft->empty() ? nullptr
+            : const_cast<std::vector<std::pair<int,int>> *>(params.offload_policy_dft.get());
+}
+
 bool common_speculative_load_draft_model(
         common_params_speculative & params,
         const gpt_params         & params_base) {
@@ -2134,8 +2147,7 @@ bool common_speculative_load_draft_model(
     }
 
     params.model_dft = loaded_model;
-    params.cparams_dft = common_context_params_to_llama(params_dft);
-    params.cparams_dft.moe_cache_size = 0;
+    common_speculative_set_cparams_dft(params, params_dft);
     // draft affinity; inherits the target one when not requested
     const std::vector<int32_t> & cpu_affinity_dft = params.cpu_affinity_configured
         ? params.cpu_affinity
@@ -2204,15 +2216,7 @@ bool common_speculative_prepare_mtp_runtime(
                     params_mtp.moe_resident, params_mtp.moe_resident_mib,
                     params_mtp.moe_resident_zero_fill ? "new" : "old");
         }
-        params.cparams_dft = common_context_params_to_llama(params_mtp);
-        params.cparams_dft.moe_cache_size = 0;
-        if (params.cparams_dft.moe_resident_ubatch && params.cparams_dft.moe_resident < 0) {
-            // params_mtp is local; the copied raw CUDA options pointer must
-            // survive until the predictor backend is constructed.
-            params.adaptive_cuda_params_dft = std::make_shared<const std::string>(params_mtp.cuda_params);
-            params.cparams_dft.cuda_params = params.adaptive_cuda_params_dft->empty() ? nullptr
-                    : const_cast<char *>(params.adaptive_cuda_params_dft->c_str());
-        }
+        common_speculative_set_cparams_dft(params, params_mtp);
         // same draft affinity as the external draft path
         const std::vector<int32_t> & cpu_affinity_dft = params.cpu_affinity_configured
             ? params.cpu_affinity
