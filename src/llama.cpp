@@ -3074,9 +3074,12 @@ static void llm_load_print_meta(llama_model_loader & ml, llama_model & model) {
         LLAMA_LOG_INFO("%s: rope_yarn_log_mul    = %.4f\n",   __func__, hparams.rope_yarn_log_mul);
     }
 
-    if (model.arch == LLM_ARCH_QWEN2MOE) {
+    if (model.arch == LLM_ARCH_QWEN2MOE || model.arch == LLM_ARCH_FLINT) {
+        LLAMA_LOG_INFO("%s: n_layer_dense_lead = %d\n",   __func__, hparams.n_layer_dense_lead);
         LLAMA_LOG_INFO("%s: n_ff_exp         = %d\n",     __func__, hparams.n_ff_exp);
         LLAMA_LOG_INFO("%s: n_ff_shexp       = %d\n",     __func__, hparams.n_ff_shexp);
+        LLAMA_LOG_INFO("%s: expert_weights_norm  = %d\n", __func__, hparams.expert_weights_norm);
+        LLAMA_LOG_INFO("%s: expert_weights_scale = %.1f\n", __func__, hparams.expert_weights_scale);
     }
 
     if (model.arch == LLM_ARCH_QWEN3MOE || model.arch == LLM_ARCH_OPENAI_MOE || model.arch == LLM_ARCH_QWEN3VLMOE) {
@@ -4259,6 +4262,7 @@ static bool is_model_split_supported(const llama_model & model) {
         //LLM_ARCH_QWEN3NEXT,
         LLM_ARCH_QWEN35,
         LLM_ARCH_QWEN35MOE,
+        LLM_ARCH_FLINT,
         LLM_ARCH_GEMMA4,
         LLM_ARCH_GEMMA4_MTP,
         LLM_ARCH_GEMMA4_ASSISTANT,
@@ -9734,14 +9738,14 @@ struct llama_context * llama_init_from_model(
     cparams.n_ubatch         = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     if (cparams.moe_resident_ubatch &&
-            (model->arch != LLM_ARCH_QWEN35MOE || cparams.n_seq_max != 1 ||
+            (cparams.n_seq_max != 1 ||
              params.cb_eval || model->split_mode == LLAMA_SPLIT_MODE_GRAPH ||
              model->split_mode == LLAMA_SPLIT_MODE_ATTN ||
              cparams.n_ubatch > uint32_t(INT_MAX) ||
              cparams.moe_resident_ubatch > cparams.n_ubatch ||
              (cparams.moe_resident_ubatch_auto &&
                 ((cparams.moe_resident_ubatch + 511ull) / 512) * 512 > cparams.n_ubatch))) {
-        LLAMA_LOG_ERROR("%s: adaptive residency workspace requires Qwen3.5 MoE, -np 1, ordinary layer scheduling, "
+        LLAMA_LOG_ERROR("%s: adaptive residency workspace requires -np 1, ordinary layer scheduling, "
                 "no evaluation callback, and a generation ceiling within the prefill limit (-b for auto, -ub otherwise)\n", __func__);
         llama_free(ctx);
         return nullptr;
@@ -10529,6 +10533,7 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
         case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_FLINT:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_MAPLE:
         case LLM_ARCH_QWEN3NEXT:
