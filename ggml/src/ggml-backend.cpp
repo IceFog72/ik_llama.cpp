@@ -1372,6 +1372,7 @@ struct ggml_backend_sched_moe_ffn {
         size_t group = 0;
         ggml_tensor * up = nullptr, * down = nullptr;
         ggml_tensor * join = nullptr;
+        ggml_tensor * pregate = nullptr; // next-layer forecast IDs (opt-in prefetch), never a math input
         bool allow_defer = false;
         bool upload_fenced = false; // prior readers retired; current hits separately protected
         ggml_tensor * banks[3]{};
@@ -1411,6 +1412,7 @@ struct ggml_backend_sched_moe_ffn {
         int64_t host_started = 0, cpu_started = 0;
         ggml_status status = GGML_STATUS_SUCCESS;
         bool cache = false;
+        bool forecast = false; // prediction_experts holds the next layer's forecast
         std::vector<int> missing;
         std::vector<bool> protected_slots;
     } in_flight;
@@ -1612,6 +1614,11 @@ struct ggml_backend_sched_moe_ffn {
                 (unsigned long long)prediction_calls, (unsigned long long)prediction_candidates,
                 (unsigned long long)prediction_selected, (unsigned long long)prediction_correct,
                 (unsigned long long)prediction_uploads, (unsigned long long)prediction_used, learned_routes.size());
+        if (ring_uploads) fprintf(stderr,
+                "ggml_backend_sched: moe-resident new prefetch uploads=%llu installed=%llu waited=%llu hits=%llu unused=%llu promoted=%llu skipped=%llu bytes=%llu\n",
+                (unsigned long long)ring_uploads, (unsigned long long)ring_installed, (unsigned long long)ring_late,
+                (unsigned long long)ring_hits, (unsigned long long)ring_unused, (unsigned long long)ring_promotions,
+                (unsigned long long)ring_skipped, (unsigned long long)ring_bytes);
         if (cpu_batch_rows) fprintf(stderr,
                 "ggml_backend_sched: moe-resident new CPU work rows=%llu unique_experts=%llu masked_quant_rows=%llu compact_routes=yes\n",
                 (unsigned long long)cpu_batch_rows, (unsigned long long)cpu_batch_experts,
@@ -1637,6 +1644,7 @@ struct ggml_backend_sched_moe_ffn {
         const ggml_tensor * bank = nullptr;
         const uint8_t * source = nullptr;
         size_t bytes = 0, offset = 0;
+        bool direct = false; // source is pinned: DMA it without the staging copy
     };
     std::vector<upload_copy> upload_copies;
     ggml_backend_buffer_t upload_staging = nullptr;
@@ -1647,6 +1655,40 @@ struct ggml_backend_sched_moe_ffn {
     bool upload_job = false, upload_stop = false;
     std::atomic<uint64_t> upload_host_us{0};
     uint64_t admission_us = 0;
+    // Opt-in next-layer prefetch ring. Entry i of a group lives at cache index
+    // slots.size() + i in the same bank storage, so one bank descriptor covers
+    // both. Entries are transient: installed for one layer, then retired or
+    // promoted into the cache by a device copy. Only the host thread mutates them.
+    struct ring_entry {
+        int layer = -1, expert = -1;
+        const void * data[3]{};
+        bool installed = false, used = false;
+        ggml_backend_event_t ready = nullptr;
+    };
+    int ring_size = 0; // entries per group: twice the uploads allowed per layer
+    std::vector<std::vector<ring_entry>> rings;
+    ggml_backend_t prefetcher = nullptr; // dedicated copy stream for forecast uploads
+    ggml_backend_event_t ring_fence = nullptr; // compute-stream point a forecast upload waits for
+    ggml_backend_buffer_t pregate_host = nullptr;
+    uint64_t ring_uploads = 0, ring_installed = 0, ring_late = 0, ring_hits = 0;
+    uint64_t ring_unused = 0, ring_promotions = 0, ring_bytes = 0, ring_skipped = 0;
+    void ring_reset() {
+        if (prefetcher) ggml_backend_synchronize(prefetcher);
+        for (auto & ring : rings) for (auto & r : ring) {
+            r.layer = r.expert = -1; r.installed = r.used = false;
+        }
+    }
+    void ring_release() {
+        ring_reset();
+        for (auto & ring : rings) for (auto & r : ring) { ggml_backend_event_free(r.ready); r.ready = nullptr; }
+        rings.clear();
+        ggml_backend_event_free(ring_fence);
+        ring_fence = nullptr;
+        if (prefetcher) ggml_backend_free(prefetcher);
+        prefetcher = nullptr;
+        ggml_backend_buffer_free(pregate_host);
+        pregate_host = nullptr;
+    }
     void ensure_upload_worker() {
         if (upload_worker.joinable()) return;
         upload_worker = std::thread([this] {
@@ -1659,7 +1701,7 @@ struct ggml_backend_sched_moe_ffn {
                 const int64_t started = ggml_time_us();
                 auto * pinned = static_cast<uint8_t *>(ggml_backend_buffer_get_base(upload_staging));
                 size_t offset = 0;
-                for (const auto & copy : upload_copies) if (copy.bytes) {
+                for (const auto & copy : upload_copies) if (copy.bytes && !copy.direct) {
                     ggml_moe_prefetch_wait(copy.bank);
                     std::memcpy(pinned + offset, copy.source, copy.bytes);
                     offset += copy.bytes;
@@ -1668,6 +1710,10 @@ struct ggml_backend_sched_moe_ffn {
                 ggml_backend_event_record(upload_started);
                 offset = 0;
                 for (auto & copy : upload_copies) if (copy.bytes) {
+                    if (copy.direct) {
+                        ggml_backend_tensor_set_async(uploader, &copy.destination, copy.source, copy.offset, copy.bytes);
+                        continue;
+                    }
                     ggml_backend_tensor_set_async(uploader, &copy.destination, pinned + offset, copy.offset, copy.bytes);
                     offset += copy.bytes;
                 }
@@ -1866,6 +1912,7 @@ struct ggml_backend_sched_moe_ffn {
     }
     void clear_cache() {
         finish_upload();
+        ring_reset();
         if (virtual_cache) {
             for (auto & g : groups) for (auto & bank : g.storage) {
                 ggml_backend_buffer_free(bank); bank = nullptr;
@@ -1933,6 +1980,9 @@ struct ggml_backend_sched_moe_ffn {
         wake.notify_one();
     }
     ggml_status finish() {
+        // Avoid an OS wake-up on the decode critical path; the predicate
+        // wait below still owns the result. Advisory only, bounded to 500 us.
+        if (new_policy) ggml_moe_wait_hot(busy, true);
         std::unique_lock<std::mutex> lock(mutex);
         done.wait(lock, [this] { return !busy; });
         return status;
@@ -1950,6 +2000,7 @@ struct ggml_backend_sched_moe_ffn {
         }
         upload_wake.notify_one();
         if (upload_worker.joinable()) upload_worker.join();
+        ring_release();
         clear_cache();
 #ifdef GGML_USE_CUDA
         if (profile_backend) ggml_backend_cuda_moe_profile(profile_backend, nullptr, 0, 0);
@@ -2087,6 +2138,7 @@ struct ggml_backend_sched {
     bool only_active_experts;
     bool moe_resident_zero_fill = false;
     bool moe_resident_grouping = false; // layout-grouped complete cache; shared cache by default
+    int moe_resident_prefetch = 0; // next-layer forecast uploads per layer into the ring (new policy)
     bool moe_resident_adaptive = false;
     bool moe_resident_refresh_pending = false;
     size_t moe_resident_cap_bytes;
@@ -2185,6 +2237,13 @@ void ggml_backend_sched_set_moe_resident_zero_fill(ggml_backend_sched_t sched, b
     if (!sched) return;
     GGML_ASSERT(!sched->is_alloc);
     sched->moe_resident_zero_fill = enabled;
+}
+
+void ggml_backend_sched_set_moe_resident_prefetch(ggml_backend_sched_t sched, int uploads_per_layer) {
+    if (!sched) return;
+    // Ring geometry is fixed for the lifetime of the complete-FFN state.
+    GGML_ASSERT(!sched->is_alloc && !sched->moe_ffn);
+    sched->moe_resident_prefetch = std::max(0, std::min(8, uploads_per_layer));
 }
 
 void ggml_backend_sched_set_moe_resident_grouping(ggml_backend_sched_t sched, bool enabled) {

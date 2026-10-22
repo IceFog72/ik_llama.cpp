@@ -924,6 +924,9 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     if (params.moe_resident_mib > 0 && params.moe_resident != -1) {
         throw std::invalid_argument("error: an MoE resident MiB cap requires auto residency\n");
     }
+    if (params.moe_resident_prefetch > 0 && (params.moe_resident != -1 || !params.moe_resident_zero_fill)) {
+        throw std::invalid_argument("error: --moe-resident-prefetch requires auto residency and --moe-resident-profiler new\n");
+    }
     if (params.moe_resident_ubatch && params.moe_resident > 0) {
         throw std::invalid_argument("error: --moe-resident-ubatch requires auto residency\n");
     }
@@ -2262,6 +2265,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         }
         return true;
     }
+    if (arg == "--moe-resident-prefetch") {
+        CHECK_ARG
+        const std::string value(argv[i]);
+        invalid_param = value.empty() || value.find_first_not_of("0123456789") != std::string::npos || value.size() > 2;
+        if (!invalid_param) params.moe_resident_prefetch = std::stoi(value);
+        invalid_param = invalid_param || params.moe_resident_prefetch > 8;
+        if (invalid_param) fprintf(stderr, "error: --moe-resident-prefetch must be 0..8\n");
+        return true;
+    }
     if (arg == "--moe-resident-profiler") {
         CHECK_ARG
         if (strcmp(argv[i], "old") == 0) params.moe_resident_zero_fill = false;
@@ -3454,6 +3466,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "       --moe-resident [N|auto]", "cache experts on CUDA and split eligible fused single-GPU decode between CPU/CUDA (N: cache cap per CUDA backend in MiB; auto or no value: automatic budget; 0: disabled; default: disabled)" });
     options.push_back({ "*",           "       --moe-resident-ubatch N", "cap generation and follow-up workspace at N tokens until full context reset (0: off; requires auto residency; omitted -ub: auto initial prefill in multiples of 512, up to -b)" });
     options.push_back({ "*",           "       --moe-resident-profiler old|new", "auto residency policy (old: positive-fill profiler; new: routing history, GPU lookup, packed CPU results, background admission and stable cache resizing; default: %s)", params.moe_resident_zero_fill ? "new" : "old" });
+    options.push_back({ "*",           "       --moe-resident-prefetch N", "new profiler only: predict each layer's experts with its router on the previous layer's input and upload up to N missing experts per layer after its CPU join (0: off; default: %d)", params.moe_resident_prefetch });
     options.push_back({ "*",           "       --moe-resident-grouping off|layout", "auto residency cache layout (off: shared slots; layout: separate slots per bank layout; default: %s)", params.moe_resident_grouping ? "layout" : "off" });
     options.push_back({ "*",           "-ger,  --grouped-expert-routing", "enable grouped expert routing (default: %s)", params.grouped_expert_routing ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fug, --no-fused-up-gate",   "disable fused up-gate (default: %s)", params.fused_up_gate ? "enabled" : "disabled" });
@@ -4839,6 +4852,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.moe_resident_ubatch_auto = params.moe_resident_ubatch && !params.n_ubatch_explicit;
     cparams.moe_resident_zero_fill = params.moe_resident_zero_fill;
     cparams.moe_resident_grouping = params.moe_resident_grouping;
+    cparams.moe_resident_prefetch = params.moe_resident_prefetch;
     cparams.only_active_experts = params.only_active_exps;
     cparams.prefetch_experts  = params.prefetch_experts;
     cparams.prefetch_experts_threads = params.prefetch_experts_threads;

@@ -148,6 +148,55 @@ cross-layer wavefront; nearly all CPU completion time remains exposed at the
 join. Evidence is in
 [the prediction results](../.skills/benchmarks/2026-10-14-luna-build-test/warm-diagnosis/mtp-expert-prediction/RESULTS.md).
 
+## Next-layer prefetch
+
+`--moe-resident-prefetch N` (0 to 8, default 0) adds a forecast-driven upload
+ring. It requires `--moe-resident` and `--moe-resident-profiler new`; 0 builds
+the same graph as before.
+
+For one-to-four-token batches, each layer's graph gains one small GPU node:
+the next layer's router applied to `rms_norm(this layer's FFN input)` times the
+next layer's `ffn_norm`. Its top-k IDs are read back with the routing data. On
+Qwen3.6-35B-A3B this forecast matched the real next-layer top-2 at 97.6% and
+top-4 at 94.7%. The forecast IDs never enter arithmetic. The real router still
+selects every expert.
+
+After this layer's CPU join, a dedicated CUDA stream uploads up to N forecast
+experts that are not resident. They go straight from pinned host weights into
+`2*N` extra VRAM ring slots. Starting after the join matters: the upload then
+overlaps the next layer's GPU attention while the CPU is idle. Uploads that
+overlapped CPU experts slowed each CPU expert by 14-25% through host DRAM
+contention. When the next layer is routed, its ring entries join the slot
+mapping. A still-running upload makes only the GPU half of that layer wait on
+the upload event. A used entry that rates higher than its victim moves into the
+cache by a device copy, with no host traffic. A forecast upload waits on a
+compute-stream event recorded after the last readers of its ring slot.
+
+Pinned host banks (`CUDA_Host`) also let ordinary admission DMA directly from
+the source weights. This skips the staging memcpy. Pageable banks keep the
+staged path, and the ring stays inactive (`skipped` counts this).
+The new policy's CPU join spins up to 500 us before it parks.
+
+On 2026-10-23, Qwen3.6-35B-A3B UD-Q4_K_M ran on an RTX 2060 and a Ryzen 7 2700X
+with `-cmoe --moe-resident 2048`. The prompt had 9,578 tokens, then 256 greedy
+tokens were generated. Mean decode speed over interleaved runs:
+
+| `--moe-resident-prefetch` | runs | t/s | `gpu_share` |
+|---|---|---|---|
+| 0 | 4 | 30.2 | 13% |
+| 1 | 2 | 33.4 | 38% |
+| 2 | 4 | 33.9 | 48-54% |
+| 3 | 2 | 29.6 | 57-58% |
+
+N=3 transfers about 5.4 MB per layer. That exceeds the idle window, and router
+wait grows from about 220 to 350 us/layer. The useful N depends on PCIe speed,
+expert size and attention time. Output stayed coherent. The text is not
+bit-identical: a different CPU/GPU split changes floating-point summation
+order, and two baseline runs already differ.
+Shutdown logs report
+`new prefetch uploads= installed= waited= hits= unused= promoted= skipped= bytes=`.
+`waited` counts installs that made the GPU wait for the upload.
+
 ## CPU execution
 
 Eligible CPU misses use a persistent native worker team owned by the scheduler.

@@ -100,8 +100,10 @@ static void resident_bank(ggml_backend_sched_moe_ffn & f, size_t group, int bank
     auto & g = f.groups[group];
     ggml_backend_sched_moe_ffn_bind(tensor, f.virtual_cache ? g.storage[bank] : f.cache);
     if (!f.virtual_cache) tensor.data = static_cast<uint8_t *>(tensor.data) + g.offsets[bank];
-    tensor.ne[2] = int64_t(g.slots.size());
-    tensor.nb[2] = g.strides[bank]; tensor.nb[3] = tensor.nb[2] * g.slots.size();
+    // Prefetch ring entries follow the cache slots in the same storage.
+    const size_t slots = g.slots.size() + (f.rings.empty() ? 0 : size_t(f.ring_size));
+    tensor.ne[2] = int64_t(slots);
+    tensor.nb[2] = g.strides[bank]; tensor.nb[3] = tensor.nb[2] * slots;
 }
 
 static void resident_upload(ggml_backend_sched_moe_ffn & f,
@@ -125,6 +127,11 @@ static void resident_mapping(ggml_backend_sched_t sched, ggml_backend_t gpu, boo
         const auto & s = g.slots[p];
         if (s.layer >= 0 && s.expert >= 0)
             f.mapping_scratch[size_t(s.layer) * sched->moe_resident_n_expert + s.expert] = int32_t(p);
+    }
+    for (size_t gi = 0; gi < f.rings.size(); ++gi) for (size_t i = 0; i < f.rings[gi].size(); ++i) {
+        const auto & r = f.rings[gi][i];
+        if (r.installed) f.mapping_scratch[size_t(r.layer) * sched->moe_resident_n_expert + r.expert] =
+                int32_t(f.groups[gi].slots.size() + i);
     }
     auto map = resident_vector(f.slot_map, GGML_TYPE_I32, f.mapping.size());
     // Keep the reusable DMA source at its stable address. Callers fence the
@@ -168,6 +175,7 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
     if (f.cache && !resize) return true;
     if (f.disabled) return false;
     f.finish(); f.wait_io(); f.finish_upload();
+    f.ring_reset(); // ring entries are rebuilt after any capacity change
     ggml_backend_synchronize(gpu);
     // Prefill can have allocated ordinary projection caches. They are not
     // used by complete-FFN decode and must not reduce its available budget.
@@ -189,6 +197,8 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
     size_t padding = ggml_backend_buffer_get_size(f.slot_map) +
             (f.histogram ? ggml_backend_buffer_get_size(f.histogram) : 0);
     for (const auto & g : f.groups) for (size_t stride : g.strides) if (stride) padding += gran;
+    const size_t ring = size_t(f.ring_size); // prefetch entries per group, outside cache capacity
+    for (const auto & g : f.groups) for (size_t stride : g.strides) padding += ring * stride;
     std::vector<size_t> counts;
     size_t logical_bytes = 0;
     if (f.budget_bytes <= padding || !f.plan_cache(f.budget_bytes - padding,
@@ -269,7 +279,7 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
                 }
                 g.slots.resize(counts[gi]);
                 for (int b = 0; b < 3; ++b) if (g.storage[b] &&
-                        !ggml_backend_cuda_moe_cache_resize(g.storage[b], counts[gi] * g.strides[b])) {
+                        !ggml_backend_cuda_moe_cache_resize(g.storage[b], (counts[gi] + ring) * g.strides[b])) {
                     f.clear_cache(); f.disabled = true; return false;
                 }
             }
@@ -277,10 +287,10 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
         size_t physical = 0;
         for (size_t gi = 0; gi < f.groups.size(); ++gi) {
             auto & g = f.groups[gi];
-            const size_t capacity = size_t(sched->moe_resident_layers) * sched->moe_resident_n_expert;
+            const size_t capacity = size_t(sched->moe_resident_layers) * sched->moe_resident_n_expert + ring;
             for (int b = 0; b < 3; ++b) if (g.strides[b]) {
                 if (!g.storage[b]) g.storage[b] = ggml_backend_cuda_moe_cache_new(device, capacity * g.strides[b]);
-                if (!g.storage[b] || !ggml_backend_cuda_moe_cache_resize(g.storage[b], counts[gi] * g.strides[b])) {
+                if (!g.storage[b] || !ggml_backend_cuda_moe_cache_resize(g.storage[b], (counts[gi] + ring) * g.strides[b])) {
                     f.clear_cache(); f.disabled = true; return false;
                 }
                 physical += ggml_backend_buffer_get_size(g.storage[b]);
@@ -294,12 +304,16 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
         for (size_t gi = 0; gi < f.groups.size(); ++gi) {
             auto & g = f.groups[gi];
             g.slots.resize(counts[gi]);
-            for (int b = 0; b < 3; ++b) { g.offsets[b] = offset; offset += counts[gi] * g.strides[b]; }
+            for (int b = 0; b < 3; ++b) { g.offsets[b] = offset; offset += (counts[gi] + ring) * g.strides[b]; }
         }
-        f.cache = ggml_backend_buft_alloc_buffer(sched->bufts[0], logical_bytes);
+        f.cache = ggml_backend_buft_alloc_buffer(sched->bufts[0], offset);
         if (!f.cache) { f.clear_cache(); f.disabled = true; return false; }
         ggml_backend_buffer_clear(f.cache, 0);
-        f.allocation_bytes = logical_bytes;
+        f.allocation_bytes = offset;
+    }
+    if (ring) {
+        f.rings.resize(f.groups.size());
+        for (auto & r : f.rings) r.resize(ring);
     }
     // Fill vacant slots from bounded conversation history. Existing slots and
     // their physical bytes survive a VMM resize; only genuinely new slots copy.
@@ -351,6 +365,25 @@ static ggml_status resident_gpu_ffn(ggml_backend_sched_moe_ffn & f,
 
 enum class resident_admission { rejected, deferred, submitted };
 
+// Lowest-value slots, refreshed at most once per model pass.
+template <typename value_fn>
+static void resident_refresh_victims(ggml_backend_sched_moe_ffn & f, ggml_backend_sched_moe_ffn::group & g,
+        uint64_t epoch, const value_fn & value) {
+    if (!g.victims.empty() && g.victim_epoch == epoch) return;
+    g.victims.clear();
+    for (size_t pos = 0; pos < g.slots.size(); ++pos) if (g.slots[pos].layer != -2)
+        g.victims.emplace_back(value(g.slots[pos].layer, g.slots[pos].expert), pos);
+    const size_t count = std::min<size_t>(64, g.victims.size());
+    std::partial_sort(g.victims.begin(), g.victims.begin() + count, g.victims.end());
+    g.victims.resize(count);
+    g.victim_epoch = epoch;
+    GGML_UNUSED(f);
+}
+
+static bool resident_pinned(const ggml_tensor * bank) {
+    return bank && bank->buffer && ggml_backend_buffer_get_type(bank->buffer) == ggml_backend_cuda_host_buffer_type();
+}
+
 static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_backend_sched_moe_ffn::task & t,
         const std::vector<int> & missing, const std::vector<bool> & protected_slots, ggml_backend_t gpu,
         bool prediction = false, bool early_fence = false, double window_us = -1) {
@@ -389,15 +422,7 @@ static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_back
     if (std::none_of(candidates.begin(), candidates.end(), [minimum](const auto & c) { return c.first > minimum; })) {
         ++f.admission_rejected; return resident_admission::rejected;
     }
-    if (g.victims.empty() || g.victim_epoch != epoch) {
-        g.victims.clear();
-        for (size_t pos = 0; pos < g.slots.size(); ++pos) if (g.slots[pos].layer != -2)
-            g.victims.emplace_back(value(g.slots[pos].layer, g.slots[pos].expert), pos);
-        const size_t count = std::min<size_t>(64, g.victims.size());
-        std::partial_sort(g.victims.begin(), g.victims.begin() + count, g.victims.end());
-        g.victims.resize(count);
-        g.victim_epoch = epoch;
-    }
+    resident_refresh_victims(f, g, epoch, value);
     std::vector<ggml_backend_sched_moe_ffn::promotion::item> admitted;
     while (!candidates.empty() && admitted.size() < batch_limit) {
         const auto best = std::max_element(candidates.begin(), candidates.end());
@@ -435,7 +460,7 @@ static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_back
     }
     if (admitted.empty()) return resident_admission::rejected;
     size_t staging_bytes = 0;
-    for (auto * bank : t.banks) if (bank) staging_bytes += bank->nb[2];
+    for (auto * bank : t.banks) if (bank && !resident_pinned(bank)) staging_bytes += bank->nb[2];
     const bool setup = !f.uploader || !f.upload_worker.joinable() || !f.upload_staging ||
             ggml_backend_buffer_get_size(f.upload_staging) < staging_bytes * admitted.size();
     const int64_t setup_started = setup ? ggml_time_us() : 0;
@@ -448,7 +473,7 @@ static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_back
     }
     if (!f.upload_started || !f.upload_ready || !f.upload_fence) return resident_admission::deferred;
     if (!ggml_backend_sched_moe_decode_buffer(f.upload_staging,
-            ggml_backend_cuda_host_buffer_type(), staging_bytes * admitted.size())) return resident_admission::deferred;
+            ggml_backend_cuda_host_buffer_type(), std::max<size_t>(1, staging_bytes * admitted.size()))) return resident_admission::deferred;
     f.ensure_upload_worker();
     const int64_t setup_us = setup ? ggml_time_us() - setup_started : 0;
     f.upload_setup_us += setup_us;
@@ -468,6 +493,7 @@ static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_back
             copy.bank = t.banks[bank];
             copy.source = static_cast<const uint8_t *>(copy.bank->data) + size_t(item.entry.expert) * copy.bank->nb[2];
             copy.bytes = copy.bank->nb[2]; copy.offset = item.position * g.strides[bank];
+            copy.direct = resident_pinned(copy.bank); // pinned weights need no staging copy
             f.upload.bytes += copy.bytes; f.upload_copies.push_back(copy);
         }
         slot = {}; slot.layer = -2;
@@ -572,6 +598,143 @@ static void resident_record_token_routes(ggml_backend_sched_t sched,
             ids + token * k, k, sched->moe_resident_layers, experts);
 }
 
+// Opt-in next-layer prefetch ring. Ordering contract (one compute stream, host
+// thread only): a retired entry's last readers (its layer's GPU FFN and any
+// promotion copy) are queued before the ring_fence record that every forecast
+// upload waits on before overwriting an entry. An installed entry makes the
+// compute stream wait on its upload event, so a late upload delays only the
+// GPU half of its layer, which runs alongside that layer's CPU experts.
+static bool resident_position_valid(const ggml_backend_sched_moe_ffn & f, size_t group,
+        const ggml_backend_sched_moe_ffn::task & t, int expert, int position) {
+    const auto & g = f.groups[group];
+    if (size_t(position) < g.slots.size()) return ggml_backend_sched_moe_ffn_match(g.slots[position], t, expert);
+    const size_t i = size_t(position) - g.slots.size();
+    if (group >= f.rings.size() || i >= f.rings[group].size()) return false;
+    const auto & r = f.rings[group][i];
+    if (!r.installed || r.layer != t.layer || r.expert != expert) return false;
+    for (int b = 0; b < 3; ++b) if (r.data[b] != (t.banks[b] ? t.banks[b]->data : nullptr)) return false;
+    return true;
+}
+
+// A used forecast becomes a cache entry by a device copy: no PCIe or host RAM traffic.
+static void resident_ring_promote(ggml_backend_sched_t sched, size_t group, size_t index, ggml_backend_t gpu) {
+    auto & f = *sched->moe_ffn;
+    auto & g = f.groups[group];
+    const auto & r = f.rings[group][index];
+    if (size_t(r.layer) >= f.tasks.size() || !f.tasks[r.layer] || f.tasks[r.layer]->group != group) return;
+    const auto & t = *f.tasks[r.layer];
+    const uint64_t key = (uint64_t(r.layer) << 32) | uint32_t(r.expert);
+    if (g.slot_index.count(key)) return;
+    for (int b = 0; b < 3; ++b) if (r.data[b] != (t.banks[b] ? t.banks[b]->data : nullptr)) return;
+    const int experts = sched->moe_resident_n_expert;
+    size_t bytes = 0; for (size_t stride : g.strides) bytes += stride;
+    if (!bytes || g.slots.empty()) return;
+    const auto value = [&](int layer, int expert) { return f.reuse_value(layer, expert, experts, bytes); };
+    resident_refresh_victims(f, g, f.policy_clock / f.history_layers, value);
+    const double candidate = value(r.layer, r.expert);
+    size_t victim = g.slots.size();
+    for (auto it = g.victims.begin(); it != g.victims.end(); ++it) {
+        const size_t pos = it->second;
+        if (pos >= g.slots.size()) continue;
+        const auto & s = g.slots[pos];
+        if (s.layer == -2 || f.slot_protected(s)) continue;
+        if (s.layer >= 0) {
+            const size_t id = size_t(s.layer) * experts + s.expert;
+            if (id < f.forecast_probability.size() && f.forecast_probability[id] >= 0.75) continue;
+            if (candidate <= 1.25 * value(s.layer, s.expert)) break; // shortlist is ascending
+        }
+        victim = pos;
+        g.victims.erase(it);
+        break;
+    }
+    if (victim == g.slots.size()) return;
+    const size_t source = g.slots.size() + index;
+    for (int b = 0; b < 3; ++b) if (g.strides[b] && t.banks[b]) {
+        auto * buffer = f.virtual_cache ? g.storage[b] : f.cache;
+        const size_t base = f.virtual_cache ? 0 : g.offsets[b];
+        ggml_backend_cuda_moe_cache_move(gpu, buffer, base + victim * g.strides[b], base + source * g.strides[b], g.strides[b]);
+        f.d2d_bytes += g.strides[b];
+    }
+    auto & s = g.slots[victim];
+    if (s.layer >= 0) { g.slot_index.erase((uint64_t(s.layer) << 32) | uint32_t(s.expert)); ++f.evictions; }
+    s = {};
+    s.layer = r.layer; s.expert = r.expert; s.used = ++f.clock;
+    s.admitted_at = f.policy_clock;
+    s.admission_cost_us = double(bytes) / 3e5; // device copy at roughly 300 GB/s
+    for (int b = 0; b < 3; ++b) { s.banks[b] = t.banks[b]; s.data[b] = r.data[b]; }
+    g.slot_index[key] = int(victim);
+    ++f.ring_promotions; ++f.promotions;
+    f.mapping_dirty = true;
+}
+
+// At each layer: install this layer's completed forecasts, retire all others.
+static void resident_ring_service(ggml_backend_sched_t sched, int layer, ggml_backend_t gpu) {
+    auto & f = *sched->moe_ffn;
+    for (size_t gi = 0; gi < f.rings.size(); ++gi) for (size_t i = 0; i < f.rings[gi].size(); ++i) {
+        auto & r = f.rings[gi][i];
+        if (r.layer < 0) continue;
+        if (r.layer == layer) {
+            if (!r.installed && r.ready) {
+                if (!ggml_backend_cuda_moe_event_ready(r.ready)) { ggml_backend_event_wait(gpu, r.ready); ++f.ring_late; }
+                r.installed = true; ++f.ring_installed; f.mapping_dirty = true;
+            }
+            continue;
+        }
+        if (r.installed && r.used) resident_ring_promote(sched, gi, i, gpu);
+        else ++f.ring_unused;
+        if (r.installed) f.mapping_dirty = true;
+        r.layer = r.expert = -1; r.installed = r.used = false;
+    }
+}
+
+// Upload up to N predicted, non-resident experts of the next layer from pinned
+// host weights. Runs on its own stream during this layer's CPU work.
+static void resident_ring_prefetch(ggml_backend_sched_t sched, const ggml_backend_sched_moe_ffn::task & t,
+        ggml_backend_t gpu, const int32_t * forecast, int count) {
+    auto & f = *sched->moe_ffn;
+    const int next = t.layer + 1;
+    if (f.rings.empty() || next >= int(f.tasks.size()) || !f.tasks[next] || !f.live_task(*f.tasks[next])) return;
+    const auto & nt = *f.tasks[next];
+    for (auto * bank : nt.banks) if (bank && !resident_pinned(bank)) { ++f.ring_skipped; return; }
+    auto & g = f.groups[nt.group];
+    auto & ring = f.rings[nt.group];
+    if (!f.prefetcher) {
+        f.prefetcher = ggml_backend_cuda_init(ggml_backend_cuda_get_device(gpu), nullptr, &f);
+        if (!f.prefetcher) return;
+    }
+    if (!f.ring_fence && !(f.ring_fence = ggml_backend_event_new(gpu))) return;
+    const int experts = sched->moe_resident_n_expert;
+    bool fenced = false;
+    int issued = 0;
+    for (int i = 0; i < count && issued < sched->moe_resident_prefetch; ++i) {
+        const int e = forecast[i];
+        if (e < 0 || e >= experts || f.mapping[size_t(next) * experts + e] >= 0) continue;
+        if (std::any_of(ring.begin(), ring.end(), [&](const auto & r) { return r.layer == next && r.expert == e; })) continue;
+        const auto entry = std::find_if(ring.begin(), ring.end(), [](const auto & r) { return r.layer < 0; });
+        if (entry == ring.end()) break;
+        if (!entry->ready && !(entry->ready = ggml_backend_event_new(f.prefetcher))) break;
+        if (!fenced) {
+            ggml_backend_event_record(f.ring_fence);
+            ggml_backend_event_wait(f.prefetcher, f.ring_fence);
+            fenced = true;
+        }
+        const size_t position = g.slots.size() + size_t(entry - ring.begin());
+        for (int b = 0; b < 3; ++b) {
+            auto * bank = nt.banks[b];
+            entry->data[b] = bank ? bank->data : nullptr;
+            if (!bank) continue;
+            auto destination = *bank;
+            resident_bank(f, nt.group, b, destination);
+            ggml_backend_tensor_set_async(f.prefetcher, &destination,
+                    static_cast<const uint8_t *>(bank->data) + size_t(e) * bank->nb[2], position * g.strides[b], bank->nb[2]);
+            f.ring_bytes += bank->nb[2];
+        }
+        ggml_backend_event_record(entry->ready);
+        entry->layer = next; entry->expert = e; entry->installed = entry->used = false;
+        ++issued; ++f.ring_uploads;
+    }
+}
+
 static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
     auto & f = *sched->moe_ffn;
     auto & call = f.in_flight;
@@ -625,9 +788,13 @@ static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
         ggml_backend_synchronize(gpu); call.owner = nullptr; return status;
     }
     call.owner = nullptr; // result is queued; future uploads use the stream fence
+    // Start next-layer forecast DMA after the CPU join: it then overlaps the GPU
+    // attention gap instead of competing with CPU experts for host DRAM.
+    if (cache && call.forecast)
+        resident_ring_prefetch(sched, t, gpu, f.prediction_experts.data(), int(f.prediction_experts.size()));
     const int64_t admission_started = ggml_time_us();
     if (cache) {
-        resident_prefetch_prediction(sched, gpu, t.layer);
+        if (f.rings.empty()) resident_prefetch_prediction(sched, gpu, t.layer);
         resident_promote(sched, t, missing, protected_slots, gpu);
     }
     f.admission_us += ggml_time_us() - admission_started;
@@ -665,6 +832,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
             ggml_backend_cuda_moe_event_ready(f.upload_ready)) {
         f.publish_upload();
     }
+    if (cache && !f.rings.empty()) resident_ring_service(sched, t.layer, gpu);
     if (cache && f.mapping_dirty) {
         const int64_t started = ggml_time_us();
         f.wait_io(); // mapping is a reusable asynchronous DMA source
@@ -677,8 +845,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     std::vector<int> stale;
     for (int e = 0; e < experts; ++e) {
         const int position = f.mapping[size_t(t.layer) * experts + e];
-        if (position >= 0 && (size_t(position) >= g.slots.size() ||
-                !ggml_backend_sched_moe_ffn_match(g.slots[position], t, e))) {
+        if (position >= 0 && !resident_position_valid(f, t.group, t, e, position)) {
             stale.push_back(e);
             complete = false;
             continue;
@@ -694,8 +861,13 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         f.mapping_wait_us += ggml_time_us() - started;
         for (int e : stale) {
             const int position = f.mapping[size_t(t.layer) * experts + e];
-            g.slot_index.erase((uint64_t(t.layer) << 32) | uint32_t(e));
-            if (size_t(position) < g.slots.size()) g.slots[position] = {};
+            if (size_t(position) < g.slots.size()) {
+                g.slot_index.erase((uint64_t(t.layer) << 32) | uint32_t(e));
+                g.slots[position] = {};
+            } else if (t.group < f.rings.size() && size_t(position) - g.slots.size() < f.rings[t.group].size()) {
+                auto & r = f.rings[t.group][size_t(position) - g.slots.size()];
+                r.layer = r.expert = -1; r.installed = r.used = false;
+            }
         }
         resident_mapping(sched, gpu, true);
     }
@@ -739,6 +911,10 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     // transfer the small pinned inputs, rather than a kernel writing host RAM.
     ggml_backend_tensor_get_async(gpu, t.up->src[3], ids, 0, ggml_nbytes(&t.host_ids));
     ggml_backend_tensor_get_async(gpu, t.up->src[2], t.host_act.data, 0, ggml_nbytes(&t.host_act));
+    const bool forecast = cache && !f.rings.empty() && t.pregate && t.pregate->buffer &&
+            !ggml_backend_buffer_is_host(t.pregate->buffer) &&
+            ggml_backend_sched_moe_decode_buffer(f.pregate_host, ggml_backend_cuda_host_buffer_type(), ggml_nbytes(t.pregate));
+    if (forecast) ggml_backend_tensor_get_async(gpu, t.pregate, ggml_backend_buffer_get_base(f.pregate_host), 0, ggml_nbytes(t.pregate));
     ++f.fallback_routes;
     ggml_backend_event_record(f.router_ready);
     if (!f.upload.pending && f.upload_fence) {
@@ -777,7 +953,12 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         if (e < 0 || e >= experts) { f.cpu_ids[row] = -1; continue; }
         const size_t i = size_t(t.layer) * experts + e;
         const int p = cache ? f.mapping[i] : -1;
-        if (p >= 0) {
+        if (p >= 0 && size_t(p) >= g.slots.size()) {
+            // Forecast hit in the ring; the entry is retired after this layer.
+            f.gpu_ids[row] = p; f.cpu_ids[row] = -1;
+            f.rings[t.group][size_t(p) - g.slots.size()].used = true;
+            ++gpu_count; ++f.hits; ++f.ring_hits;
+        } else if (p >= 0) {
             f.gpu_ids[row] = p; f.cpu_ids[row] = -1; protected_slots[p] = true;
             if (g.slots[p].predicted) { ++f.prediction_used; g.slots[p].predicted = false; }
             g.slots[p].used = ++f.clock;
@@ -838,12 +1019,20 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     // Submit only optional future-layer replacement here. Its old-reader
     // fence precedes current GPU hits, which remain protected; DMA may overlap this CPU job
     // and subsequently queued shared work. Current hits remain protected.
-    if (cpu_work && cache) resident_prefetch_prediction(sched, gpu, t.layer, &t, &protected_slots, cpu_started);
+    if (forecast) {
+        // Rank-major across verification tokens: every token's best guess first.
+        const auto * predicted = static_cast<const int32_t *>(ggml_backend_buffer_get_base(f.pregate_host));
+        const int ranks = int(t.pregate->ne[0]), rows = int(t.pregate->ne[1]);
+        f.prediction_experts.clear();
+        for (int r = 0; r < ranks; ++r) for (int j = 0; j < rows; ++j) f.prediction_experts.push_back(predicted[j * ranks + r]);
+    } else if (cpu_work && cache) {
+        resident_prefetch_prediction(sched, gpu, t.layer, &t, &protected_slots, cpu_started);
+    }
     auto & call = f.in_flight;
     call.owner = &t; call.gpu = gpu; call.tokens = tokens; call.k = k;
     call.cpu_count = cpu_count; call.gpu_count = gpu_count;
     call.cpu_started = cpu_started; call.host_started = host_started; call.status = status;
-    call.cache = cache;
+    call.cache = cache; call.forecast = forecast;
     call.missing = std::move(missing); call.protected_slots = std::move(protected_slots);
     if (status == GGML_STATUS_SUCCESS && cpu_work && t.allow_defer) {
         ++f.deferred_layers;

@@ -487,6 +487,7 @@ struct gpt_params {
     uint32_t moe_resident_ubatch = 0; // generation workspace ceiling; 0 disables adaptive workspace
     bool moe_resident_zero_fill = false; // false: old profiler; true: reuse-aware residency policy
     bool moe_resident_grouping = false; // layout-grouped complete cache; shared cache by default
+    int  moe_resident_prefetch = 0; // next-layer expert prefetch uploads per layer (0 = off; requires auto residency, profiler new)
     bool merge_qkv         = false; // if true, merge separate Q, K, V tensors into a single, contiguous tensor
     bool merge_up_gate_exps= false; // if true, merge ffn_up_exps and ffn_gate_exps into a single, contiguous tensor
     bool defer_experts     = false; // if true, defer expert mmap residency to speed up model loading (Linux only)

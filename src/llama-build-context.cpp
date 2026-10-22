@@ -1952,6 +1952,26 @@ llm_expert_gating_func_type   gating_op,
         if (cur->type != GGML_TYPE_F32) {
             cur = ggml_cast(ctx, cur, GGML_TYPE_F32);
         }
+        // Opt-in residency forecast: the next layer's router applied to this
+        // layer's FFN input predicts its experts well. The scheduler uploads
+        // predicted misses during this layer's CPU work; the IDs never enter math.
+        if (lctx.cparams.moe_resident_prefetch > 0 && input->type == GGML_TYPE_F32 &&
+                input->ne[1] >= 1 && input->ne[1] <= 4 && il >= 0 &&
+                ffn_norm == lctx.model.layers[il].ffn_norm && !ffn_norm->extra) {
+            const int n_target = int(lctx.model.hparams.n_layer) - int(lctx.model.hparams.nextn_predict_layers);
+            const auto * next = il + 1 < n_target ? &lctx.model.layers[il + 1] : nullptr;
+            if (next && next->ffn_gate_inp && !next->ffn_gate_inp->extra && next->ffn_norm && !next->ffn_norm->extra &&
+                    next->ffn_gate_inp->ne[0] == input->ne[0] && next->ffn_gate_inp->ne[1] == n_expert &&
+                    next->ffn_norm->ne[0] == input->ne[0]) {
+                auto * x = ggml_mul(ctx, ggml_rms_norm(ctx, input, lctx.model.hparams.f_norm_rms_eps), next->ffn_norm);
+                auto * pred = ggml_cont(ctx, ggml_top_k(ctx, ggml_mul_mat(ctx, next->ffn_gate_inp, x), n_expert_used));
+                pred->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_MOE_RESIDENT_PREGATE;
+                pred->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2] = il;
+                ggml_set_output(pred);
+                cb(pred, "ffn_moe_pregate", il);
+                ggml_build_forward_expand(graph, pred);
+            }
+        }
         auto the_gate_inp = gate_inp->extra ? ((ggml_split_tensor_t *)gate_inp->extra)->splits[lctx.model.main_gpu] : gate_inp;
         auto the_gate_inp_b = gate_inp_b ? gate_inp_b->extra ? ((ggml_split_tensor_t *)gate_inp_b->extra)->splits[lctx.model.main_gpu] : gate_inp_b : nullptr;
         auto the_exp_probs_b = exp_probs_b ? exp_probs_b->extra ? ((ggml_split_tensor_t *)exp_probs_b->extra)->splits[lctx.model.main_gpu] : exp_probs_b : nullptr;

@@ -8,6 +8,9 @@ enum {
     GGML_MOE_RESIDENT_DEFERRED_DOWN = 0x52534e44,
     GGML_MOE_RESIDENT_SHARED = 0x52534e53,
     GGML_MOE_RESIDENT_CPU_ROUTES = 0x52534e43,
+    // Next-layer expert forecast (IDs only, never an arithmetic input). The
+    // second-to-last op parameter holds the producing layer.
+    GGML_MOE_RESIDENT_PREGATE = 0x52534e46,
     GGML_MOE_RESIDENT_JOIN = 0xff,
 };
 

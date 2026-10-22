@@ -2211,6 +2211,7 @@ bool common_speculative_prepare_mtp_runtime(
                 params_mtp.moe_resident_mib = overrides.moe_resident_mib;
                 params_mtp.moe_resident_zero_fill = overrides.moe_resident_zero_fill;
                 params_mtp.moe_resident_grouping = overrides.moe_resident_grouping;
+                params_mtp.moe_resident_prefetch = overrides.moe_resident_prefetch;
             }
             LOG_INF("%s: embedded predictor residency=%d cap=%d MiB profiler=%s\n", __func__,
                     params_mtp.moe_resident, params_mtp.moe_resident_mib,

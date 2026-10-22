@@ -61,6 +61,17 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
     std::set<int> seen_layers;
     for (int i = 0; i < graph->n_nodes; ++i)
         for (auto * src : graph->nodes[i]->src) if (src) ++uses[src];
+    // Opt-in next-layer forecasts, keyed by the layer that produces them.
+    std::unordered_map<int, ggml_tensor *> pregates;
+    if (new_policy && sched->moe_resident_prefetch > 0) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            auto * node = graph->nodes[i];
+            if (node->op == GGML_OP_CONT && node->type == GGML_TYPE_I32 && ggml_is_contiguous(node) &&
+                    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_MOE_RESIDENT_PREGATE) {
+                pregates[node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2]] = node;
+            }
+        }
+    }
     for (int i = 0; i + 1 < graph->n_nodes; ++i) {
         auto * up = graph->nodes[i], * down = graph->nodes[i + 1];
         if (up->op != GGML_OP_MOE_FUSED_UP_GATE) continue;
@@ -68,7 +79,10 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
                 up->src[3]->type == GGML_TYPE_I32 && ggml_is_contiguous(up->src[3])) {
             int observed_layer = -1;
             if (ggml_backend_sched_moe_parse_layer_id(up->src[0], sched->moe_resident_layers, observed_layer)) {
-                if (!sched->moe_ffn) sched->moe_ffn = new ggml_backend_sched_moe_ffn;
+                if (!sched->moe_ffn) {
+                    sched->moe_ffn = new ggml_backend_sched_moe_ffn;
+                    sched->moe_ffn->ring_size = 2 * sched->moe_resident_prefetch;
+                }
                 sched->moe_ffn->new_policy = true;
                 sched->moe_ffn->observations[up] = observed_layer;
             }
@@ -149,7 +163,10 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
                 ++sched->moe_ffn_qualified_layers;
             }
         }
-        if (!sched->moe_ffn) sched->moe_ffn = new ggml_backend_sched_moe_ffn;
+        if (!sched->moe_ffn) {
+            sched->moe_ffn = new ggml_backend_sched_moe_ffn;
+            sched->moe_ffn->ring_size = new_policy ? 2 * sched->moe_resident_prefetch : 0;
+        }
         auto & f = *sched->moe_ffn;
         f.new_policy = new_policy;
         if (repeated_layers.count(layer)) { note(sched->MOE_FFN_R_REPEATED); continue; }
@@ -217,6 +234,8 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
         auto & t = *f.tasks[layer];
         t.layer = layer; t.group = group; t.up = up; t.down = down;
         t.join = nullptr; t.allow_defer = false;
+        const auto pregate = pregates.find(layer);
+        t.pregate = pregate != pregates.end() && pregate->second->ne[1] == act->ne[2] ? pregate->second : nullptr;
         if (new_policy && down->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_MOE_RESIDENT_DEFERRED_DOWN) {
             for (int j = i + 2; j < graph->n_nodes; ++j) {
                 auto * consumer = graph->nodes[j];
