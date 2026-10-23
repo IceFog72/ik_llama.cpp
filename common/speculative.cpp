@@ -1194,7 +1194,7 @@ static common_speculative_state_ngram_cache create_state_ngram_cache(
     bool save_static = false;
     bool save_dynamic = false;
 
-    common_speculative_state_ngram_cache state(config.type, path_static, path_dynamic, save_static, save_dynamic);
+    common_speculative_state_ngram_cache state(config.type, path_static, path_dynamic, save_dynamic, save_static);
 
     return state;
 }

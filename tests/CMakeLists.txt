@@ -124,6 +124,8 @@ llama_test(test-sampling-history)
 
 llama_build(test-ngram-cache.cpp)
 llama_test(test-ngram-cache)
+llama_build(test-ngram-cache-sync.cpp)
+llama_test(test-ngram-cache-sync)
 
 # build test-tokenizer-0 target once and add many tests
 add_executable(test-tokenizer-0 test-tokenizer-0.cpp)

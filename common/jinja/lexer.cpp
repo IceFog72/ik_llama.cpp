@@ -1,7 +1,6 @@
 #include "lexer.h"
 #include "runtime.h"
-
-#include "../unicode.h"
+#include "unicode.h"
 
 #include <cctype>
 #include <charconv>
@@ -79,7 +78,6 @@ lexer_result lexer::tokenize(const std::string & source) {
                 // add escaped char
                 char escaped_char = src[pos++];
                 if (escaped_char == 'x') {
-                    // Java-style hexadecimal string escape (e.g. "\x00" in the flint chat template)
                     if (pos + 1 >= src.size()) {
                         throw lexer_exception("incomplete hexadecimal escape", source, pos);
                     }
