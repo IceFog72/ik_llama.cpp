@@ -7388,6 +7388,14 @@ static void llama_resident_workspace_generation(llama_context & ctx) {
     }
 }
 
+// Output rows to reserve for an adaptive-workspace graph of n_tokens. An MTP
+// target outputs every prompt row for its predictor; reserving only -wgt rows
+// lets the arena outgrow the reservation at runtime and run out of VRAM.
+static int llama_resident_reserve_outputs(const llama_context & ctx, uint32_t n_tokens) {
+    return llama_context_has_mtp_outputs(ctx) && ctx.cparams.mtp_op_type == MTP_OP_NONE
+            ? int(n_tokens) : ctx.cparams.worst_graph_tokens;
+}
+
 static bool llama_adapt_resident_workspace(llama_context & lctx, uint32_t demand) {
     if (!lctx.cparams.moe_resident_ubatch) return true;
 #ifdef GGML_USE_CUDA
@@ -7424,7 +7432,7 @@ static bool llama_adapt_resident_workspace(llama_context & lctx, uint32_t demand
         ctx.reset_scheduler();
         llama_token token = llama_token_bos(&ctx.model);
         auto batch = llama_batch_get_one(&token, n, ctx.cparams.n_ctx - n, 0);
-        return llm_build_context::llama_build_graph(ctx, batch, true, ctx.cparams.worst_graph_tokens);
+        return llm_build_context::llama_build_graph(ctx, batch, true, llama_resident_reserve_outputs(ctx, n));
     };
     // Predictor warmup can use the whole microbatch. Its one-token generation
     // graph must not be used to estimate the prefill allocation.
@@ -7525,10 +7533,12 @@ static bool llama_adapt_resident_workspace(llama_context & lctx, uint32_t demand
         ctx->prefill_ubatch = prefill ? chosen : 0;
         new_bytes += ggml_backend_sched_get_buffer_size(ctx->sched, ctx->backends[0]);
     }
-    LLAMA_LOG_INFO("%s: %s ubatch=%u contexts=%zu context=%u compute=%.2f->%.2f MiB idle_scratch_released=%.2f MiB handoff=%.2f ms\n",
+    size_t free_after = 0;
+    ggml_backend_cuda_get_device_memory(ggml_backend_cuda_get_device(root->backends[0]), &free_after, &total_bytes);
+    LLAMA_LOG_INFO("%s: %s ubatch=%u contexts=%zu context=%u compute=%.2f->%.2f MiB idle_scratch_released=%.2f MiB free=%zu->%zu MiB handoff=%.2f ms\n",
             __func__, prefill ? "prefill" : "generation", chosen, contexts.size(), root->cparams.n_ctx,
-            old_bytes / 1048576.0, new_bytes / 1048576.0, scratch_bytes / 1048576.0, (ggml_time_us() - started) / 1000.0);
-    GGML_UNUSED(total_bytes);
+            old_bytes / 1048576.0, new_bytes / 1048576.0, scratch_bytes / 1048576.0,
+            free_bytes / 1048576, free_after / 1048576, (ggml_time_us() - started) / 1000.0);
     return true;
 #else
     GGML_UNUSED(demand);
@@ -9480,7 +9490,8 @@ static int llama_moe_offload_calibrate(llama_context & ctx, const llama_layer & 
     };
     constexpr int b1 = 64, b2 = 512;
     cpu_us(b1); // first touch of the weights (page faults with mmap)
-    const double t1 = cpu_us(b1), t2 = cpu_us(b2);
+    // Best of two: other processes only ever add time.
+    const double t1 = std::min(cpu_us(b1), cpu_us(b1)), t2 = std::min(cpu_us(b2), cpu_us(b2));
     const double per_token = (t2 - t1) / (b2 - b1), fixed = t1 - per_token * b1;
     if (t1 <= 0 || t2 <= 0 || per_token <= 0) {
         LLAMA_LOG_WARN("%s: expert offload calibration failed; keeping the offload-batch-size rule\n", __func__);
@@ -10432,7 +10443,8 @@ struct llama_context * llama_init_from_model(
                 llama_free(ctx);
                 return nullptr;
             }
-            ggml_cgraph * gf = llm_build_context::llama_build_graph(*ctx, reserve_batch, true, cparams.worst_graph_tokens);
+            ggml_cgraph * gf = llm_build_context::llama_build_graph(*ctx, reserve_batch, true,
+                    cparams.moe_resident_ubatch ? llama_resident_reserve_outputs(*ctx, n_tokens) : cparams.worst_graph_tokens);
             if (gf == nullptr) {
                 llama_free(ctx);
                 return nullptr;

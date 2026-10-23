@@ -180,6 +180,9 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
         resize = true;
     }
     if (f.disabled) return false;
+    // After a workspace transition, do not rebuild a full plan's cache for such
+    // a partial graph; its lone FFN runs on the CPU path until decode.
+    if (!f.cache && !resize && live_tasks < f.planned_tasks) return false;
     f.finish(); f.wait_io(); f.finish_upload();
     f.ring_reset(); // ring entries are rebuilt after any capacity change
     ggml_backend_synchronize(gpu);

@@ -60,6 +60,11 @@ the upload is not counted). Dense ops keep the `offload-batch-size` rule. The lo
 line `expert offload: upload ... -> offload from N tokens` reports the result,
 and `adaptive generation ceiling 512 -> N` reports a raised ceiling.
 
+With embedded MTP the target outputs every prompt row for its predictor. Its
+adaptive graphs are therefore measured and reserved with all rows as outputs,
+not `-wgt` rows; otherwise the arena outgrew the reservation at runtime and a
+2048-token prefill ran out of VRAM.
+
 ## Refresh at the start of a response
 
 `llama-server` calls `llama_moe_resident_begin_generation()` once per response
