@@ -172,7 +172,13 @@ static std::vector<resident_candidate> resident_candidates(ggml_backend_sched_t 
 static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
         ggml_backend_t gpu, bool resize) {
     auto & f = *sched->moe_ffn;
-    if (f.cache && !resize) return true;
+    // A prefill ubatch can expose only its last layer as a one-token FFN, which
+    // creates the cache with a one-layer plan. Re-plan once a graph has more.
+    const size_t live_tasks = f.graph_tasks.size() / 2;
+    if (f.cache && !resize) {
+        if (live_tasks <= f.planned_tasks) return true;
+        resize = true;
+    }
     if (f.disabled) return false;
     f.finish(); f.wait_io(); f.finish_upload();
     f.ring_reset(); // ring entries are rebuilt after any capacity change
@@ -241,7 +247,7 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
     }
     if (f.cache && !f.virtual_cache) {
         // Platforms without VMM keep a fitting cache; growth is deferred.
-        if (f.allocation_bytes <= f.budget_bytes) return true;
+        if (f.allocation_bytes <= f.budget_bytes) { f.planned_tasks = live_tasks; return true; }
         f.remember_cache(); f.clear_cache();
     }
     f.remember_cache();
@@ -336,8 +342,10 @@ static bool ggml_backend_sched_moe_new_cache(ggml_backend_sched_t sched,
     for (auto & g : f.groups) { g.victims.clear(); g.victim_epoch = UINT64_MAX; }
     resident_mapping(sched, gpu);
     ggml_backend_synchronize(gpu);
-    fprintf(stderr, "ggml_backend_sched: moe-resident new cache=%zu MiB slots=%zu stable=%s history=%zu\n",
-            f.allocation_bytes / 1048576, f.slot_count(), f.virtual_cache ? "yes" : "no", candidates.size());
+    f.planned_tasks = live_tasks;
+    fprintf(stderr, "ggml_backend_sched: moe-resident new cache=%zu MiB slots=%zu layers=%zu budget=%zu MiB stable=%s history=%zu\n",
+            f.allocation_bytes / 1048576, f.slot_count(), live_tasks, f.budget_bytes / 1048576,
+            f.virtual_cache ? "yes" : "no", candidates.size());
     GGML_UNUSED(total);
     return true;
 }
@@ -714,7 +722,7 @@ static void resident_ring_prefetch(ggml_backend_sched_t sched, const ggml_backen
         if (entry == ring.end()) break;
         if (!entry->ready && !(entry->ready = ggml_backend_event_new(f.prefetcher))) break;
         if (!fenced) {
-            ggml_backend_event_record(f.ring_fence);
+            if (!f.ring_fence_ready) ggml_backend_event_record(f.ring_fence);
             ggml_backend_event_wait(f.prefetcher, f.ring_fence);
             fenced = true;
         }
@@ -733,6 +741,55 @@ static void resident_ring_prefetch(ggml_backend_sched_t sched, const ggml_backen
         entry->layer = next; entry->expert = e; entry->installed = entry->used = false;
         ++issued; ++f.ring_uploads;
     }
+    f.ring_fence_ready = false;
+}
+
+// Device join: one pinned word pair per scheduler, probed once with a gate that
+// passes at once. False keeps the host join (unsupported GPU or allocation failure).
+static bool resident_gate_ready(ggml_backend_sched_t sched, ggml_backend_t gpu) {
+    auto & f = *sched->moe_ffn;
+    if (!sched->moe_resident_device_join) return false;
+    if (f.gate_words) return true;
+    if (f.gate_buffer) return false; // probe failed earlier
+    f.gate_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), 64);
+    if (!f.gate_buffer) { sched->moe_resident_device_join = false; return false; }
+    auto * words = static_cast<uint32_t *>(ggml_backend_buffer_get_base(f.gate_buffer));
+    words[0] = words[1] = 0;
+    if (!ggml_backend_cuda_moe_gate(gpu, &words[0], 0, &words[1])) {
+        fprintf(stderr, "ggml_backend_sched: moe-resident device join unsupported on this GPU; using host join\n");
+        return false;
+    }
+    f.gate_words = words; f.gate_value = 0;
+    return true;
+}
+
+// Device join publication: queue this layer's CPU-result upload behind a GPU
+// wait on the worker's release. The host continues with later splits. The job
+// is settled (joined, measured, admitted) at the next point needing the CPU.
+static void resident_publish_gated(ggml_backend_sched_moe_ffn & f, ggml_backend_sched_moe_ffn::task & t,
+        ggml_backend_t gpu, size_t gpu_count) {
+    auto & call = f.in_flight;
+    ggml_backend_cuda_moe_gate(gpu, &f.gate_words[0], t.gate_value, &f.gate_words[1]);
+    if (gpu_count) {
+        const size_t bytes = t.pack_rows.size() * t.host_down.nb[1];
+        t.device_cpu = *t.down;
+        ggml_backend_sched_moe_ffn_bind(t.device_cpu, f.device_cpu);
+        ggml_backend_tensor_set_async(gpu, &t.device_cpu, t.pack_dst, 0, bytes);
+        ggml_backend_cuda_moe_scatter(gpu, t.down, &t.device_cpu, &t.device_ids);
+        f.result_bytes += bytes; f.packed_result_bytes += bytes;
+    } else {
+        ggml_backend_tensor_set_async(gpu, t.down, t.host_down.data, 0, ggml_nbytes(&t.host_down));
+        f.result_bytes += ggml_nbytes(&t.host_down);
+    }
+    // Retired ring entries' readers are all queued now. A forecast upload issued
+    // at settle time must not wait for the next layer's attention as well.
+    if (call.cache && call.forecast && !f.rings.empty() &&
+            (f.ring_fence || (f.ring_fence = ggml_backend_event_new(gpu)))) {
+        ggml_backend_event_record(f.ring_fence);
+        f.ring_fence_ready = true;
+    }
+    call.published = true; call.published_us = ggml_time_us();
+    ++f.gated_layers;
 }
 
 static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
@@ -748,10 +805,16 @@ static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
     const bool cache = call.cache;
     const auto & missing = call.missing;
     const auto & protected_slots = call.protected_slots;
+    if (call.gated && !call.published) {
+        resident_publish_gated(f, t, gpu, gpu_count);
+        return GGML_STATUS_SUCCESS;
+    }
     if (cpu_count || !gpu_count) {
         const int64_t join_started = ggml_time_us();
         const auto cpu_status = f.finish();
-        const int64_t exposed = std::max<int64_t>(1, ggml_time_us() - join_started);
+        // Device join: the GPU, not the host, waited from publication to CPU completion.
+        const int64_t exposed = std::max<int64_t>(1, call.gated
+                ? f.cpu_finished_us - call.published_us : ggml_time_us() - join_started);
         if (t.allow_defer) f.deferred_join_us += exposed;
         // Independent GPU work may outlast this job. Admission must use CPU
         // execution time, not the later time at which its consumer joins it.
@@ -760,7 +823,12 @@ static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
         f.observe_cpu_cost(t.layer, tokens, cpu_count, double(elapsed), double(exposed),
                 sched->moe_resident_n_expert_used);
         if (status == GGML_STATUS_SUCCESS) status = cpu_status;
-        if (status == GGML_STATUS_SUCCESS && gpu_count) {
+        if (call.gated) {
+            if (status == GGML_STATUS_SUCCESS && __atomic_load_n(&f.gate_words[1], __ATOMIC_ACQUIRE)) {
+                fprintf(stderr, "ggml_backend_sched: moe-resident device join timed out\n");
+                status = GGML_STATUS_FAILED;
+            }
+        } else if (status == GGML_STATUS_SUCCESS && gpu_count) {
             if (!ggml_backend_sched_moe_decode_buffer(f.packed_output,
                     ggml_backend_cuda_host_buffer_type(), ggml_nbytes(&t.host_down))) {
                 ggml_backend_synchronize(gpu); call.owner = nullptr; return GGML_STATUS_ALLOC_FAILED;
@@ -792,6 +860,7 @@ static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
     // attention gap instead of competing with CPU experts for host DRAM.
     if (cache && call.forecast)
         resident_ring_prefetch(sched, t, gpu, f.prediction_experts.data(), int(f.prediction_experts.size()));
+    f.ring_fence_ready = false; // a publication fence covers only its own layer
     const int64_t admission_started = ggml_time_us();
     if (cache) {
         if (f.rings.empty()) resident_prefetch_prediction(sched, gpu, t.layer);
@@ -1002,6 +1071,18 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         t.host_nodes[0] = &t.host_up; t.host_nodes[1] = &t.host_down;
         t.host_graph = {}; t.host_graph.nodes = t.host_nodes; t.host_graph.n_nodes = 2;
         f.cpu = sched->backends[1];
+        t.gate_value = 0; t.pack_rows.clear(); t.pack_dst = nullptr;
+        if (status == GGML_STATUS_SUCCESS && resident_gate_ready(sched, gpu) &&
+                (!gpu_count || ggml_backend_sched_moe_decode_buffer(f.packed_output,
+                        ggml_backend_cuda_host_buffer_type(), ggml_nbytes(&t.host_down)))) {
+            // All-CPU layers upload host_down (pinned) as is; partial layers upload packed CPU rows.
+            if (gpu_count) {
+                for (int row = 0; row < k; ++row) if (f.gpu_ids[row] < 0) t.pack_rows.push_back(row);
+                t.pack_dst = static_cast<uint8_t *>(ggml_backend_buffer_get_base(f.packed_output));
+            }
+            if (++f.gate_value == 0) ++f.gate_value; // 0 means host join
+            t.gate_value = f.gate_value;
+        }
         f.submit(t);
     }
     // Policy learning is not an input to this invocation's arithmetic. Run it
@@ -1033,6 +1114,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     call.cpu_count = cpu_count; call.gpu_count = gpu_count;
     call.cpu_started = cpu_started; call.host_started = host_started; call.status = status;
     call.cache = cache; call.forecast = forecast;
+    call.gated = cpu_work && t.gate_value != 0; call.published = false;
     call.missing = std::move(missing); call.protected_slots = std::move(protected_slots);
     if (status == GGML_STATUS_SUCCESS && cpu_work && t.allow_defer) {
         ++f.deferred_layers;

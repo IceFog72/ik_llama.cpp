@@ -2082,6 +2082,7 @@ bool common_speculative_load_draft_model(
     // External draft contexts retain their ordinary workspace policy. Only an
     // embedded MTP predictor participates in the target's adaptive handoff.
     params_dft.moe_resident_ubatch = 0;
+    params_dft.moe_resident_ubatch_explicit = true;
     params_dft.cpu_affinity.clear();
     params_dft.cpu_affinity_auto = false;
     params_dft.cpu_affinity_configured = false;
@@ -2212,6 +2213,7 @@ bool common_speculative_prepare_mtp_runtime(
                 params_mtp.moe_resident_zero_fill = overrides.moe_resident_zero_fill;
                 params_mtp.moe_resident_grouping = overrides.moe_resident_grouping;
                 params_mtp.moe_resident_prefetch = overrides.moe_resident_prefetch;
+                params_mtp.moe_resident_device_join = overrides.moe_resident_device_join;
             }
             LOG_INF("%s: embedded predictor residency=%d cap=%d MiB profiler=%s\n", __func__,
                     params_mtp.moe_resident, params_mtp.moe_resident_mib,

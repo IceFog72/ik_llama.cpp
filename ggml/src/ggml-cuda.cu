@@ -4779,6 +4779,63 @@ void ggml_backend_cuda_moe_scatter(ggml_backend_t backend, ggml_tensor * dst,
     CUDA_CHECK(cudaGetLastError());
 }
 
+#if !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+static __global__ void resident_gate_kernel(const volatile uint32_t * flag, uint32_t value,
+        volatile uint32_t * error, uint64_t timeout_ns) {
+#if __CUDA_ARCH__ >= 700
+    uint64_t start, now;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+    while (int32_t(*flag - value) < 0) {
+        __nanosleep(128);
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+        if (now - start > timeout_ns) { *error = 1; break; }
+    }
+    __threadfence_system();
+#endif
+}
+#endif
+
+bool ggml_backend_cuda_moe_gate(ggml_backend_t backend, const uint32_t * flag, uint32_t value, uint32_t * error) {
+#if defined(GGML_USE_HIPBLAS) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(backend); GGML_UNUSED(flag); GGML_UNUSED(value); GGML_UNUSED(error);
+    return false;
+#else
+    auto * ctx = (ggml_backend_cuda_context *)backend->context;
+    if (ggml_cuda_info().devices[ctx->device].cc < CC_VOLTA) return false;
+    ggml_cuda_set_device(ctx->device);
+    void * device_flag = nullptr, * device_error = nullptr;
+    if (cudaHostGetDevicePointer(&device_flag, const_cast<uint32_t *>(flag), 0) != cudaSuccess ||
+            cudaHostGetDevicePointer(&device_error, error, 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+#if !defined(GGML_CUDA_NO_VMM)
+    // Front-end stream wait when the driver enables stream memory operations
+    // (Linux GeForce: nvidia module option NVreg_EnableStreamMemOPs=1). Without
+    // it the driver emulates the wait by blocking the next launching host
+    // thread, which would stall this pipeline, so poll with a kernel instead.
+    static int mem_ops[GGML_CUDA_MAX_DEVICES];
+    static bool probed[GGML_CUDA_MAX_DEVICES];
+    if (!probed[ctx->device]) {
+        CUdevice device;
+        if (cuDeviceGet(&device, ctx->device) != CUDA_SUCCESS ||
+                cuDeviceGetAttribute(&mem_ops[ctx->device], CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1, device) != CUDA_SUCCESS) {
+            mem_ops[ctx->device] = 0;
+        }
+        probed[ctx->device] = true;
+    }
+    if (mem_ops[ctx->device] && cuStreamWaitValue32(ctx->stream(), (CUdeviceptr)device_flag, value,
+                CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS) {
+        return true; // no timeout on this path; *error stays 0
+    }
+#endif
+    resident_gate_kernel<<<1, 1, 0, ctx->stream()>>>((const uint32_t *)device_flag, value,
+            (uint32_t *)device_error, 10ull * 1000 * 1000 * 1000);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+#endif
+}
+
 bool ggml_backend_cuda_moe_event_ready(ggml_backend_event_t event) {
     ggml_cuda_set_device(((ggml_backend_cuda_context *)event->backend->context)->device);
 #if defined(GGML_USE_HIPBLAS)

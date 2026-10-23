@@ -236,6 +236,8 @@ extern "C" {
     // Select before enabling residency; false uses the old positive-fill policy (default), true includes zero fills.
     GGML_API void                 ggml_backend_sched_set_moe_resident_zero_fill(ggml_backend_sched_t sched, bool enabled);
     GGML_API void                 ggml_backend_sched_set_moe_resident_prefetch(ggml_backend_sched_t sched, int uploads_per_layer);
+    // New policy only: the GPU stream, not the host, waits for each CPU expert job's results.
+    GGML_API void                 ggml_backend_sched_set_moe_resident_device_join(ggml_backend_sched_t sched, bool enabled);
     GGML_API void                 ggml_backend_sched_set_moe_resident_grouping(ggml_backend_sched_t sched, bool enabled);
     GGML_API void                 ggml_backend_sched_set_moe_resident(ggml_backend_sched_t sched, int slots);
     GGML_API void                 ggml_backend_sched_set_moe_resident_layers(ggml_backend_sched_t sched, int n_layers);

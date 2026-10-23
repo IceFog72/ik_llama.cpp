@@ -1373,6 +1373,11 @@ struct ggml_backend_sched_moe_ffn {
         ggml_tensor * up = nullptr, * down = nullptr;
         ggml_tensor * join = nullptr;
         ggml_tensor * pregate = nullptr; // next-layer forecast IDs (opt-in prefetch), never a math input
+        // Device join: after computing, the CPU worker copies these host_down rows
+        // to pack_dst (pinned), then stores gate_value. 0 = host join.
+        std::vector<int> pack_rows;
+        uint8_t * pack_dst = nullptr;
+        uint32_t gate_value = 0;
         bool allow_defer = false;
         bool upload_fenced = false; // prior readers retired; current hits separately protected
         ggml_tensor * banks[3]{};
@@ -1413,6 +1418,9 @@ struct ggml_backend_sched_moe_ffn {
         ggml_status status = GGML_STATUS_SUCCESS;
         bool cache = false;
         bool forecast = false; // prediction_experts holds the next layer's forecast
+        bool gated = false;     // device join: the worker releases a GPU-side gate
+        bool published = false; // gated result upload queued; settle still pending
+        int64_t published_us = 0;
         std::vector<int> missing;
         std::vector<bool> protected_slots;
     } in_flight;
@@ -1549,6 +1557,12 @@ struct ggml_backend_sched_moe_ffn {
     std::vector<group> groups;
     bool new_policy = false, virtual_cache = false, histogram_dirty = false, mapping_dirty = false;
     ggml_backend_buffer_t histogram = nullptr, slot_map = nullptr, packed_output = nullptr;
+    // Device join: pinned words polled by the GPU gate. gate_words[0] is the
+    // released value (written by the CPU worker), gate_words[1] the timeout flag.
+    ggml_backend_buffer_t gate_buffer = nullptr;
+    uint32_t * gate_words = nullptr;
+    uint32_t gate_value = 0;
+    uint64_t gated_layers = 0;
     ggml_backend_event_t router_ready = nullptr, upload_ready = nullptr, upload_fence = nullptr;
     ggml_backend_event_t upload_started = nullptr;
     double upload_us_per_byte = 1e6 / (8.0 * 1024 * 1024 * 1024);
@@ -1619,6 +1633,8 @@ struct ggml_backend_sched_moe_ffn {
                 (unsigned long long)ring_uploads, (unsigned long long)ring_installed, (unsigned long long)ring_late,
                 (unsigned long long)ring_hits, (unsigned long long)ring_unused, (unsigned long long)ring_promotions,
                 (unsigned long long)ring_skipped, (unsigned long long)ring_bytes);
+        if (gated_layers) fprintf(stderr, "ggml_backend_sched: moe-resident new device join layers=%llu\n",
+                (unsigned long long)gated_layers);
         if (cpu_batch_rows) fprintf(stderr,
                 "ggml_backend_sched: moe-resident new CPU work rows=%llu unique_experts=%llu masked_quant_rows=%llu compact_routes=yes\n",
                 (unsigned long long)cpu_batch_rows, (unsigned long long)cpu_batch_experts,
@@ -1669,10 +1685,12 @@ struct ggml_backend_sched_moe_ffn {
     std::vector<std::vector<ring_entry>> rings;
     ggml_backend_t prefetcher = nullptr; // dedicated copy stream for forecast uploads
     ggml_backend_event_t ring_fence = nullptr; // compute-stream point a forecast upload waits for
+    bool ring_fence_ready = false; // device join recorded ring_fence at publication
     ggml_backend_buffer_t pregate_host = nullptr;
     uint64_t ring_uploads = 0, ring_installed = 0, ring_late = 0, ring_hits = 0;
     uint64_t ring_unused = 0, ring_promotions = 0, ring_bytes = 0, ring_skipped = 0;
     void ring_reset() {
+        ring_fence_ready = false;
         if (prefetcher) ggml_backend_synchronize(prefetcher);
         for (auto & ring : rings) for (auto & r : ring) {
             r.layer = r.expert = -1; r.installed = r.used = false;
@@ -1869,6 +1887,7 @@ struct ggml_backend_sched_moe_ffn {
         return !new_policy || graph_tasks.count(t.up) != 0;
     }
     size_t allocation_bytes = 0;
+    size_t planned_tasks = 0; // live layers the current cache plan covered
     size_t slot_count() const {
         size_t count = 0;
         for (const auto & g : groups) count += g.slots.size();
@@ -1971,6 +1990,18 @@ struct ggml_backend_sched_moe_ffn {
                             ? ggml_backend_cpu_graph_compute_executor(cpu, &current->host_graph,
                                     ggml_moe_cpu_workers::execute, &cpu_workers)
                             : ggml_backend_graph_compute(cpu, &current->host_graph);
+                    if (current->gate_value) {
+                        // Always release, even after a failure: the GPU stream waits on it.
+                        // The host reports the failure when it settles this job.
+                        const size_t row = current->host_down.nb[1];
+                        size_t offset = 0;
+                        for (const int r : current->pack_rows) {
+                            std::memcpy(current->pack_dst + offset,
+                                    static_cast<const uint8_t *>(current->host_down.data) + size_t(r) * row, row);
+                            offset += row;
+                        }
+                        __atomic_store_n(&gate_words[0], current->gate_value, __ATOMIC_RELEASE);
+                    }
                     lock.lock();
                     status = result; cpu_finished_us = ggml_time_us(); busy = false;
                     done.notify_one();
@@ -2011,6 +2042,7 @@ struct ggml_backend_sched_moe_ffn {
         ggml_backend_event_free(completion);
         for (auto buffer : {activation, intermediate, output, ids, device_ids, device_cpu})
             ggml_backend_buffer_free(buffer);
+        ggml_backend_buffer_free(gate_buffer); // the last gate was released by finish() above
     }
 };
 
@@ -2139,6 +2171,7 @@ struct ggml_backend_sched {
     bool moe_resident_zero_fill = false;
     bool moe_resident_grouping = false; // layout-grouped complete cache; shared cache by default
     int moe_resident_prefetch = 0; // next-layer forecast uploads per layer into the ring (new policy)
+    bool moe_resident_device_join = false; // GPU stream gate replaces the host CPU join (new policy)
     bool moe_resident_adaptive = false;
     bool moe_resident_refresh_pending = false;
     size_t moe_resident_cap_bytes;
@@ -2244,6 +2277,12 @@ void ggml_backend_sched_set_moe_resident_prefetch(ggml_backend_sched_t sched, in
     // Ring geometry is fixed for the lifetime of the complete-FFN state.
     GGML_ASSERT(!sched->is_alloc && !sched->moe_ffn);
     sched->moe_resident_prefetch = std::max(0, std::min(8, uploads_per_layer));
+}
+
+void ggml_backend_sched_set_moe_resident_device_join(ggml_backend_sched_t sched, bool enabled) {
+    if (!sched) return;
+    GGML_ASSERT(!sched->is_alloc && !sched->moe_ffn);
+    sched->moe_resident_device_join = enabled;
 }
 
 void ggml_backend_sched_set_moe_resident_grouping(ggml_backend_sched_t sched, bool enabled) {
@@ -5062,8 +5101,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         if (sched->moe_ffn && sched->moe_ffn->in_flight.owner) {
             auto & f = *sched->moe_ffn;
-            if (split_backend != f.in_flight.gpu || split->graph.nodes[0] == f.in_flight.owner->join ||
-                    ggml_backend_sched_moe_ffn_node(sched, split->graph.nodes[0])) {
+            // A published device join already gates its consumers on the GPU stream;
+            // only CPU-backend work or the next complete FFN must settle it.
+            const bool settle = split_backend != f.in_flight.gpu ||
+                    ggml_backend_sched_moe_ffn_node(sched, split->graph.nodes[0]);
+            if (settle || (!f.in_flight.published && split->graph.nodes[0] == f.in_flight.owner->join)) {
                 const auto status = resident_finish_ffn(sched);
                 if (status != GGML_STATUS_SUCCESS) return status;
             } else {
@@ -5171,7 +5213,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (sched->moe_ffn && sched->moe_ffn->in_flight.owner) {
         // Every deferred job has a validated consumer in this graph.
         // Reaching the end without it is an internal scheduling error.
-        return GGML_STATUS_FAILED;
+        if (!sched->moe_ffn->in_flight.published) return GGML_STATUS_FAILED;
+        const auto status = resident_finish_ffn(sched); // settle the last device join
+        if (status != GGML_STATUS_SUCCESS) return status;
     }
 
     return GGML_STATUS_SUCCESS;
