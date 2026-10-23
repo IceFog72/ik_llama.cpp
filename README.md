@@ -1,3 +1,46 @@
+# IceFog72 fork of ik_llama.cpp
+
+[IceFog72/ik_llama.cpp](https://github.com/IceFog72/ik_llama.cpp) is upstream `ik_llama.cpp` plus hybrid CPU/GPU work for MoE models on a single consumer GPU. Development and measurements use an RTX 2060 (6 GB) with a Ryzen 7 2700X (8 cores). Every addition is opt-in: without the flags below, the fork behaves like upstream. Last merged with upstream `main` on 2026-10-23.
+
+## What differs from upstream
+
+| Feature | Flag | Details |
+|---|---|---|
+| Expert cache in VRAM. Each MoE layer of decode runs its cached experts on the GPU and the rest on a persistent CPU team, at the same time. | `--moe-resident N\|auto` (`N`: cache cap in MiB) | [moe-resident-profiler-new.md](docs/moe-resident-profiler-new.md) |
+| Routing-history residency policy: GPU expert lookup, packed CPU results, background admission, stable cache resizing. | `--moe-resident-profiler new` | [moe-resident-profiler-new.md](docs/moe-resident-profiler-new.md) |
+| Next-layer expert prefetch. The next layer's router predicts its experts, and missing ones upload after the CPU experts finish. | `--moe-resident-prefetch N` (0–8) | [moe-resident-profiler-new.md](docs/moe-resident-profiler-new.md) |
+| Adaptive workspace. Prefill uses a large ubatch, then generation hands that VRAM back to the expert cache. Default with residency when `-ub` is not set. | `--moe-resident-ubatch N` | [moe-resident-ubatch.md](docs/moe-resident-ubatch.md) |
+| Expert offload batch measured at startup for each model (upload time against CPU expert time). Used unless `-cuda offload-batch-size` is set. | automatic | [moe-resident-ubatch.md](docs/moe-resident-ubatch.md) |
+| Decode attention reads Q4_0 K and Q4_0/Q8_0 V directly, for 1 token or 2 (MTP verification), without converting the KV cache to f16. | `-cuda fa-quant-tile=1` | [quantized-kv-tiles.md](docs/quantized-kv-tiles.md) |
+| GPU-side wait for CPU expert results (experimental, no measured gain yet). The hardware wait needs `NVreg_EnableStreamMemOPs=1` (`scripts/nvidia-stream-memops.sh`). | `--moe-resident-device-join` | `--help` |
+
+Other fork changes include n-gram drafting fixes, `ignore_eos` suppressing every end-of-generation token, Q2_0 quantization and per-request sampler reset. [fork-improvements.md](docs/fork-improvements.md) records every fork change with commits and measurements.
+
+## Recommended flags
+
+Qwen3.6-35B-A3B (UD-Q4_K_M) on a 6 GB GPU with 64K context and MTP:
+
+```
+llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --jinja -fa on --no-context-shift \
+  -ngl 999 -cmoe -np 1 --ctx-size 65536 -b 2048 -wgt 1 -t 8 -tb 8 \
+  -ctk q4_0 -ctv q4_0 -ctv-first q8_0,4 -ctv-last q8_0,4 --k-cache-hadamard --v-cache-hadamard \
+  --moe-resident 2048 --moe-resident-profiler new --moe-resident-prefetch 2 \
+  -cuda fa-quant-tile=1 --spec-type mtp:n_max=1,p_min=0.0
+```
+
+On the reference machine this generates about 45–48 t/s on short prompts and about 37 t/s at 28K context. Prefill runs at about 430–700 t/s.
+
+- `-cmoe` keeps experts in RAM. `--moe-resident` then caches the frequently used ones in VRAM.
+- `-t 8 -tb 8`: use the physical core count. With MTP, `-tb 16` (SMT threads) halved generation speed.
+- `-wgt 1` sizes the worst-case graph for one output row, which frees VRAM for the expert cache.
+- Q4_0 KV with Hadamard rotation preserves accuracy. `-cuda fa-quant-tile=1` keeps long-context decode fast with it.
+- Do not set `-ub`: the adaptive workspace sizes prefill from free VRAM.
+- Do not set `-cuda offload-batch-size`: it is measured at startup. The log reports `expert offload: ... -> offload from N tokens`.
+- Close other GPU users, such as a browser, before benchmarking. The expert cache sizes itself from free VRAM.
+- On the client side, leave `n_probs` off unless you need token probabilities (it costs about 1.5 t/s).
+
+---
+
 # ik_llama.cpp: llama.cpp fork with better CPU performance
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
