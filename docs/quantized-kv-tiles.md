@@ -24,8 +24,8 @@ It can be combined with the existing `--moe-resident` options.
 Look for actual dispatch messages, not only the startup option acknowledgement:
 
 ```text
-fa-quant-tile active K=q4_0 V=q4_0 head=256 query=1 gqa=8 (MMA, no full KV expansion)
-fa-quant-tile active K=q4_0 V=q8_0 head=256 query=1 gqa=8 (MMA, no full KV expansion)
+fa-quant-tile active K=q4_0 V=q4_0 head=256 query<=2 gqa=8 (MMA, no full KV expansion)
+fa-quant-tile active K=q4_0 V=q8_0 head=256 query<=2 gqa=8 (MMA, no full KV expansion)
 ```
 
 Each type combination logs once per backend. A startup message alone does not
@@ -33,11 +33,15 @@ prove that the request's shape selected the optimized path.
 
 ## Scope and ownership
 
-The first specialization supports the measured Qwen path: one query token,
-256-wide heads, Q4_0 K, Q4_0/Q8_0 V, and grouped query heads in multiples of
+The specialization supports the measured Qwen path: one query token, or two
+for the MTP verification batch (`--spec-type mtp:n_max=1`), 256-wide heads, Q4_0 K, Q4_0/Q8_0 V, and grouped query heads in multiples of
 eight. It requires the existing MMA-capable NVIDIA path, a mask, default
 precision, zero ALiBi/softcap, and no sliding-window hint. Other cases retain
-the existing implementation, including multi-token prompt processing.
+the existing implementation, including prompt processing and longer draft batches.
+
+The tiled kernel runs 2-warp blocks, and Turing has no asynchronous copies, so
+one stream-K block per SM leaves it latency-bound. The tiled path launches two
+blocks per SM. More blocks did not help further on an RTX 2060.
 
 K/V remain quantized in their existing device buffers. The loader expands a
 32-row tile into the same padded FP16 shared-memory tile the existing MMA
@@ -66,12 +70,17 @@ cmake --build build --target test-cuda-fa-quant-tile -j14
 ```
 
 The manual test target is available when `GGML_CUDA` and `LLAMA_BUILD_TESTS` are
-enabled. It compares identical quantized inputs through separate off/on CUDA
-backends and fails if the tiled path was expected but never selected. It covers
-Q4/Q4 and Q4/Q8 at 256, 257, 2048, 20000, 50000 and 65536 actual tokens, padded
-and sparse masks, both KV layouts, sinks, repeated graphs with changed inputs,
-and fallback shapes/types. It rejects non-finite output and checks each value
-with `abs_error <= 1e-5 + 1e-4*abs(reference)`.
+enabled. It runs identical quantized inputs through separate off/on CUDA
+backends and fails if the tiled path was expected but never selected. The
+tiled path splits the KV range across more blocks than the old path, so its f16
+partial sums combine in a different order. Where it is selected, both outputs
+are measured against a double-precision reference, and the tiled maximum error
+must not exceed 1.25 times the old path's. Fallback shapes must still match the
+old path to `1e-5 + 1e-4*abs(reference)`. It covers
+Q4/Q4 and Q4/Q8 at 256, 257, 2048, 20000, 50000 and 65536 actual tokens, two
+queries at 257, 2048, 28000 and 65536 tokens, padded and sparse masks, both KV
+layouts, sinks, repeated graphs with changed inputs, and fallback shapes/types.
+It rejects non-finite output.
 
 The test is a numerical gate, not a speed benchmark. It reuses the old
 conversion-plus-MMA implementation as reference. It does not establish

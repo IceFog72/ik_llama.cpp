@@ -1419,7 +1419,10 @@ void launch_fattn_mma(
     dim3 blocks_num;
     if (stream_k) {
         // For short contexts it can be faster to have the SMs work on whole tiles because this lets us skip the fixup.
-        const int max_blocks = Q->ne[1] > 1 ? 2*nsm : nsm;
+        // The quantized-tile kernel (no f16 conversion) runs 2-warp blocks and, on Turing, synchronous
+        // tile loads, so one block per SM leaves it latency-bound on long single-token decode.
+        const bool quant_tiles = !need_f16_K;
+        const int max_blocks = Q->ne[1] > 1 || quant_tiles ? 2*nsm : nsm;
         const int tiles_nwaves = (ntiles_total + max_blocks - 1) / max_blocks;
         const int tiles_efficiency_percent = 100 * ntiles_total / (max_blocks*tiles_nwaves);
 

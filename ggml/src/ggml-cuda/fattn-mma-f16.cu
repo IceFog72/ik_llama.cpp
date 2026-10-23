@@ -203,7 +203,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_hs(ggml_backend_cuda_context
     }
 }
 
-// This first specialization matches the measured Qwen decode path. Keep all
+// This specialization matches the measured Qwen decode path (1 token, or 2 for MTP verification). Keep all
 // other shapes on the existing implementation, including prompt processing.
 static bool try_fattn_quant_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (!ctx.fa_quant_tile) return false;
@@ -217,7 +217,7 @@ static bool try_fattn_quant_tile(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     if (!new_mma_available(cc) || Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
             Q->ne[0] != 256 || K->ne[0] != 256 || V->ne[0] != 256 ||
-            Q->ne[1] != 1 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
+            Q->ne[1] > 2 || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
             K->ne[2] <= 0 || Q->ne[2] % K->ne[2] != 0 || (Q->ne[2] / K->ne[2]) % 8 != 0 ||
             V->ne[1] != K->ne[1] || V->ne[2] != K->ne[2] ||
             K->ne[1] < FATTN_KQ_STRIDE || K->ne[1] % FATTN_KQ_STRIDE != 0 ||
@@ -237,14 +237,21 @@ static bool try_fattn_quant_tile(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // the option. No synchronization or repeated per-layer logging is needed.
     const unsigned variant = V->type == GGML_TYPE_Q4_0 ? 1u : 2u;
     if (!(ctx.fa_quant_tile_logged & variant)) {
-        ggml_cuda_log(GGML_LOG_LEVEL_INFO, "%s: fa-quant-tile active K=q4_0 V=%s head=256 query=1 gqa=%lld (MMA, no full KV expansion)\n",
+        ggml_cuda_log(GGML_LOG_LEVEL_INFO, "%s: fa-quant-tile active K=q4_0 V=%s head=256 query<=2 gqa=%lld (MMA, no full KV expansion)\n",
                 __func__, ggml_type_name(V->type), (long long)(Q->ne[2] / K->ne[2]));
         ctx.fa_quant_tile_logged |= variant;
     }
-    if (V->type == GGML_TYPE_Q4_0) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<256, 1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+    // Two query tokens is the MTP verification batch.
+    if (Q->ne[1] == 1) {
+        if (V->type == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_f16_case<256, 1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>(ctx, dst);
+        }
+    } else if (V->type == GGML_TYPE_Q4_0) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 2, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
     } else {
-        ggml_cuda_flash_attn_ext_mma_f16_case<256, 1, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<256, 2, 8, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>(ctx, dst);
     }
     return true;
 }
