@@ -26,15 +26,15 @@ multiples of 512; its smallest candidate is the generation ceiling rounded up to
 prefill sizing to consider a larger microbatch. `llama_n_ubatch()` reports this
 configured upper limit, while execution uses the context's active ceiling.
 
-For example, add this to the existing Qwen launch arguments and omit `-ub`:
+No extra option is needed: residency without `-ub` turns it on, and the
+offload batch is measured at startup (next section). For example:
 
 ```sh
--b 3072 --ctx-size 65536 -np 1 -cmoe \
---moe-resident auto --moe-resident-ubatch 512 \
--cuda offload-batch-size=16
+-b 2048 --ctx-size 65536 -np 1 -cmoe --moe-resident 2048 --moe-resident-profiler new
 ```
 
-To bound prefill explicitly, add `-ub 2048`. Keep the existing KV quantization,
+To bound prefill explicitly, add `-ub 2048`. To change the generation ceiling,
+add `--moe-resident-ubatch N`. Keep the existing KV quantization,
 Hadamard, Flash Attention, thread and MTP arguments. A residency cap remains
 optional; adaptation never exceeds an explicit cap. Freed memory may remain
 unused if that cap, expert layout, the number of distinct experts or reserved
@@ -88,6 +88,12 @@ least 256 MiB or one eighth of available memory, with a 512 MiB minimum when
 adaptive ubatching is enabled. The margin is additional to already allocated
 model, full context, compute buffers, histogram/lookup and physical page padding.
 
+The cache is sized for the decode graph's expert layers. Prefill ubatches
+expose only the last layer as a one-token FFN, so a cache planned from such a
+graph would cover one layer. The cache re-plans when a live graph has more
+expert layers than its plan, and it is not created from a partial graph, so
+each response does not rebuild it.
+
 A fitting cache is retained. Growth of less than 64 MiB is deferred to avoid
 reuploading the working set for small driver-memory fluctuations. Larger
 growth or a required reduction rebuilds the cache and restores valid previous
@@ -97,8 +103,10 @@ every generated token and does not change KV or recurrent state.
 
 ## Allocation and lifetime
 
-The implementation currently supports Qwen3.5 MoE on one CUDA backend with
-causal attention, one sequence and ordinary layer scheduling. Evaluation
+The implementation is architecture-agnostic for MoE models whose experts stay
+in host memory (`-cmoe`). It needs one CUDA backend, causal attention, one
+sequence and ordinary layer scheduling. It has been run on Qwen3.6-35B-A3B
+(with and without embedded MTP) and Gemma 4 26B-A4B. Evaluation
 callbacks and graph/attention split modes are rejected when adaptation is
 requested. Embedded MTP is supported by coordinating the linked target and
 predictor workspaces. External draft contexts keep their ordinary workspace
@@ -177,9 +185,22 @@ repeated performance study or a comparison against PolyStrata. Both runs
 still used the old 656-slot expert-cache limit.
 
 These runs did not reproduce the reported garbled output. They do not establish
-correctness for the original failing conversation or the embedded MTP path.
-The subsequent changes lifting the automatic cache's twice-top-k slot limit
-and refreshing its budget per server response are source-only and require a
-rebuild and runtime check. No throughput gain is claimed for those unbuilt
-changes. Runtime acceptance must cover repeated responses with and without
-adaptive ubatching, explicit caps, disabled residency, and embedded MTP.
+correctness for the original failing conversation.
+
+On 2026-10-23, after the decode-sized cache fix, the measured offload batch
+and the MTP reservation fix, the same machine ran `llama-server` with the
+recommended flags in the README (no `-ub`, `--moe-resident 2048`, new profiler,
+prefetch 2) over three-turn chats:
+
+| Model and mode | Prefill | Decode per turn |
+|---|---|---|
+| Qwen3.6-35B-A3B, no MTP | 701 t/s | 41–44 t/s |
+| Qwen3.6-35B-A3B, MTP (`n_max=1`) | 592 t/s | 45–48 t/s |
+| Gemma 4 26B-A4B, adaptive | 866 t/s | 19.8 / 24.3 / 23.5 t/s |
+| Gemma 4 26B-A4B, fixed `-ub 512` | 369 t/s | 21.9 / 24.8 / 24.5 t/s |
+
+Before the cache fix, the adaptive workspace prefilled about 2.4 times faster
+but decoded slower, because the cache covered one layer. Gemma's first-response
+decode remains about 10% below fixed `-ub 512`: the cache is rebuilt and
+refilled after the large prefill and holds about 25 fewer slots. The measured
+offload batch was 151–212 tokens for Qwen across runs and 114 for Gemma.

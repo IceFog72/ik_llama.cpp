@@ -6,7 +6,9 @@ Select the opt-in policy with:
 --moe-resident auto --moe-resident-profiler new
 ```
 
-An explicit expert cap works too, for example `--moe-resident 1536`.
+An explicit expert cap works too, for example `--moe-resident 1536`. The
+README's "Recommended flags" lists the full measured setup, including
+`--moe-resident-prefetch 2` and `-cuda fa-quant-tile=1`.
 `--moe-resident-profiler old` remains the default. Residency omitted or set
 to zero disables both policies. No other launch settings need to change.
 The complete-FFN executor requires an eligible single-CUDA-plus-CPU layout.
@@ -259,6 +261,24 @@ tokens, no ordinary expert operations, and the existing node compatibility and
 pointer-update checks. Successful launches report `new CUDA shared graph replay
 active tokens=N nodes=M`.
 
+## Device join (experimental)
+
+`--moe-resident-device-join` (new profiler only, default off) queues a layer's
+CPU-result upload and the following GPU work before the CPU experts finish.
+The CPU worker packs its result rows and then stores a flag in pinned memory.
+A GPU-side wait on that flag releases the queued work, so the host does not
+block on the CPU join before submitting it.
+
+With `CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1`, the wait is a hardware
+`cuStreamWaitValue32`. Otherwise a small polling kernel waits, with a 10 s
+timeout. GeForce drivers ship with `NVreg_EnableStreamMemOPs=0`, and the CUDA
+driver then emulates stream waits by blocking the host thread, which defeats
+the purpose. `sudo scripts/nvidia-stream-memops.sh enable|disable|check` sets,
+removes or checks that module option. A reboot applies it.
+
+No speedup has been measured with the polling kernel, and the hardware path
+has not been measured yet. The recommended setup leaves the flag off.
+
 ## Promotion and resizing ownership
 
 An admitted victim is removed from the device lookup and marked unavailable.
@@ -270,6 +290,9 @@ workspace release and scheduler destruction finish outstanding uploads first.
 Every publication marks the device lookup dirty, including publication from a
 graph scan; the next dispatch refreshes it after fencing the reusable DMA source.
 Legacy projection caches are released before measuring the complete-FFN budget.
+The cache is planned from the decode graph's expert layers. A partial graph,
+such as a prefill ubatch whose last layer is a one-token FFN, does not create
+or shrink it. See [moe-resident-ubatch.md](moe-resident-ubatch.md).
 
 A dedicated host upload worker stages the admitted expert's three banks into
 one reusable pinned RAM buffer, then queues their copies on the upload stream.
@@ -298,6 +321,30 @@ workspace. Stable resizing does not promise to retain expert bytes while their
 physical VRAM is needed by another allocation.
 
 ## Status and diagnostics
+
+### Current results (2026-10-23)
+
+RTX 2060 (6 GB) with a Ryzen 7 2700X, Qwen3.6-35B-A3B UD-Q4_K_M, `-cmoe
+--moe-resident 2048 --moe-resident-profiler new --moe-resident-prefetch 2
+-cuda fa-quant-tile=1`, no `-ub`, `-t 8 -tb 8`:
+
+| Workload | Prefill | Decode |
+|---|---|---|
+| Three-turn chat, no MTP | 701 t/s | 41–44 t/s |
+| Three-turn chat, MTP `n_max=1` | 430–590 t/s | 45–48 t/s |
+| 28K-token chat request, MTP | about 440 t/s | 36–38 t/s |
+
+`gpu_share` is about 64–75% on short chats and about 60% at 28K context. At
+28K, CPU expert time (`cpu_wait` about 380–450 us/layer) and lower draft
+acceptance (about 0.70 against 0.80) are the remaining costs. Router wait is
+back to its short-context level (about 270 us/layer) with `fa-quant-tile=1`.
+
+`-tb 16` on this 8-core CPU dropped MTP decode from 45–48 to about 20 t/s and
+prefill from 592 to 435 t/s. MTP verification runs CPU experts with the batch
+thread count, so `-tb` above the physical core count makes SMT siblings compete
+for the same cores and DRAM bandwidth.
+
+### Earlier validation (2026-10-14)
 
 On 2026-10-14 the incremental CUDA server build and rebuilt residency test
 target passed. The default test compares persistent CPU execution against

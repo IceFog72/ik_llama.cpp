@@ -12,7 +12,7 @@
 | Adaptive workspace. Prefill uses a large ubatch, then generation hands that VRAM back to the expert cache. Default with residency when `-ub` is not set. | `--moe-resident-ubatch N` | [moe-resident-ubatch.md](docs/moe-resident-ubatch.md) |
 | Expert offload batch measured at startup for each model (upload time against CPU expert time). Used unless `-cuda offload-batch-size` is set. | automatic | [moe-resident-ubatch.md](docs/moe-resident-ubatch.md) |
 | Decode attention reads Q4_0 K and Q4_0/Q8_0 V directly, for 1 token or 2 (MTP verification), without converting the KV cache to f16. | `-cuda fa-quant-tile=1` | [quantized-kv-tiles.md](docs/quantized-kv-tiles.md) |
-| GPU-side wait for CPU expert results (experimental, no measured gain yet). The hardware wait needs `NVreg_EnableStreamMemOPs=1` (`scripts/nvidia-stream-memops.sh`). | `--moe-resident-device-join` | `--help` |
+| GPU-side wait for CPU expert results (experimental, no measured gain yet). The hardware wait needs `NVreg_EnableStreamMemOPs=1` (`scripts/nvidia-stream-memops.sh`). | `--moe-resident-device-join` | [moe-resident-profiler-new.md](docs/moe-resident-profiler-new.md) |
 
 Other fork changes include n-gram drafting fixes, `ignore_eos` suppressing every end-of-generation token, Q2_0 quantization and per-request sampler reset. [fork-improvements.md](docs/fork-improvements.md) records every fork change with commits and measurements.
 
