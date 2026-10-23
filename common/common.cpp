@@ -4873,6 +4873,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.moe_resident_mib  = params.moe_resident_mib;
     cparams.moe_resident_ubatch = moe_resident_ubatch_effective(params);
     cparams.moe_resident_ubatch_auto = cparams.moe_resident_ubatch && !params.n_ubatch_explicit;
+    cparams.moe_resident_ubatch_offload = cparams.moe_resident_ubatch && !params.moe_resident_ubatch_explicit;
     cparams.moe_resident_zero_fill = params.moe_resident_zero_fill;
     cparams.moe_resident_grouping = params.moe_resident_grouping;
     cparams.moe_resident_prefetch = params.moe_resident_prefetch;

@@ -933,6 +933,7 @@ struct ggml_backend_cuda_context {
 
     int   fusion = GGML_CUDA_FUSION;
     int   offload_batch_size = GGML_CUDA_MIN_BATCH_OFFLOAD;
+    int   offload_moe_tokens = 0; // >0: measured expert-op offload batch, replaces the rule below for MoE ops
     int   offload_batch_size_per_byte = -1;
     int   mmq_id_thresh = 32;
     float fa_offset = 0.6931f; // ln(2)

@@ -5739,6 +5739,7 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
     // as the condition for offloading model weights residing in RAM to the GPU.
     // In this case, the number of tokens is not as usual in op->ne[1] but rather in op->ne[2].
     if (op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_MOE_FUSED_UP_GATE) {
+        if (ctx->offload_moe_tokens > 0) return op->ne[2] >= ctx->offload_moe_tokens;
         if (ctx->offload_batch_size_per_byte >= 0) {
             auto src0 = op->src[0];
             auto row_size = ggml_row_size(src0->type, src0->ne[0]);
@@ -5760,6 +5761,11 @@ GGML_CALL static bool ggml_backend_cuda_offload_op(ggml_backend_t backend, const
     //       (op->ne[2] >= min_batch_size && (op->op == GGML_OP_MUL_MAT_ID || op->op == GGML_OP_MOE_FUSED_UP_GATE));
 
     GGML_UNUSED(backend);
+}
+
+GGML_CALL void ggml_backend_cuda_set_moe_offload_tokens(ggml_backend_t backend, int tokens) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    ((ggml_backend_cuda_context *)backend->context)->offload_moe_tokens = std::max(0, tokens);
 }
 
 static ggml_backend_event_t ggml_backend_cuda_event_new(ggml_backend_t backend) {

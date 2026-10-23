@@ -49,6 +49,11 @@ GGML_API GGML_CALL void ggml_backend_cuda_invalidate_graphs(const void * model);
 // Synchronize this backend, invalidate its captures and release idle physical scratch.
 GGML_API GGML_CALL size_t ggml_backend_cuda_trim_compute(ggml_backend_t backend);
 
+// Expert ops (MUL_MAT_ID, MOE_FUSED_UP_GATE) whose weights are in host memory
+// offload to this backend from `tokens` batch tokens on. 0 restores the
+// offload-batch-size rule. Dense ops always keep that rule.
+GGML_API GGML_CALL void ggml_backend_cuda_set_moe_offload_tokens(ggml_backend_t backend, int tokens);
+
 GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int64_t nslice, const float * imatrix);
 #ifdef  __cplusplus
 }

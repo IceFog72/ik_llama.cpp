@@ -542,6 +542,7 @@ extern "C" {
         bool moe_resident_ubatch_auto; // choose prefill workspace in multiples of 512 up to n_ubatch
         int32_t moe_resident_prefetch; // next-layer expert prefetch uploads per layer (0 = off)
         bool moe_resident_device_join; // GPU-side wait for CPU expert results (new profiler only)
+        bool moe_resident_ubatch_offload; // derive the generation ceiling from the batch at which experts offload to the GPU
     };
 
     // model quantization parameters

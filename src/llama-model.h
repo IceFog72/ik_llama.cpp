@@ -660,6 +660,9 @@ struct llama_model {
     std::set<llama_lora_adapter *> lora_adapters;
 
     bool tensor_overrides;
+    // Measured batch from which host-resident expert ops pay off on the GPU
+    // (auto MoE residency); -1 = not measured yet, 0 = keep the backend rule.
+    mutable int moe_offload_tokens = -1;
 
     // Set by llm_apply_khad_pretransform once H is folded into wv_b/kv_b_pp.
     bool khad_pretransformed = false;

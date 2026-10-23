@@ -61,6 +61,7 @@ struct llama_cparams {
     bool moe_resident_grouping; // layout-grouped complete cache (default: false)
     int  moe_resident_prefetch = 0; // next-layer prefetch uploads per layer (0 = off)
     bool moe_resident_device_join = false; // GPU-side wait for CPU expert results
+    bool moe_resident_ubatch_offload = false; // generation ceiling follows the expert offload batch
     size_t moe_cache_size = 0;
     bool mtp;
     int  worst_graph_tokens;

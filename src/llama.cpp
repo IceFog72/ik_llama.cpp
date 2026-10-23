@@ -9142,6 +9142,7 @@ struct llama_context_params llama_context_default_params() {
         /*.moe_resident_ubatch_auto    =*/ false,
         /*.moe_resident_prefetch       =*/ 0,
         /*.moe_resident_device_join    =*/ false,
+        /*.moe_resident_ubatch_offload =*/ false,
     };
 
     return result;
@@ -9389,6 +9390,121 @@ void llama_free_model(struct llama_model * model) {
     }
     delete model;
 }
+
+#ifdef GGML_USE_CUDA
+static bool llama_tensor_on_host(const ggml_tensor * t) {
+    return t && t->buffer && ggml_backend_buffer_is_host(t->buffer);
+}
+
+// First layer whose routed experts all live in host memory, i.e. whose expert
+// ops the scheduler may offload. nullptr when the experts are on the GPU.
+static const llama_layer * llama_moe_host_expert_layer(const llama_model & model) {
+    for (const auto & l : model.layers) {
+        if (!llama_tensor_on_host(l.ffn_down_exps)) continue;
+        if (llama_tensor_on_host(l.ffn_up_gate_exps) ||
+                (llama_tensor_on_host(l.ffn_up_exps) && llama_tensor_on_host(l.ffn_gate_exps))) return &l;
+    }
+    return nullptr;
+}
+
+// The up/gate expert op of layer `l` for a batch of `n_tokens`, without data.
+static ggml_tensor * llama_moe_up_gate_op(ggml_context * g, const llama_model & model, const llama_layer & l,
+        int64_t n_tokens) {
+    const auto & hp = model.hparams;
+    ggml_tensor * x = ggml_new_tensor_3d(g, GGML_TYPE_F32, hp.n_embd, 1, n_tokens);
+    ggml_tensor * ids = ggml_new_tensor_2d(g, GGML_TYPE_I32, hp.n_expert_used, n_tokens);
+    return llama_tensor_on_host(l.ffn_up_gate_exps)
+            ? ggml_moe_up_gate(g, l.ffn_up_gate_exps, nullptr, x, ids, GGML_UNARY_OP_SILU)
+            : ggml_moe_up_gate(g, l.ffn_up_exps, l.ffn_gate_exps, x, ids, GGML_UNARY_OP_SILU);
+}
+
+// Offloading a host-resident expert op uploads the layer's expert banks once per
+// batch, while its CPU cost grows with the batch. Time both on one layer and
+// return the batch from which the upload is cheaper; 0 when not measurable.
+// GPU compute after the upload is not included, so this leans towards offload.
+static int llama_moe_offload_calibrate(llama_context & ctx, const llama_layer & l) {
+    const auto & hp = ctx.model.hparams;
+    const bool merged = llama_tensor_on_host(l.ffn_up_gate_exps);
+    const size_t layer_bytes = ggml_nbytes(l.ffn_down_exps) +
+            (merged ? ggml_nbytes(l.ffn_up_gate_exps) : ggml_nbytes(l.ffn_up_exps) + ggml_nbytes(l.ffn_gate_exps));
+
+    // Upload: copy a slice of the real (host) expert weights to a device buffer.
+    const size_t chunk = std::min<size_t>(64ull << 20, ggml_nbytes(l.ffn_down_exps));
+    ggml_backend_buffer_t device = ggml_backend_buft_alloc_buffer(
+            ggml_backend_get_default_buffer_type(ctx.backends[0]), chunk);
+    if (!device) return 0;
+    ggml_init_params tp = { ggml_tensor_overhead(), nullptr, true };
+    ggml_context * tctx = ggml_init(tp);
+    ggml_tensor * dst = ggml_new_tensor_1d(tctx, GGML_TYPE_I8, int64_t(chunk));
+    ggml_backend_tensor_alloc(device, dst, ggml_backend_buffer_get_base(device));
+    double copy_us = 1e30;
+    for (int i = 0; i < 3; ++i) {
+        const int64_t t0 = ggml_time_us();
+        ggml_backend_tensor_set(dst, l.ffn_down_exps->data, 0, chunk);
+        ggml_backend_synchronize(ctx.backends[0]);
+        copy_us = std::min(copy_us, double(ggml_time_us() - t0));
+    }
+    ggml_free(tctx);
+    ggml_backend_buffer_free(device);
+    const double upload_us = copy_us * double(layer_bytes) / double(chunk);
+
+    // CPU: the layer's real expert graph, uniformly random routes.
+    std::mt19937 rng(42);
+    auto cpu_us = [&](int n_tokens) -> double {
+        ggml_init_params gp = { 8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ggml_context * g = ggml_init(gp);
+        ggml_tensor * par = llama_moe_up_gate_op(g, ctx.model, l, n_tokens);
+        ggml_tensor * x = par->src[2], * ids = par->src[3];
+        ggml_tensor * out = ggml_mul_mat_id(g, l.ffn_down_exps, par, ids);
+        ggml_cgraph * gf = ggml_new_graph(g);
+        ggml_build_forward_expand(gf, out);
+        double us = -1;
+        if (ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(g, ctx.backend_cpu)) {
+            std::vector<float> xv(ggml_nelements(x), 0.01f);
+            ggml_backend_tensor_set(x, xv.data(), 0, ggml_nbytes(x));
+            std::vector<int32_t> iv(ggml_nelements(ids));
+            const int k = int(hp.n_expert_used);
+            for (int t = 0; t < n_tokens; ++t) for (int j = 0; j < k; ++j) {
+                int e;
+                do { e = int(rng() % hp.n_expert); } while (std::find(iv.begin() + t * k, iv.begin() + t * k + j, e) != iv.begin() + t * k + j);
+                iv[t * k + j] = e;
+            }
+            ggml_backend_tensor_set(ids, iv.data(), 0, ggml_nbytes(ids));
+            ggml_backend_cpu_set_n_threads(ctx.backend_cpu, int(ctx.cparams.n_threads_batch));
+            const int64_t t0 = ggml_time_us();
+            if (ggml_backend_graph_compute(ctx.backend_cpu, gf) == GGML_STATUS_SUCCESS) us = double(ggml_time_us() - t0);
+            ggml_backend_buffer_free(buf);
+        }
+        ggml_free(g);
+        return us;
+    };
+    constexpr int b1 = 64, b2 = 512;
+    cpu_us(b1); // first touch of the weights (page faults with mmap)
+    const double t1 = cpu_us(b1), t2 = cpu_us(b2);
+    const double per_token = (t2 - t1) / (b2 - b1), fixed = t1 - per_token * b1;
+    if (t1 <= 0 || t2 <= 0 || per_token <= 0) {
+        LLAMA_LOG_WARN("%s: expert offload calibration failed; keeping the offload-batch-size rule\n", __func__);
+        return 0;
+    }
+    const int tokens = std::max(1, int(std::ceil((upload_us - fixed) / per_token)));
+    LLAMA_LOG_INFO("%s: expert offload: upload %.1f ms/layer (%.1f GB/s), CPU %.1f ms + %.3f ms/token per layer -> offload from %d tokens\n",
+            __func__, upload_us / 1000, double(chunk) / copy_us / 1000, fixed / 1000, per_token / 1000, tokens);
+    return tokens;
+}
+
+// Smallest multiple of 512 up to `limit` whose expert op the GPU backend would
+// offload, by the backend's own rule; 0 if none.
+static uint32_t llama_moe_offload_ceiling(llama_context & ctx, const llama_layer & l, uint32_t limit) {
+    uint32_t found = 0;
+    for (uint32_t n = 512; n <= limit && !found; n += 512) {
+        ggml_init_params gp = { 4 * ggml_tensor_overhead(), nullptr, true };
+        ggml_context * g = ggml_init(gp);
+        if (ggml_backend_offload_op(ctx.backends[0], llama_moe_up_gate_op(g, ctx.model, l, n))) found = n;
+        ggml_free(g);
+    }
+    return found;
+}
+#endif
 
 static void llama_repack_up_gate_exps(llama_context & lctx) {
     if (lctx.cparams.mtp_op_type != MTP_OP_NONE) {
@@ -9696,6 +9812,7 @@ struct llama_context * llama_init_from_model(
     cparams.moe_resident_prefetch = params.moe_resident < 0 && params.moe_resident_zero_fill
             ? std::max(0, std::min<int32_t>(8, params.moe_resident_prefetch)) : 0;
     cparams.moe_resident_device_join = params.moe_resident < 0 && params.moe_resident_zero_fill && params.moe_resident_device_join;
+    cparams.moe_resident_ubatch_offload = cparams.moe_resident_ubatch && params.moe_resident_ubatch_offload;
     cparams.cuda_params      = params.cuda_params;
     cparams.mtp              = params.mtp;
     cparams.moe_cache_size   = params.moe_cache_size;
@@ -10282,6 +10399,30 @@ struct llama_context * llama_init_from_model(
                 }
             }
 
+#ifdef GGML_USE_CUDA
+            // Auto residency: choose the expert offload batch by measurement unless
+            // -cuda sets offload-batch-size, and keep follow-up prompts at a batch
+            // that still offloads (the default 512 ceiling assumes it does).
+            if (cparams.moe_resident < 0 && ctx->backends.size() == 2 && ggml_backend_is_cuda(ctx->backends[0])) {
+                if (const llama_layer * l = llama_moe_host_expert_layer(*model)) {
+                    const bool explicit_offload = cparams.cuda_params &&
+                            std::strstr((const char *)cparams.cuda_params, "offload-batch-size") != nullptr;
+                    if (!explicit_offload) {
+                        if (model->moe_offload_tokens < 0) model->moe_offload_tokens = llama_moe_offload_calibrate(*ctx, *l);
+                        ggml_backend_cuda_set_moe_offload_tokens(ctx->backends[0], model->moe_offload_tokens);
+                    }
+                    if (cparams.moe_resident_ubatch_offload) {
+                        const uint32_t ceiling = llama_moe_offload_ceiling(*ctx, *l, cparams.n_ubatch);
+                        if (ceiling > cparams.moe_resident_ubatch) {
+                            LLAMA_LOG_INFO("%s: adaptive generation ceiling %u -> %u tokens (smallest batch that offloads experts)\n",
+                                    __func__, cparams.moe_resident_ubatch, ceiling);
+                            cparams.moe_resident_ubatch = ceiling;
+                            ctx->active_ubatch = ceiling;
+                        }
+                    }
+                }
+            }
+#endif
             // build worst-case graph
             if (cparams.moe_resident_ubatch) n_tokens = ctx->active_ubatch;
             int n_past = cparams.n_ctx - n_tokens;

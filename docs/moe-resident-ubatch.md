@@ -1,12 +1,19 @@
 # Adaptive MoE compute workspace
 
-`--moe-resident-ubatch N` enables an opt-in compute-workspace handoff under
+`--moe-resident-ubatch N` enables a compute-workspace handoff under
 automatic MoE residency. `N` is the generation and follow-up microbatch ceiling in tokens,
 not an expert-cache budget. `--moe-resident [MiB|auto]` still controls experts.
 
+With `--moe-resident auto` or a MiB cap and no `-ub`, the handoff is on by
+default. The ceiling is then the smallest multiple of 512 at which the GPU
+backend offloads host-resident expert ops (see below), at least 512. It stays
+off with `-np` above 1, graph or attention split modes, an evaluation callback,
+`-b` below 512 or no GPU, so those keep the fixed workspace.
+
 | Options | Workspace policy |
 | --- | --- |
-| Option omitted, or `--moe-resident-ubatch 0` | Ordinary fixed workspace policy |
+| No residency, or `-ub` given, or `--moe-resident-ubatch 0` | Ordinary fixed workspace policy |
+| `--moe-resident auto` (or a MiB cap) without `-ub` | Automatic prefill workspace, then the offload-derived ceiling until full context reset |
 | Residency omitted, or `--moe-resident 0` | Adaptation disabled, even if the workspace option is present |
 | `--moe-resident auto --moe-resident-ubatch 512 -ub 2048` | Initial prefill ceiling up to 2048, generation and follow-up ceiling 512 until full context reset |
 | `--moe-resident auto --moe-resident-ubatch 512` without `-ub` | Choose the largest measured initial prefill workspace fitting available GPU memory, in multiples of 512, up to `-b`; then retain the 512 ceiling until full context reset |
@@ -35,6 +42,23 @@ CUDA headroom prevents further growth. Automatic residency, with or without
 adaptive ubatching, sizes complete-expert slots from the byte budget up to all
 experts in the eligible layers. The former limit of twice the active-expert
 count per layer is removed for this cache.
+
+## Expert offload batch
+
+Prefill with host-resident experts is dominated by the offload path: for each
+microbatch the CUDA backend uploads a layer's expert banks and computes there.
+That pays off only above some batch. The backend's rule
+`ubatch * n_expert_used >= offload-batch-size * n_expert` depends on the model,
+and 512 tokens qualify for Qwen3.6-35B-A3B only with `offload-batch-size=16`.
+
+Under automatic residency, unless `-cuda` sets `offload-batch-size` or
+`offload-batch-size-per-byte`, context creation measures it once per model on
+the first host-expert layer: the upload of a 64 MiB slice of the real expert
+weights, and the CPU expert graph at 64 and 512 tokens. Expert ops offload from
+the batch at which the CPU estimate exceeds the upload time (GPU compute after
+the upload is not counted). Dense ops keep the `offload-batch-size` rule. The log
+line `expert offload: upload ... -> offload from N tokens` reports the result,
+and `adaptive generation ceiling 512 -> N` reports a raised ceiling.
 
 ## Refresh at the start of a response
 
