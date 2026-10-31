@@ -58,6 +58,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"suffix",        COMMON_SPECULATIVE_TYPE_SUFFIX}
 };
 
+const llama_ckpt_data spec_ckpt = { LLAMA_CHECKPOINT_SPEC, 0 };
+
 bool common_speculative_needs_checkpoint(const llama_model * model) {
     return model != nullptr &&
         llama_model_has_recurrent(model);
@@ -1413,7 +1415,7 @@ common_speculative * common_speculative_init(
 
     if (!configs.empty() && common_speculative_needs_checkpoint(target_model)) {
         const int ckpt_tokens = std::max(1, params.get_max_stage_n_max() + 1);
-        const int actual_mode = llama_spec_ckpt_init(ctx_tgt, params.spec_ckpt_mode, ckpt_tokens);
+        const int actual_mode = llama_spec_ckpt_init(ctx_tgt, spec_ckpt, params.spec_ckpt_mode, ckpt_tokens);
         if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
             LOG_ERR("%s: failed to prepare speculative checkpoint mode '%s' during speculative init (max_tokens=%d)\n",
                     __func__,
@@ -1426,7 +1428,7 @@ common_speculative * common_speculative_init(
             }
             return nullptr;
         }
-        llama_spec_ckpt_discard(ctx_tgt);
+        llama_spec_ckpt_discard(ctx_tgt, spec_ckpt);
         params.spec_ckpt_mode = actual_mode;
     }
 
@@ -2663,15 +2665,15 @@ static bool common_speculative_checkpoint_save(
     ckpt.n_past = n_past;
     ckpt.sampled = sampled;
 
-    const int actual_mode = llama_spec_ckpt_init(ctx, ckpt_mode, max_tokens);
+    const int actual_mode = llama_spec_ckpt_init(ctx, spec_ckpt, ckpt_mode, max_tokens);
     if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
         return false;
     }
     ckpt.mode = actual_mode;
 
-    ckpt.valid = llama_spec_ckpt_save(ctx, seq_id);
+    ckpt.valid = llama_spec_ckpt_save(ctx, spec_ckpt, seq_id);
     if (!ckpt.valid) {
-        llama_spec_ckpt_discard(ctx);
+        llama_spec_ckpt_discard(ctx, spec_ckpt);
         return false;
     }
 
@@ -2696,7 +2698,7 @@ void common_speculative_checkpoint_discard(
         common_speculative_checkpoint & ckpt,
         llama_context * ctx) {
     ckpt.clear();
-    llama_spec_ckpt_discard(ctx);
+    llama_spec_ckpt_discard(ctx, spec_ckpt);
 }
 
 bool common_speculative_checkpoint_restore(
@@ -2717,7 +2719,7 @@ bool common_speculative_checkpoint_restore(
 
     const int step = (int) ids.size() - 1;
     const enum llama_spec_ckpt_restore_result restore_result = llama_spec_ckpt_restore_ex(
-            ctx, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
+            ctx, spec_ckpt, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
     if (restore_result == LLAMA_SPEC_CKPT_RESTORE_FAILED) {
         LOG_ERR("%s: seq_id=%d speculative checkpoint restore failed\n", __func__, (int) seq_id);
         common_speculative_checkpoint_discard(ckpt, ctx);
@@ -3141,6 +3143,28 @@ llama_context * common_speculative_get_companion_ctx(common_speculative * spec) 
     }
 
     return nullptr;
+}
+
+std::vector<const llama_context *> common_speculative_get_draft_contexts(const common_speculative * spec) {
+    std::vector<const llama_context *> result;
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (const auto & impl : spec->impls) {
+        const llama_context * ctx = nullptr;
+        if (const auto * state = dynamic_cast<const common_speculative_state_draft *>(impl.get())) {
+            ctx = state->ctx_dft;
+        } else if (const auto * state = dynamic_cast<const common_speculative_state_mtp *>(impl.get())) {
+            ctx = state->ctx_mtp;
+        } else if (const auto * state = dynamic_cast<const common_speculative_state_dflash *>(impl.get())) {
+            ctx = state->ctx_dft;
+        }
+        if (ctx != nullptr) {
+            result.push_back(ctx);
+        }
+    }
+    return result;
 }
 
 static int32_t mtp_accept_batch(

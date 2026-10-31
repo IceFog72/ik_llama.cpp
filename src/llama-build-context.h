@@ -20,6 +20,7 @@ using llm_build_cb = std::function<void(struct ggml_tensor * cur, const char * n
 
 enum llm_ffn_op_type {
     LLM_FFN_SILU,
+    LLM_FFN_SITU,
     LLM_FFN_GELU,
     LLM_FFN_RELU,
     LLM_FFN_RELU_SQR,
@@ -41,6 +42,23 @@ struct post_norm_data {
     std::vector<ggml_tensor *> next_input;
     ggml_tensor * norm;
     float         f_rms_eps;
+};
+
+struct mla_pp_params {
+    ggml_cgraph * gf = nullptr;
+    int il = -1;
+    ggml_tensor * q = nullptr;
+    ggml_tensor * cache = nullptr;
+    ggml_tensor * wkv_b = nullptr;
+    ggml_tensor * mask = nullptr;
+    ggml_tensor * dsa_last_full_sorted = nullptr;
+    int64_t n_head = 0;
+    int64_t n_embd_head_k = 0;
+    int64_t n_embd_head_v = 0;
+    int64_t n_extra = 0;
+    int64_t kv_lora_rank = 0;
+    float kq_scale = 0.0f;
+    bool force_flash_f32 = false;
 };
 
 struct llm_build_context {
@@ -74,6 +92,7 @@ struct llm_build_context {
     const float norm_rms_eps;
 
     const int32_t n_tokens;
+    int32_t n_tokens_seg;   // token count of the segment being built (n_tokens unless replaying)
     const int32_t n_kv;     // size of KV cache to consider (n_kv <= kv_self.size)
     const int32_t n_outputs;
     const int32_t n_outputs_enc;
@@ -97,6 +116,7 @@ struct llm_build_context {
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
     const bool clear_lctx_inputs;
+    const bool worst_case;  // the graph only sizes buffers, so it must be at least as large as any real batch's
 
     const llm_build_cb & cb;
 
@@ -251,7 +271,11 @@ struct llm_build_context {
     ggml_cgraph * build_qwen3next();
     ggml_cgraph * build_qwen4exp();
 
+    ggml_tensor * build_lfm_shortconv(ggml_cgraph * gf, ggml_tensor * input, ggml_tensor * state_seq,
+            uint32_t state_seq_id, bool reset_state, int il);
+
     ggml_cgraph * build_lfm2();
+    ggml_cgraph * build_lfm3();
 
     ggml_cgraph * build_qwen35moe();
 
@@ -437,6 +461,7 @@ struct llm_build_context {
     ggml_cgraph * build_bailingmoe2();
     ggml_cgraph * build_bailingmoe3();
     ggml_cgraph * build_glm5next();
+    ggml_cgraph * build_raon1();
 
     ggml_cgraph * build_glm5next_mtp();
 
@@ -444,6 +469,8 @@ struct llm_build_context {
     ggml_cgraph * build_minimaxm3();
 
     ggml_cgraph * build_smollm3();
+
+    ggml_cgraph * build_spark2_5();
 
     ggml_cgraph * build_mimo2();
 
@@ -469,6 +496,8 @@ struct llm_build_context {
     //
     static ggml_tensor * llm_build_lora_mm(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * w, ggml_tensor * cur);
+
+    ggml_tensor * build_mla_expanded_pp(const mla_pp_params & p);
 
     static ggml_tensor * build_mla_output_gate(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * output, ggml_tensor * input, ggml_tensor * gate_w,

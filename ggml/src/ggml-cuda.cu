@@ -25,9 +25,11 @@
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
+#include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/dmmv.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fill.cuh"
+#include "ggml-cuda/fma.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -35,6 +37,7 @@
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
+#include "ggml-cuda/pool1d.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
 #include "ggml-cuda/scale.cuh"
@@ -595,6 +598,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
         if (cublas_handles[i] != nullptr) {
             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+        }
+        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            if (cublas_workspaces[i][j] != nullptr) {
+                CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
+            }
         }
     }
     auto info = const_cast<ggml_cuda_device_info*>(&ggml_cuda_info());
@@ -1923,7 +1931,7 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float alpha_f32 = 1.0f;
         const float beta_f32  = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        ctx.cublas_handle(id, stream);
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
@@ -1961,7 +1969,7 @@ static void ggml_cuda_op_mul_mat_cublas(
             const float alpha_f32 = 1.0f;
             const float beta_f32  = 0.0f;
 
-            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+            ctx.cublas_handle(id, stream);
             CUBLAS_CHECK(
                     cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                         row_diff, src1_ncols, ne10,
@@ -2005,7 +2013,7 @@ static void ggml_cuda_op_mul_mat_cublas(
         const half alpha_f16 = 1.0f;
         const half beta_f16 = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        ctx.cublas_handle(id, stream);
         CUBLAS_CHECK(
             cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
@@ -2040,7 +2048,7 @@ static void ggml_cuda_op_mul_mat_cublas(
         const float alpha = 1.0f;
         const float beta = 0.0f;
 
-        CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+        ctx.cublas_handle(id, stream);
         CUBLAS_CHECK(
             cublasSgemm(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                     row_diff, src1_ncols, ne10,
@@ -2493,7 +2501,7 @@ static void ggml_cuda_mul_mat_batched_cublas_impl(ggml_backend_cuda_context & ct
 
     const int64_t ne_dst = ggml_nelements(dst);
     cudaStream_t main_stream = ctx.stream();
-    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), main_stream));
+    ctx.cublas_handle(ctx.device, main_stream);
 
     float * dst_ddf = (float *) dst->data;
     const size_t ts_src1 = ggml_type_size(src1->type);
@@ -2861,6 +2869,13 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         && src1->ne[1] <= ggml_cuda_mmvq_max_batch_size(cc);
     bool              use_mul_mat_q =  ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+
+#ifdef GGML_CUDA_USE_DMMV
+    if (use_dequantize_mul_mat_vec && src0->ne[1] >= 16*src0->ne[0]) {
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_dequantize_mul_mat_vec, nullptr);
+        return node_n;
+    }
+#endif
 
     // if mmvq is available it's a better choice than dmmv:
 #ifndef GGML_CUDA_FORCE_DMMV
@@ -3985,6 +4000,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 ggml_cuda_op_mul(ctx, dst);
             }
             break;
+        case GGML_OP_FMA:
+            ggml_cuda_op_fma(ctx, dst);
+            break;
         case GGML_OP_FUSED_MUL_UNARY:
             ggml_cuda_op_fused_mul_unary(ctx, dst);
             break;
@@ -4270,6 +4288,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
                 break;
+        case GGML_OP_DIAG:
+            ggml_cuda_op_diag(ctx, dst);
+            break;
         case GGML_OP_DIAG_MASK_INF:
             ggml_cuda_op_diag_mask_inf(ctx, dst);
             break;
@@ -4369,6 +4390,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_POOL_2D:
             ggml_cuda_op_pool2d(ctx, dst);
             break;
+        case GGML_OP_POOL_1D:
+            ggml_cuda_op_pool1d(ctx, dst);
+            break;
         case GGML_OP_SUM_ROWS:
             if (fusion && i + 2 < cgraph->n_nodes &&
                 cgraph->nodes[i+1]->op == GGML_OP_SCALE &&
@@ -4397,6 +4421,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             } else {
                 ggml_cuda_op_sum_rows(ctx, dst);
             }
+            break;
+        case GGML_OP_MEAN:
+            ggml_cuda_op_mean(ctx, dst);
             break;
         case GGML_OP_CUMSUM:
             ggml_cuda_op_cumsum(ctx, dst);
@@ -4949,6 +4976,18 @@ static inline ggml_cuda_graph * ggml_cuda_get_graph(ggml_backend_cuda_context & 
     auto & graph = ctx.cuda_graphs[key];
     if (!graph) {
         graph = std::make_unique<ggml_cuda_graph>();
+    }
+    if (ctx.max_graphs > 0) {
+        graph->last_used_time = ggml_time_us();
+        if (ctx.cuda_graphs.size() > size_t(ctx.max_graphs)) {
+            auto lru = ctx.cuda_graphs.begin();
+            for (auto it = ctx.cuda_graphs.begin(); it != ctx.cuda_graphs.end(); ++it) {
+                if (it->second->last_used_time < lru->second->last_used_time) {
+                    lru = it;
+                }
+            }
+            ctx.cuda_graphs.erase(lru);
+        }
     }
     return graph.get();
 }
@@ -5604,6 +5643,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_MULTI_ADD:
         case GGML_OP_MUL_MULTI_ADD:
         case GGML_OP_MUL:
+        case GGML_OP_FMA:
         case GGML_OP_DIV:
         case GGML_OP_SUB:
         case GGML_OP_FUSED_RMS_NORM:
@@ -5615,6 +5655,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_CLAMP:
         case GGML_OP_CONT:
         case GGML_OP_DIAG_MASK_INF:
+        case GGML_OP_DIAG:
         case GGML_OP_SOFT_MAX:
         case GGML_OP_SOFT_CAP_MAX:
         case GGML_OP_ROPE:
@@ -5642,6 +5683,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             }
         case GGML_OP_IM2COL:
         case GGML_OP_POOL_2D:
+        case GGML_OP_POOL_1D:
         case GGML_OP_SUM_ROWS:
         case GGML_OP_GROUPED_TOPK:
         case GGML_OP_ACC:
@@ -5652,6 +5694,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_TIMESTEP_EMBEDDING:
         case GGML_OP_LEAKY_RELU:
             return true;
+        case GGML_OP_MEAN:
         case GGML_OP_CUMSUM:
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
         case GGML_OP_TRI:
@@ -5859,6 +5902,7 @@ struct cuda_params {
     bool  fa_quant_tile = false;
 #ifdef USE_CUDA_GRAPH
     bool use_cuda_graph = true;
+    int  max_graphs = 0;
 #else
     bool use_cuda_graph = false;
 #endif
@@ -5941,6 +5985,9 @@ static cuda_params ggml_cuda_parse_params(const char * params_string) {
             else if (parsed[0] == "graphs") {
                 is_good = read_value(parsed[1], params.use_cuda_graph);
             }
+            else if (parsed[0] == "max-graphs") {
+                is_good = read_value(parsed[1], params.max_graphs);
+            }
 #endif
         }
         if (!is_good) {
@@ -6004,6 +6051,10 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device, [[maybe_unused]] con
         if (params.use_cuda_graph != ctx->use_cuda_graph) {
             GGML_CUDA_LOG_INFO(" =========================== %s: setting use_cuda_graph to %d\n", __func__, params.use_cuda_graph);
             ctx->use_cuda_graph = params.use_cuda_graph;
+        }
+        if (params.max_graphs != ctx->max_graphs) {
+            GGML_CUDA_LOG_INFO(" =========================== %s: setting max_graphs to %d\n", __func__, params.max_graphs);
+            ctx->max_graphs = params.max_graphs;
         }
 #endif
     }

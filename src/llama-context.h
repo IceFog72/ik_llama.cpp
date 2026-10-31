@@ -289,16 +289,22 @@ struct llama_kv_cache {
     };
 
     gpu_checkpoint ckpt;
+    std::map<llama_pos, gpu_checkpoint *> ckpt_rewind_map;
+    std::vector<std::unique_ptr<gpu_checkpoint>> ckpt_rewind_pool;
 
-    bool checkpoint_alloc_shadows(bool conv_only_shadow = false);
+    bool checkpoint_alloc_shadows(llama_ckpt_data ckpt_type, bool conv_only_shadow = false);
     bool checkpoint_supported() const;
-    bool checkpoint_save(ggml_backend_sched_t sched);
-    bool checkpoint_restore(ggml_backend_sched_t sched);
-    void checkpoint_delete();
+    bool checkpoint_save(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type);
+    bool checkpoint_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type);
+    void checkpoint_delete(llama_ckpt_data ckpt_type);
+
+    gpu_checkpoint & llama_get_ckpt(llama_ckpt_data ckpt_type);
+
+    bool llama_ckpt_mode_equal(llama_ckpt_data ckpt_type, int mode) const;
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
     bool per_step_alloc(const llama_model & model, int max_tokens);
-    bool per_step_restore(ggml_backend_sched_t sched, int step, uint32_t slot);
+    bool per_step_restore(ggml_backend_sched_t sched, llama_ckpt_data ckpt_type, int step, uint32_t slot);
 
     ~llama_kv_cache() {
         for (struct ggml_context * ctx : ctxs) {
@@ -618,6 +624,7 @@ struct llama_context {
             struct ggml_tensor * cand_pin = nullptr;
             struct ggml_tensor * state_write_pos = nullptr;
             struct ggml_tensor * kq_mask = nullptr;
+            struct ggml_tensor * n_visible = nullptr;
         };
 
         struct storage {
@@ -711,6 +718,7 @@ struct llama_context {
         struct ggml_tensor * win_cells  = nullptr; // I32 [ratio*n_win]   member cells of those blocks
         struct ggml_tensor * win_pos    = nullptr; // I32 [4*n_win]       mrope position of those blocks
         struct ggml_tensor * head_w     = nullptr; // F32 [n_idx_h, n_tokens] all ones; the head sum is unweighted
+        struct ggml_tensor * cut_mask   = nullptr;
     };
     std::vector<qsa_input> inp_qsa;
 
@@ -737,6 +745,12 @@ struct llama_context {
         int64_t w_view    = 0;
         int64_t win_off   = 0;
     } swa_window_view;
+
+    // keep slice chosen by the builder for this ubatch, read by the capture row accounting
+    struct dsv41_replay_state {
+        bool    active = false;
+        int64_t keep   = 0;
+    } dsv41_replay;
 
     // multi-head MTP chaining state: head k's output row at the last committed position,
     // written back after each warmup/update decode and fed into the next MTP graph through
