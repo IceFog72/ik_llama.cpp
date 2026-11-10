@@ -457,6 +457,12 @@ static __device__ __forceinline__ float iq1bn_fp8_to_float(uint8_t fp8) {
     return s.f;
 }
 
+static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
+    const uint32_t e = (x >> 3) & 0xf;
+    const uint32_t m = x & 0x7;
+    return e ? __uint_as_float((e + 120) << 23 | m << 20) : m*(1.0f/512);
+}
+
 template <ggml_type type>
 struct ggml_cuda_type_traits;
 
@@ -632,6 +638,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_MXFP4> {
     static constexpr int qk = QK4_NL;
     static constexpr int qr = QR4_NL;
     static constexpr int qi = QI4_NL;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_NVFP4_KS> {
+    static constexpr int qk = QK_NVFP4;
+    static constexpr int qr = QR_NVFP4;
+    static constexpr int qi = QI_NVFP4;
 };
 
 template<>
@@ -814,6 +827,52 @@ struct ggml_cuda_type_traits<GGML_TYPE_IQ5_K_R4> {
     static constexpr int qk = QK_K;
     static constexpr int qr = QR5_XS;
     static constexpr int qi = QI5_XS;
+};
+
+
+#define QR_TQ 4
+#define QI_TQ (QK_TQK/QR_TQ)
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQ2_T> {
+    static constexpr int qk = QK_TQK;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQK6> {
+    static constexpr int qk = QK_TQK;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQK7> {
+    static constexpr int qk = QK_TQK;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP5> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP6> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
+};
+
+template<>
+struct ggml_cuda_type_traits<GGML_TYPE_TQP7> {
+    static constexpr int qk = QK_TQP;
+    static constexpr int qr = QR_TQ;
+    static constexpr int qi = QI_TQ;
 };
 
 

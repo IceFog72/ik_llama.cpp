@@ -38,6 +38,9 @@ enum llm_norm_type {
     LLM_NORM_RMS,
 };
 
+// query rows per MiniMax-M3 indexer-score chunk, bounds the F32 score of a prefill ubatch as in glm5next
+constexpr int32_t MINIMAXM3_MSA_SCORE_CHUNK = 256;
+
 struct post_norm_data {
     std::vector<ggml_tensor *> next_input;
     ggml_tensor * norm;
@@ -206,7 +209,7 @@ struct llm_build_context {
             ggml_tensor * wq, ggml_tensor * bq,
             ggml_tensor * wk, ggml_tensor * bk,
             ggml_tensor * wv, ggml_tensor * bv,
-            float attention_scale, int il, bool add_graph_split = false) const;
+            float attention_scale, int il, bool add_graph_split = false, ggml_tensor * v_cur = nullptr) const;
 
     std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_mul_mat_qkv(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * wqkv, ggml_tensor * bqkv,
@@ -214,7 +217,8 @@ struct llm_build_context {
             ggml_tensor * wq, ggml_tensor * bq,
             ggml_tensor * wk, ggml_tensor * bk,
             ggml_tensor * wv, ggml_tensor * bv,
-            ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il, bool add_graph_split = false) const;
+            ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il, bool add_graph_split = false,
+            ggml_tensor * v_cur = nullptr) const;
 
     std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_mul_mat_qkv_gated(ggml_cgraph * gf, ggml_tensor * cur,
             ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il) const;
@@ -222,6 +226,8 @@ struct llm_build_context {
     ggml_cgraph * build_llama();
 
     ggml_cgraph * build_muse_glimmer();
+
+    ggml_cgraph * build_ricursive();
 
     ggml_cgraph * build_mistral3();
 
@@ -447,6 +453,7 @@ struct llm_build_context {
     ggml_cgraph * build_chatglm();
 
     ggml_cgraph * build_glm4();
+    ggml_cgraph * build_glm4_with_mtp();
 
     ggml_cgraph * build_dots1();
 
@@ -462,6 +469,7 @@ struct llm_build_context {
     ggml_cgraph * build_bailingmoe3();
     ggml_cgraph * build_glm5next();
     ggml_cgraph * build_raon1();
+    ggml_cgraph * build_xing4();
 
     ggml_cgraph * build_glm5next_mtp();
 
@@ -505,7 +513,7 @@ struct llm_build_context {
 
     static ggml_tensor * llm_build_lora_mm_id(llama_context & lctx, ggml_context * ctx0,
           ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids,
-          ggml_tensor * cache_w = nullptr, ggml_tensor * cache_ids = nullptr);
+          ggml_tensor * cache_w = nullptr, ggml_tensor * cache_ids = nullptr, bool fuse_signs = true);
 
     static ggml_tensor * llm_build_inp_embd(ggml_context * ctx, llama_context & lctx,
         const llama_hparams & hparams,
@@ -545,7 +553,7 @@ struct llm_build_context {
                     float     kq_scale,
          const llm_build_cb & cb, int il, ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
          ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
-                    int32_t   swa_head = -1);
+                    int32_t   swa_head = -1, ggml_tensor * kv_idx = nullptr);
 
     static ggml_tensor * llm_build_ffn(ggml_context * ctx, llama_context & lctx, ggml_tensor * ffn_norm,
          ggml_tensor * cur,
@@ -656,7 +664,8 @@ llm_expert_gating_func_type   gating_op,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
             bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_il = -1, float post_norm_eps = 0.0f,
-            post_norm_data * pnd = nullptr, ggml_tensor ** k_view = nullptr, ggml_tensor ** v_view = nullptr);
+            post_norm_data * pnd = nullptr, ggml_tensor ** k_view = nullptr, ggml_tensor ** v_view = nullptr,
+            ggml_tensor * kv_idx = nullptr, ggml_tensor * v_res = nullptr);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 

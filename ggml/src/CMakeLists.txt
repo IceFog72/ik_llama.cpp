@@ -255,13 +255,23 @@ if (GGML_CUDA)
                 #set(CMAKE_CUDA_ARCHITECTURES "OFF") # use this to compile much faster, but only F16 models work
             endif()
         endif()
-        message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
         if (GGML_MUSA)
             set(CMAKE_CUDA_COMPILER ${MUSAToolkit_MCC_EXECUTABLE})
         else()
             enable_language(CUDA)
         endif()
+
+        if (CMAKE_CUDA_ARCHITECTURES STREQUAL "native" AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+            set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
+            list(TRANSFORM CMAKE_CUDA_ARCHITECTURES REPLACE "^(120|121)((-real)?)$" "\\1a\\2")
+        endif()
+        message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+        foreach(arch IN LISTS CMAKE_CUDA_ARCHITECTURES)
+            if (arch MATCHES "^(120|121)a(-real|-virtual)?$")
+                set_property(SOURCE ggml-cuda/nvfp4.cu APPEND PROPERTY COMPILE_DEFINITIONS "GGML_CUDA_NVFP4_${CMAKE_MATCH_1}A")
+            endif()
+        endforeach()
 
         file(GLOB   GGML_HEADERS_CUDA "ggml-cuda/*.cuh")
         list(APPEND GGML_HEADERS_CUDA "../include/ggml-cuda.h")
@@ -1155,7 +1165,7 @@ if (CMAKE_OSX_ARCHITECTURES      STREQUAL "arm64" OR
     endif()
 elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR
         (NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_GENERATOR_PLATFORM_LWR AND
-         CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64)$"))
+         CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|i686|AMD64|amd64)$"))
     message(STATUS "x86 detected")
     if (MSVC)
         # instruction set detection for MSVC only
@@ -1238,6 +1248,14 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
         endif()
         if (GGML_AVX512_BF16)
             list(APPEND ARCH_FLAGS -mavx512bf16)
+        endif()
+        if (GGML_USE_I32GATHER)
+            message(STATUS "Prefer ZMM Gather Instructions")
+            add_compile_definitions(GGML_USE_I32GATHER)
+        endif()
+        if (GGML_CPU_INTEL_CLIENT)
+            message(STATUS "Build for Intel Client CPUs")
+            add_compile_definitions(GGML_CPU_INTEL_CLIENT)
         endif()
     endif()
 elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")

@@ -2,6 +2,7 @@
 #include "mmq_id.cuh"
 #include "quantize_id.cuh"
 #include "quantize.cuh"
+#include "nvfp4.cuh"
 
 #include <vector>
 #include <climits>
@@ -101,6 +102,9 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
             break;
         case GGML_TYPE_MXFP4:
             mul_mat_q_case_id<GGML_TYPE_MXFP4>(ctx, args, stream);
+            break;
+        case GGML_TYPE_NVFP4_KS:
+            mul_mat_q_case_id<GGML_TYPE_NVFP4_KS>(ctx, args, stream);
             break;
         case GGML_TYPE_Q2_K:
             mul_mat_q_case_id<GGML_TYPE_Q2_K>(ctx, args, stream);
@@ -218,6 +222,24 @@ static void ggml_cuda_mul_mat_q_switch_type_id(ggml_backend_cuda_context & ctx, 
             break;
         case GGML_TYPE_IQ4_KT:
             mul_mat_q_case_id<GGML_TYPE_IQ4_KT>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQ2_T:
+            mul_mat_q_case_id<GGML_TYPE_TQ2_T>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQK6:
+            mul_mat_q_case_id<GGML_TYPE_TQK6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQK7:
+            mul_mat_q_case_id<GGML_TYPE_TQK7>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP5:
+            mul_mat_q_case_id<GGML_TYPE_TQP5>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP6:
+            mul_mat_q_case_id<GGML_TYPE_TQP6>(ctx, args, stream);
+            break;
+        case GGML_TYPE_TQP7:
+            mul_mat_q_case_id<GGML_TYPE_TQP7>(ctx, args, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -392,6 +414,10 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
                 launch_mmq_ids_helper< 8> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
                     ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
                 break;
+            case 10:
+                launch_mmq_ids_helper<10> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+                break;
             case 16:
                 launch_mmq_ids_helper<16> ((const int32_t *) ids_tensor->data, ids_src1, ids_dst, expert_bounds,
                     ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
@@ -409,6 +435,11 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }
 
     const int64_t ne11_flat = ne12*n_expert_used;
+    if (ggml_cuda_can_mul_mat_nvfp4_id(src0, src1, cc)) {
+        nvfp4_input input(ctx, src1, ggml_get_input_scale(src0));
+        ggml_cuda_gemm_nvfp4_id(ctx, src0, src1, dst, ids_src1, ids_dst, expert_bounds, input);
+        return;
+    }
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
@@ -463,6 +494,7 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_Q6_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4_KS:
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
         case GGML_TYPE_Q4_K:
@@ -502,6 +534,12 @@ bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
         case GGML_TYPE_IQ2_KT:
         case GGML_TYPE_IQ3_KT:
         case GGML_TYPE_IQ4_KT:
+        case GGML_TYPE_TQ2_T:
+        case GGML_TYPE_TQK6:
+        case GGML_TYPE_TQK7:
+        case GGML_TYPE_TQP5:
+        case GGML_TYPE_TQP6:
+        case GGML_TYPE_TQP7:
             mmq_supported = true;
             break;
         default:

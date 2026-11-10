@@ -74,6 +74,7 @@ add_library(llama
             # graphs
             graphs/build_llama.cpp
             graphs/build_muse_glimmer.cpp
+            graphs/build_ricursive.cpp
             graphs/build_mistral3.cpp
             graphs/build_deci.cpp
             graphs/build_baichuan.cpp
@@ -141,6 +142,7 @@ add_library(llama
             graphs/build_bailingmoe3.cpp
             graphs/build_glm5next.cpp
             graphs/build_raon1.cpp
+            graphs/build_xing4.cpp
             graphs/build_minimaxm2.cpp
             graphs/build_minimaxm3.cpp
             graphs/build_smollm3.cpp

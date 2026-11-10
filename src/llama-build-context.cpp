@@ -133,6 +133,8 @@ void llm_build_context::init() {
         lctx.inp_kpool_bias      = nullptr;
         lctx.inp_kpool_tail      = nullptr;
         lctx.inp_kpool_ape_slots = nullptr;
+        lctx.inp_msa_cells       = nullptr;
+        lctx.inp_msa_bias        = nullptr;
         lctx.inp_mtp_carry     = nullptr;
         lctx.inp_qsa.clear();
         lctx.dflash.inputs.target_features = nullptr;
@@ -265,7 +267,9 @@ ggml_cgraph * llm_build_context::build_k_shift() {
     // without the indexer. This block is therefore correct-and-dormant: it never executes on the
     // current MLA path, but keeps the indexer keys consistent the instant MLA K-shift is ever enabled.
     // It is NOT a way for the indexer to desync — the shift simply does not happen for MLA.
-    if (model.arch == LLM_ARCH_GLM_DSA && hparams.indexer_head_size > 0 && !kv_self.kr_l.empty()) {
+    // MiniMax-M3 caches its indexer keys the same way, without the Hadamard, and is not MLA, so there it runs.
+    if ((model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_MINIMAX_M3) &&
+            hparams.indexer_head_size > 0 && !kv_self.kr_l.empty()) {
         const int64_t head_size = hparams.indexer_head_size;
         const int64_t rope_dim  = n_rot;              // n_embd_head_qk_rope (indexer pe dims)
         const int64_t nope_dim  = head_size - rope_dim;
@@ -275,7 +279,7 @@ ggml_cgraph * llm_build_context::build_k_shift() {
         // we can un/re-rotate the cached key. Must match build_deepseek2_dsa_indexer exactly.
         bool do_hadamard = false;
         static const bool dsa_had_disable = getenv("DSA_HADAMARD_DISABLE") != nullptr;
-        if (lctx.cparams.dsa_indexer_hadamard && !dsa_had_disable) {
+        if (model.arch == LLM_ARCH_GLM_DSA && lctx.cparams.dsa_indexer_hadamard && !dsa_had_disable) {
             GGML_ASSERT((head_size & ~(head_size-1)) == head_size);
             do_hadamard = true;
         }
@@ -482,7 +486,7 @@ static struct ggml_tensor * llm_build_hadamard_rotate(
         struct ggml_context * ctx0,
         struct ggml_tensor * cur,
         const llama_hadamard_transform & t,
-        bool inverse);
+        bool inverse, bool fuse_signs);
 
 struct ggml_tensor * llm_build_context::build_inp_embd_mtp(struct ggml_tensor * mtp_tok_embd) {
     struct ggml_tensor * cur = nullptr;
@@ -501,7 +505,7 @@ struct ggml_tensor * llm_build_context::build_inp_embd_mtp(struct ggml_tensor * 
         // undo the Hadamard rotation of the embedding table (latent token embedding);
         // without this the draft head consumes embeddings in the rotated basis
         if (auto rot = lctx.model.hadamard_rotation(mtp_tok_embd); rot != nullptr) {
-            cur = llm_build_hadamard_rotate(ctx0, cur, *rot, true);
+            cur = llm_build_hadamard_rotate(ctx0, cur, *rot, true, false);
         }
     } else {
         lctx.inp_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, batch.n_tokens);
@@ -923,7 +927,7 @@ static struct ggml_tensor * llm_build_hadamard_rotate(
         struct ggml_context * ctx0,
         struct ggml_tensor * cur,
         const llama_hadamard_transform & t,
-        bool inverse = false) {
+        bool inverse, bool fuse_signs) {
     if (t.block_size == 0) {
         return cur;
     }
@@ -940,6 +944,10 @@ static struct ggml_tensor * llm_build_hadamard_rotate(
         res = ggml_reshape_4d(ctx0, x, t.perm_hd*t.perm_nk*t.perm_rep, ne1, ne2, ne3);
     }
     const bool signs_first = !inverse;
+    if (t.signs && fuse_signs && ggml_is_contiguous(res) && ggml_is_contiguous(t.signs) && ggml_nrows(t.signs) == 1 &&
+        res->ne[0] == t.signs->ne[0] && res->type == GGML_TYPE_F32 && t.signs->type == GGML_TYPE_F32) {
+        return ggml_signed_hadamard(ctx0, res, t.signs, t.block_size, signs_first);
+    }
     if (signs_first && t.signs) {
         res = ggml_mul(ctx0, res, t.signs);
     }
@@ -982,7 +990,7 @@ ggml_tensor * llm_build_context::llm_build_inp_embd(
 
         // undo the Hadamard rotation of the embedding table
         if (auto rot = lctx.model.hadamard_rotation(tok_embd); rot != nullptr) {
-            inpL = llm_build_hadamard_rotate(ctx, inpL, *rot, true);
+            inpL = llm_build_hadamard_rotate(ctx, inpL, *rot, true, false);
         }
     } else {
        lctx.inp_embd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, batch.n_tokens);
@@ -1082,7 +1090,7 @@ ggml_tensor * llm_build_context::llm_build_lora_mm(
         if (memo_it != lctx.hadamard_memo.end()) {
             cur_mm = memo_it->second;
         } else {
-            cur_mm = llm_build_hadamard_rotate(ctx0, cur, *rot);
+            cur_mm = llm_build_hadamard_rotate(ctx0, cur, *rot, false, true); //false);
             lctx.hadamard_memo[memo_key] = cur_mm;
         }
     }
@@ -1231,7 +1239,8 @@ ggml_tensor * llm_build_context::llm_build_lora_mm_id(
           struct ggml_tensor * cur, // struct ggml_tensor * b
           struct ggml_tensor * ids,
           struct ggml_tensor * cache_w,
-          struct ggml_tensor * cache_ids) {
+          struct ggml_tensor * cache_ids,
+          bool fuse_signs) {
     // FT slice B substitutes banks in llm_build_moe_ffn (il in scope there),
     // not here: lora_mm_id has no layer index for the per-layer remap.
     struct ggml_tensor * cur_mm = cur;
@@ -1244,7 +1253,7 @@ ggml_tensor * llm_build_context::llm_build_lora_mm_id(
         if (memo_it != lctx.hadamard_memo.end()) {
             cur_mm = memo_it->second;
         } else {
-            cur_mm = llm_build_hadamard_rotate(ctx0, cur, *rot);
+            cur_mm = llm_build_hadamard_rotate(ctx0, cur, *rot, false, fuse_signs);
             lctx.hadamard_memo[memo_key] = cur_mm;
         }
     }
@@ -1480,49 +1489,62 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     if (lctx.cparams.fused_up_gate &&
         up && gate && up->type != GGML_TYPE_PQ2_0 && up->type != GGML_TYPE_PQ2_0_R8 &&
         up->type != GGML_TYPE_PTQ1_0 && up->type != GGML_TYPE_PTQ1_0_R8 &&
-        lctx.model.hadamard_rotation(up) == nullptr && lctx.model.hadamard_rotation(gate) == nullptr &&
         !up_b && !up_s && !gate_b && !gate_s && type_gate == LLM_FFN_PAR &&
         (type_op == LLM_FFN_SILU || type_op == LLM_FFN_RELU || type_op == LLM_FFN_SWIGLU_OAI || (type_op == LLM_FFN_SITU && lctx.model.n_gpu_layers == 0) || (type_op == LLM_FFN_GELU && !act_scales))) {
-        auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
-                        type_op == LLM_FFN_RELU ? GGML_UNARY_OP_RELU :
-                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU :
-                        type_op == LLM_FFN_SITU ? GGML_UNARY_OP_SITU_GLU : GGML_UNARY_OP_SWIGLU_OAI;
-        cur = ggml_fused_up_gate(ctx, up, gate, cur, unary_op);
-        cb(cur, "ffn_up_gate", il);
-        *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, true);
-        *(float *)(cur->op_params + 2) = lctx.model.hparams.situ_beta;
-        *(float *)(cur->op_params + 3) = lctx.model.hparams.situ_linear_beta;
-        if (down) {
-            cur = llm_build_lora_mm(lctx, ctx, down, cur);
-            cb(cur, "ffn_down", il);
-            if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
-                // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
-                ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+
+        auto hadamard_u = lctx.model.hadamard_rotation(up);
+        auto hadamard_g = lctx.model.hadamard_rotation(gate);
+        if (hadamard_u && hadamard_g && hadamard_u != hadamard_g) {
+            printf("Oops: hadamard_u != hadamard_g?\n");
+        }
+        if ((!hadamard_u && !hadamard_g) || (hadamard_u == hadamard_g) || (hadamard_u && hadamard_g && *hadamard_u == *hadamard_g)) {
+            if (hadamard_u) {
+                cur = llm_build_hadamard_rotate(ctx, cur, *hadamard_u, false, true);
             }
-        }
-        if (down_b) {
-            cur = ggml_add(ctx, cur, down_b);
-            cb(cur, "ffn_down_b", il);
-        }
-        if (down_s) {
-            cur = ggml_mul(ctx, cur, down_s);
-            cb(cur, "ffn_down_s", il);
-        }
-        if (post_norm) {
-            if (post_norm_eps > 0.0f) {
-                cur = ggml_fused_rms_norm(ctx, cur, post_norm, post_norm_eps);
-            } else {
-                cur = llm_build_norm(ctx, cur, lctx.model.hparams, post_norm, NULL, LLM_NORM_RMS, cb, il);
+            auto unary_op = type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                            type_op == LLM_FFN_RELU ? GGML_UNARY_OP_RELU :
+                            type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU :
+                            type_op == LLM_FFN_SITU ? GGML_UNARY_OP_SITU_GLU : GGML_UNARY_OP_SWIGLU_OAI;
+            cur = ggml_fused_up_gate(ctx, up, gate, cur, unary_op);
+            cb(cur, "ffn_up_gate", il);
+            *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, true);
+            *(float *)(cur->op_params + 2) = lctx.model.hparams.situ_beta;
+            *(float *)(cur->op_params + 3) = lctx.model.hparams.situ_linear_beta;
+            if (down) {
+                if (auto hadamard_d = lctx.model.hadamard_rotation(down); hadamard_d != nullptr) {
+                    cur = llm_build_hadamard_rotate(ctx, cur, *hadamard_d, false, true);
+                }
+                cur = llm_build_lora_mm(lctx, ctx, down, cur);
+                cb(cur, "ffn_down", il);
+                if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
+                    // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
+                    ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+                }
             }
-            cb(cur, "ffn_post_normed", il);
-        }
-        if (add_input) {
-            cur = ggml_add(ctx, cur, input);
-            cb(cur, "ffn_out_with_inp", il);
-        }
-        if (add_extra) {
-            cur = ggml_add(ctx, cur, add_extra);
-            cb(cur, "ffn_out_with_inp", il);
+            if (down_b) {
+                cur = ggml_add(ctx, cur, down_b);
+                cb(cur, "ffn_down_b", il);
+            }
+            if (down_s) {
+                cur = ggml_mul(ctx, cur, down_s);
+                cb(cur, "ffn_down_s", il);
+            }
+            if (post_norm) {
+                if (post_norm_eps > 0.0f) {
+                    cur = ggml_fused_rms_norm(ctx, cur, post_norm, post_norm_eps);
+                } else {
+                    cur = llm_build_norm(ctx, cur, lctx.model.hparams, post_norm, NULL, LLM_NORM_RMS, cb, il);
+                }
+                cb(cur, "ffn_post_normed", il);
+            }
+            if (add_input) {
+                cur = ggml_add(ctx, cur, input);
+                cb(cur, "ffn_out_with_inp", il);
+            }
+            if (add_extra) {
+                cur = ggml_add(ctx, cur, add_extra);
+                cb(cur, "ffn_out_with_inp", il);
+            }
         }
         return cur;
     }
@@ -1880,6 +1902,13 @@ llm_expert_gating_func_type   gating_op,
 
     ggml_tensor * par;
     if (can_use_fmoe && up_gate_exps && (!cache_ids || !up_gate_exps_b)) {
+        auto hadamard_u = lctx.model.hadamard_rotation(up_exps);
+        auto hadamard_g = lctx.model.hadamard_rotation(gate_exps);
+        GGML_ASSERT((!hadamard_u && !hadamard_g) || (hadamard_u == hadamard_g) ||
+                (hadamard_u && hadamard_g && *hadamard_u == *hadamard_g));
+        if (hadamard_u) {
+            cur = llm_build_hadamard_rotate(ctx, cur, *hadamard_u, false, true);
+        }
         ggml_tensor * weight = cached_up_gate ? cached_up_gate : up_gate_exps;
         ggml_tensor * expert_ids = cache_ids ? cache_ids : selected_experts;
         if (up_gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI || type_op == LLM_FFN_SITU) {
@@ -1899,7 +1928,7 @@ llm_expert_gating_func_type   gating_op,
     if (up_gate_exps) {
         GGML_ASSERT(cache_ids && cached_up_gate);
         ggml_tensor * gate_up = llm_build_lora_mm_id(lctx, ctx, up_gate_exps, cur,
-                selected_experts, cached_up_gate, cache_ids);
+                selected_experts, cached_up_gate, cache_ids, true);
         if (up_gate_exps_b) {
             gate_up = ggml_add_id(ctx, gate_up, up_gate_exps_b, selected_experts);
         }
@@ -1929,26 +1958,35 @@ llm_expert_gating_func_type   gating_op,
     } else {
     GGML_ASSERT(!up_gate_exps_b);
 
+    bool up_gate_done = false;
     if (can_use_fmoe && lctx.cparams.fused_moe_up_gate && up_exps->type == gate_exps->type &&
-            lctx.model.hadamard_rotation(up_exps) == nullptr && lctx.model.hadamard_rotation(gate_exps) == nullptr &&
             (!cache_ids || (!up_exps_b && !gate_exps_b))) {
         ggml_tensor * up_weight = cached_up ? cached_up : up_exps;
         ggml_tensor * gate_weight = cached_gate ? cached_gate : gate_exps;
         ggml_tensor * expert_ids = cache_ids ? cache_ids : selected_experts;
-        if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI || type_op == LLM_FFN_SITU) {
-            par = ggml_moe_up_gate_ext(ctx, up_weight, gate_weight, cur, expert_ids, up_exps_b, gate_exps_b,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
-                    type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU :
-                    type_op == LLM_FFN_SITU ? GGML_UNARY_OP_SITU_GLU : GGML_UNARY_OP_SWIGLU_OAI);
-        } else {
-            GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
-            par = ggml_moe_up_gate(ctx, up_weight, gate_weight, cur, expert_ids,
-                    type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+        auto hadamard_u = lctx.model.hadamard_rotation(up_weight);
+        auto hadamard_g = lctx.model.hadamard_rotation(gate_weight);
+        if ((!hadamard_u && !hadamard_g) || (hadamard_u == hadamard_g) || (hadamard_u && hadamard_g && *hadamard_u == *hadamard_g)) {
+            if (hadamard_u) {
+                cur = llm_build_hadamard_rotate(ctx, cur, *hadamard_u, false, true);
+            }
+            if (up_exps_b || gate_exps_b || type_op == LLM_FFN_SWIGLU_OAI || type_op == LLM_FFN_SITU) {
+                par = ggml_moe_up_gate_ext(ctx, up_weight, gate_weight, cur, expert_ids, up_exps_b, gate_exps_b,
+                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU :
+                        type_op == LLM_FFN_GELU ? GGML_UNARY_OP_GELU :
+                        type_op == LLM_FFN_SITU ? GGML_UNARY_OP_SITU_GLU : GGML_UNARY_OP_SWIGLU_OAI);
+            } else {
+                GGML_ASSERT(type_op != LLM_FFN_SWIGLU_OAI);
+                par = ggml_moe_up_gate(ctx, up_weight, gate_weight, cur, expert_ids,
+                        type_op == LLM_FFN_SILU ? GGML_UNARY_OP_SILU : GGML_UNARY_OP_GELU);
+            }
+            *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
+            *(float *)(par->op_params + 2) = lctx.model.hparams.situ_beta;
+            *(float *)(par->op_params + 3) = lctx.model.hparams.situ_linear_beta;
+            up_gate_done = true;
         }
-        *(float *)(par->op_params + 1) = lctx.model.swiglu_limit(il, false);
-        *(float *)(par->op_params + 2) = lctx.model.hparams.situ_beta;
-        *(float *)(par->op_params + 3) = lctx.model.hparams.situ_linear_beta;
-    } else {
+    }
+    if (!up_gate_done) {
         ggml_tensor * up = llm_build_lora_mm_id(lctx, ctx, up_exps, cur, selected_experts, cached_up, cache_ids); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
@@ -2391,7 +2429,7 @@ static ggml_tensor * llm_build_kqv(
                     int       il,
                 ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
                 ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
-                    int32_t kv_view_offset = 0) {
+                    int32_t kv_view_offset = 0, ggml_tensor * kv_idx = nullptr) {
     const llama_model   & model   = lctx.model;
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
@@ -2479,6 +2517,9 @@ static ggml_tensor * llm_build_kqv(
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         if (n_swa > 0 && !kv.cells_disordered && cparams.n_seq_max == 1) {
             ((int32_t *)cur->op_params)[4] = n_swa;
+        }
+        if (kv_idx) {
+            cur->src[5] = kv_idx;
         }
 
         // Some models produced NaNs/gibberish when FA is computed with f16 precision on CUDA
@@ -2655,7 +2696,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
                     float     kq_scale,
          const llm_build_cb & cb, int il, ggml_tensor * sinks, int n_swa, int kv_il,
          ggml_tensor ** k_cache_view, ggml_tensor ** v_cache_view,
-                    int32_t   swa_head) {
+                    int32_t   swa_head, ggml_tensor * kv_idx) {
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
 
@@ -2696,7 +2737,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
     }
 
     auto cur = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv_view, kq_scale, cb, il, sinks, n_swa, kv_il,
-            k_cache_view, v_cache_view, kv_view_offset);
+            k_cache_view, v_cache_view, kv_view_offset, kv_idx);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -2721,7 +2762,7 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
             ggml_tensor * wq, ggml_tensor * bq,
             ggml_tensor * wk, ggml_tensor * bk,
             ggml_tensor * wv, ggml_tensor * bv,
-            float attention_scale, int il, bool add_graph_split) const {
+            float attention_scale, int il, bool add_graph_split, ggml_tensor * v_cur) const {
     auto Qcur = llm_build_lora_mm(lctx, ctx0, wq, cur);
     cb(Qcur, "Qcur", il);
     if (add_graph_split) {
@@ -2729,7 +2770,7 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
     }
     auto Kcur = llm_build_lora_mm(lctx, ctx0, wk, cur);
     cb(Kcur, "Kcur", il);
-    auto Vcur = llm_build_lora_mm(lctx, ctx0, wv, cur);
+    auto Vcur = llm_build_lora_mm(lctx, ctx0, wv, v_cur ? v_cur : cur);
     cb(Vcur, "Vcur", il);
     ggml_build_forward_expand(gf, Qcur);
     ggml_build_forward_expand(gf, Kcur);
@@ -2797,7 +2838,8 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
             ggml_tensor * wq, ggml_tensor * bq,
             ggml_tensor * wk, ggml_tensor * bk,
             ggml_tensor * wv, ggml_tensor * bv,
-            ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il, bool add_graph_split) const {
+            ggml_tensor * q_norm, ggml_tensor * k_norm, float attention_scale, int il, bool add_graph_split,
+            ggml_tensor * v_cur) const {
     int n_head    = hparams.n_head(il);
     int n_head_kv = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
@@ -2873,7 +2915,7 @@ std::tuple<ggml_tensor*, ggml_tensor*, ggml_tensor*> llm_build_context::llm_buil
 
     }
 
-    auto [Q, K, V] = llm_build_mul_mat_qkv(gf, cur, wq, bq, wk, bk, wv, bv, attention_scale, il, add_graph_split);
+    auto [Q, K, V] = llm_build_mul_mat_qkv(gf, cur, wq, bq, wk, bk, wv, bv, attention_scale, il, add_graph_split, v_cur);
     auto Qcur = ggml_reshape_3d(ctx0, Q, n_embd_head_k, Q->ne[0]/n_embd_head_k, n_tokens);
     // Command-R/R+ uses LayerNorm (not RMSNorm) for per-head Q/K normalization
     const auto qk_norm_type = (model.arch == LLM_ARCH_COMMAND_R) ? LLM_NORM : LLM_NORM_RMS;
@@ -2957,6 +2999,7 @@ ggml_tensor * llm_build_context::build_output(llama_context & lctx, ggml_context
         if (idx_out >= 0) idx = idx_out;
         const bool is_qwen_mtp = (lctx.model.arch == LLM_ARCH_QWEN35 ||
                                   lctx.model.arch == LLM_ARCH_QWEN35MOE ||
+                                  lctx.model.arch == LLM_ARCH_GLM4 ||
                                   lctx.model.arch == LLM_ARCH_GLM4_MOE) && lctx.cparams.mtp;
         if (cur->op == GGML_OP_REDUCE && cur->src[idx] && !is_qwen_mtp) {
             // avoid copy to main GPU
@@ -3140,6 +3183,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
         case LLM_ARCH_MUSE_GLIMMER:
             {
                 result = llm.build_muse_glimmer();
+            } break;
+        case LLM_ARCH_RICURSIVE:
+            {
+                result = llm.build_ricursive();
             } break;
         case LLM_ARCH_DECI:
             {
@@ -3372,7 +3419,7 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             } break;
         case LLM_ARCH_GLM4:
             {
-                result = llm.build_glm4();
+                result = (llm.cparams.mtp || llm.cparams.mtp_op_type != MTP_OP_NONE) ? llm.build_glm4_with_mtp() : llm.build_glm4();
             } break;
         case LLM_ARCH_GLM4_MOE:
             {
@@ -3447,6 +3494,10 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             {
                 result = llm.build_raon1();
             } break;
+        case LLM_ARCH_XING4_0:
+            {
+                result = llm.build_xing4();
+            } break;
         case LLM_ARCH_MINIMAX_M2:
             {
                 result = llm.build_minimaxm2();
@@ -3519,7 +3570,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
         int n_swa, int il, bool do_rope, bool add_graph_split, bool add_input, bool is_norm, bool is_multi,
         ggml_tensor * post_norm, int kv_il, float post_norm_eps, post_norm_data * pnd,
-        ggml_tensor ** k_view, ggml_tensor ** v_view) {
+        ggml_tensor ** k_view, ggml_tensor ** v_view, ggml_tensor * kv_idx, ggml_tensor * v_res) {
 
     float freq_base_l  = n_swa > 0 ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
     float freq_scale_l = n_swa > 0 ? hparams.rope_freq_scale_train_swa : hparams.rope_freq_scale_train;
@@ -3865,6 +3916,13 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
     }
     auto input_normed = cur;
 
+    ggml_tensor * v_cur = nullptr;
+    if (v_res) {
+        auto blend = ggml_sigmoid(ctx0, model.layers[il].attn_vres_lambda);
+        v_cur = ggml_add(ctx0, v_res, ggml_mul(ctx0, ggml_sub(ctx0, cur, v_res), blend));
+        cb(v_cur, "v_input", il);
+    }
+
     ggml_tensor *Qcur, *Kcur, *Vcur, *gate = nullptr;
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP) {
         auto [Q, K, V, G] = llm_build_mul_mat_qkv_gated(gf, cur, model.layers[il].wq, model.layers[il].wk, model.layers[il].wv,
@@ -3875,7 +3933,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
                 model.layers[il].wqkv, model.layers[il].bqkv,
                 model.layers[il].wqk,  model.layers[il].bqk,
                 model.layers[il].wq,   model.layers[il].bq, model.layers[il].wk, model.layers[il].bk, model.layers[il].wv, model.layers[il].bv,
-                model.layers[il].attn_q_norm, model.layers[il].attn_k_norm, f_attn_scale, il);
+                model.layers[il].attn_q_norm, model.layers[il].attn_k_norm, f_attn_scale, il, false, v_cur);
         Qcur = Q; Kcur = K; Vcur = V;
         if (model.arch == LLM_ARCH_MIMO2 && std::abs(model.hparams.f_attn_v_scale - 1) > 1e-4f) {
             Vcur = ggml_scale(ctx0, Vcur, model.hparams.f_attn_v_scale);
@@ -3976,7 +4034,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
             cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                     model.layers[il].wo, model.layers[il].bo,
                     Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                    k_view, v_view, swa_head);
+                    k_view, v_view, swa_head, kv_idx);
         }
     }
 
