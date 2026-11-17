@@ -2142,7 +2142,10 @@ llm_expert_gating_func_type   gating_op,
                 ffn_norm == lctx.model.layers[il].ffn_norm && !ffn_norm->extra) {
             const int n_target = int(lctx.model.hparams.n_layer) - int(lctx.model.hparams.nextn_predict_layers);
             const auto * next = il + 1 < n_target ? &lctx.model.layers[il + 1] : nullptr;
-            if (next && next->ffn_gate_inp && !next->ffn_gate_inp->extra && next->ffn_norm && !next->ffn_norm->extra &&
+            if (next && ggml_moe_resident_prefetch_supported(
+                        next->ffn_up_gate_exps ? next->ffn_up_gate_exps : next->ffn_up_exps,
+                        next->ffn_up_gate_exps ? nullptr : next->ffn_gate_exps, next->ffn_down_exps) &&
+                    next->ffn_gate_inp && !next->ffn_gate_inp->extra && next->ffn_norm && !next->ffn_norm->extra &&
                     next->ffn_gate_inp->ne[0] == input->ne[0] && next->ffn_gate_inp->ne[1] == n_expert &&
                     next->ffn_norm->ne[0] == input->ne[0]) {
                 auto * x = ggml_mul(ctx, ggml_rms_norm(ctx, input, lctx.model.hparams.f_norm_rms_eps), next->ffn_norm);

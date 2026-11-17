@@ -875,7 +875,8 @@ static void test_cuda_copy() {
 #endif
 
 #ifdef GGML_USE_CUDA
-static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false, bool skip_growth = false, bool grouping = true, int verification_tokens = 0, bool overlap = false, bool prediction = false) {
+enum class prefetch_banks { disabled, pinned, pageable };
+static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false, bool skip_growth = false, bool grouping = true, int verification_tokens = 0, bool overlap = false, bool prediction = false, prefetch_banks prefetch = prefetch_banks::disabled) {
     constexpr int width = 256, hidden = 512, experts = 16, top_k = 8, layers = 3;
     const bool verify_batch = verification_tokens > 0;
     const int tokens = verify_batch ? verification_tokens : 1;
@@ -891,6 +892,7 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
     ggml_backend_sched_set_moe_resident_grouping(sched, grouping);
     ggml_backend_sched_set_moe_resident_zero_fill(sched, !old_profiler);
     ggml_backend_sched_set_moe_resident(sched, -1);
+    if (prefetch != prefetch_banks::disabled) ggml_backend_sched_set_moe_resident_prefetch(sched, 2);
     auto * sources = ggml_init({4 * 1024 * 1024, nullptr, true});
     ggml_tensor * banks[layers][3]{}, * gpu_banks[layers][3]{};
     std::vector<ggml_backend_buffer_t> buffers;
@@ -911,7 +913,8 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         banks[layer][b] = ggml_new_tensor_3d(sources, type, columns, rows, experts);
         const char * role = b == 2 ? "down" : b == 1 ? "gate" : combined ? "gate_up" : "up";
         ggml_format_name(banks[layer][b], "blk.%d.ffn_%s_exps.weight", layer, role);
-        allocate(banks[layer][b], ggml_backend_cuda_host_buffer_type());
+        allocate(banks[layer][b], prefetch == prefetch_banks::pageable
+                ? ggml_backend_cpu_buffer_type() : ggml_backend_cuda_host_buffer_type());
         ggml_backend_buffer_set_usage(banks[layer][b]->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         std::vector<float> values(ggml_nelements(banks[layer][b]));
         for (size_t i = 0; i < values.size(); ++i)
@@ -1037,10 +1040,27 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             outputs[layer] = ggml_sqr(ctx, weighted);
             ggml_set_output(outputs[layer]);
             ggml_build_forward_expand(graph, outputs[layer]);
+            if (prefetch != prefetch_banks::disabled && layer + 1 < layers) {
+                auto * pred = ggml_cont(ctx, graph_ids);
+                pred->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_MOE_RESIDENT_PREGATE;
+                pred->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2] = layer;
+                ggml_backend_sched_set_tensor_backend(sched, pred, cuda);
+                ggml_set_output(pred);
+                ggml_build_forward_expand(graph, pred);
+            }
         }
         const auto packed_route = pack_input_route(routes[r]);
         ggml_backend_tensor_set(ids, packed_route.data(), 0, ggml_nbytes(ids));
         check(ggml_backend_sched_alloc_graph(sched, graph), "complete FFN graph allocates without bank staging");
+        if (prefetch != prefetch_banks::disabled && sched->moe_ffn) {
+            for (int layer = 0; layer + 1 < layers; ++layer) {
+                const auto & task = *sched->moe_ffn->tasks[layer];
+                check((task.pregate != nullptr) == (prefetch == prefetch_banks::pinned),
+                        "only pinned next-layer banks retain forecast IDs");
+            }
+            if (prefetch == prefetch_banks::pageable)
+                check(sched->moe_ffn->ring_skipped > 0, "pageable prefetch reports skipped work without uploads");
+        }
         if (!fail_cache && !zero_fill && !skip_growth && r == 5) {
             check(!sched->moe_ffn->cache && sched->moe_ffn->slot_count() == 0,
                     "larger geometry releases the old grouped cache before execution");
@@ -1610,6 +1630,16 @@ static void test_cpu_worker_pass() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--pageable-prefetch") == 0) {
+#ifdef GGML_USE_CUDA
+        test_complete_ffn(false, false, false, false, false, true, false, 2, false, true, prefetch_banks::pageable);
+        test_complete_ffn(true, false, false, false, false, true, false, 2, false, false, prefetch_banks::pinned);
+#else
+        check(false, "prefetch regression needs a CUDA build");
+#endif
+        if (!failures) fprintf(stderr, "VERIFIED pageable-prefetch\n");
+        return failures ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "--worker-pass") == 0) {
         test_cpu_worker_pass();
         test_cpu_worker_handoffs();

@@ -1,6 +1,27 @@
 #pragma once
 
 #include "ggml-backend.h"
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
+// Forecast uploads run on a separate stream and cannot stage pageable banks.
+// Both graph construction and the scheduler use this buffer contract.
+static inline bool ggml_moe_resident_bank_pinned(const struct ggml_tensor * bank) {
+#ifdef GGML_USE_CUDA
+    return bank && bank->buffer &&
+            ggml_backend_buffer_get_type(bank->buffer) == ggml_backend_cuda_host_buffer_type();
+#else
+    (void) bank;
+    return false;
+#endif
+}
+
+static inline bool ggml_moe_resident_prefetch_supported(const struct ggml_tensor * up,
+        const struct ggml_tensor * gate, const struct ggml_tensor * down) {
+    return ggml_moe_resident_bank_pinned(up) && (!gate || ggml_moe_resident_bank_pinned(gate)) &&
+            ggml_moe_resident_bank_pinned(down);
+}
 
 // Private graph-construction contract. A marked down projection may finish
 // after independent GPU nodes, at its marked direct consumer (split boundary).

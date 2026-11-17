@@ -1636,7 +1636,7 @@ struct ggml_backend_sched_moe_ffn {
                 (unsigned long long)prediction_calls, (unsigned long long)prediction_candidates,
                 (unsigned long long)prediction_selected, (unsigned long long)prediction_correct,
                 (unsigned long long)prediction_uploads, (unsigned long long)prediction_used, learned_routes.size());
-        if (ring_uploads) fprintf(stderr,
+        if (ring_uploads || ring_skipped) fprintf(stderr,
                 "ggml_backend_sched: moe-resident new prefetch uploads=%llu installed=%llu waited=%llu hits=%llu unused=%llu promoted=%llu skipped=%llu bytes=%llu\n",
                 (unsigned long long)ring_uploads, (unsigned long long)ring_installed, (unsigned long long)ring_late,
                 (unsigned long long)ring_hits, (unsigned long long)ring_unused, (unsigned long long)ring_promotions,
@@ -1663,6 +1663,7 @@ struct ggml_backend_sched_moe_ffn {
         double policy_us = 0, host_us = 0;
     } upload;
     ggml_moe_cpu_workers cpu_workers;
+    bool prefetch_warned = false;
     struct upload_copy {
         ggml_tensor destination{};
         const ggml_tensor * bank = nullptr;

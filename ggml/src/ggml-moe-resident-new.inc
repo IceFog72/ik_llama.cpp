@@ -391,10 +391,6 @@ static void resident_refresh_victims(ggml_backend_sched_moe_ffn & f, ggml_backen
     GGML_UNUSED(f);
 }
 
-static bool resident_pinned(const ggml_tensor * bank) {
-    return bank && bank->buffer && ggml_backend_buffer_get_type(bank->buffer) == ggml_backend_cuda_host_buffer_type();
-}
-
 static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_backend_sched_moe_ffn::task & t,
         const std::vector<int> & missing, const std::vector<bool> & protected_slots, ggml_backend_t gpu,
         bool prediction = false, bool early_fence = false, double window_us = -1) {
@@ -471,7 +467,7 @@ static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_back
     }
     if (admitted.empty()) return resident_admission::rejected;
     size_t staging_bytes = 0;
-    for (auto * bank : t.banks) if (bank && !resident_pinned(bank)) staging_bytes += bank->nb[2];
+    for (auto * bank : t.banks) if (bank && !ggml_moe_resident_bank_pinned(bank)) staging_bytes += bank->nb[2];
     const bool setup = !f.uploader || !f.upload_worker.joinable() || !f.upload_staging ||
             ggml_backend_buffer_get_size(f.upload_staging) < staging_bytes * admitted.size();
     const int64_t setup_started = setup ? ggml_time_us() : 0;
@@ -504,7 +500,7 @@ static resident_admission resident_promote(ggml_backend_sched_t sched, ggml_back
             copy.bank = t.banks[bank];
             copy.source = static_cast<const uint8_t *>(copy.bank->data) + size_t(item.entry.expert) * copy.bank->nb[2];
             copy.bytes = copy.bank->nb[2]; copy.offset = item.position * g.strides[bank];
-            copy.direct = resident_pinned(copy.bank); // pinned weights need no staging copy
+            copy.direct = ggml_moe_resident_bank_pinned(copy.bank); // pinned weights need no staging copy
             f.upload.bytes += copy.bytes; f.upload_copies.push_back(copy);
         }
         slot = {}; slot.layer = -2;
@@ -706,7 +702,7 @@ static void resident_ring_prefetch(ggml_backend_sched_t sched, const ggml_backen
     const int next = t.layer + 1;
     if (f.rings.empty() || next >= int(f.tasks.size()) || !f.tasks[next] || !f.live_task(*f.tasks[next])) return;
     const auto & nt = *f.tasks[next];
-    for (auto * bank : nt.banks) if (bank && !resident_pinned(bank)) { ++f.ring_skipped; return; }
+    for (auto * bank : nt.banks) if (bank && !ggml_moe_resident_bank_pinned(bank)) { ++f.ring_skipped; return; }
     auto & g = f.groups[nt.group];
     auto & ring = f.rings[nt.group];
     if (!f.prefetcher) {
@@ -866,7 +862,7 @@ static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
     f.ring_fence_ready = false; // a publication fence covers only its own layer
     const int64_t admission_started = ggml_time_us();
     if (cache) {
-        if (f.rings.empty()) resident_prefetch_prediction(sched, gpu, t.layer);
+        if (!call.forecast) resident_prefetch_prediction(sched, gpu, t.layer);
         resident_promote(sched, t, missing, protected_slots, gpu);
     }
     f.admission_us += ggml_time_us() - admission_started;

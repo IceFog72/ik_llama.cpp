@@ -249,6 +249,27 @@ auto note = [sched](int why) { ++sched->moe_ffn_reject_n[why]; };
         for (int b = 0; b < 3; ++b) t.banks[b] = banks[b];
         f.graph_tasks[up] = &t; f.graph_tasks[down] = &t;
     }
+    // Graph builders normally omit unsupported forecasts. Recheck actual bank
+    // buffers here for other API callers and graphs rebuilt after a transition.
+    if (sched->moe_ffn && new_policy && sched->moe_resident_prefetch > 0) {
+        auto & f = *sched->moe_ffn;
+        for (auto & task : f.tasks) {
+            if (!task || !f.live_task(*task)) continue;
+            const size_t next = size_t(task->layer + 1);
+            if (next >= f.tasks.size() || !f.tasks[next] || !f.live_task(*f.tasks[next])) {
+                task->pregate = nullptr;
+                continue;
+            }
+            const auto & nt = *f.tasks[next];
+            if (ggml_moe_resident_prefetch_supported(nt.banks[0], nt.banks[1], nt.banks[2])) continue;
+            task->pregate = nullptr;
+            ++f.ring_skipped;
+            if (!f.prefetch_warned) {
+                fprintf(stderr, "ggml_backend_sched: moe-resident prefetch needs pinned expert banks; using learned-route admission for pageable banks\n");
+                f.prefetch_warned = true;
+            }
+        }
+    }
 #else
     GGML_UNUSED(sched); GGML_UNUSED(graph);
 #endif
