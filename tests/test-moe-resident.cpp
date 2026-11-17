@@ -879,6 +879,7 @@ enum class prefetch_banks { disabled, pinned, pageable };
 static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false, bool skip_growth = false, bool grouping = true, int verification_tokens = 0, bool overlap = false, bool prediction = false, prefetch_banks prefetch = prefetch_banks::disabled) {
     constexpr int width = 256, hidden = 512, experts = 16, top_k = 8, layers = 3;
     const bool verify_batch = verification_tokens > 0;
+    const bool new_policy_profile = zero_fill && !old_profiler;
     const int tokens = verify_batch ? verification_tokens : 1;
     auto * cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
     check(cuda != nullptr, "complete FFN CUDA backend initializes");
@@ -1086,15 +1087,16 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
                 // A manually injected new-policy cache needs its device lookup
                 // even at width 1; a cache pointer alone is not a valid state.
                 if (f.new_policy) {
+                    f.planned_tasks = f.graph_tasks.size() / 2;
                     resident_history(sched);
                     check(ggml_backend_sched_moe_decode_buffer(f.slot_map, original_buft,
                             f.mapping.size() * sizeof(int32_t)), "new policy lookup allocates");
                     resident_mapping(sched, cuda);
                     ggml_backend_synchronize(cuda);
                 }
-                if (verify_batch) {
-                    check(f.new_policy && f.graph_tasks.size() == 2 * layers,
-                            "two-token verification enters the new resident executor");
+                if (f.new_policy) {
+                    check(f.graph_tasks.size() == 2 * layers,
+                            "numerical fixture enters the new resident executor");
                     // Start with GPU hits in every layer and CPU misses in
                     // both tokens. All bytes come from real host banks.
                     for (int layer = 0; layer < layers; ++layer) for (int expert = 0; expert < 2; ++expert) {
@@ -1124,7 +1126,13 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             injected = true;
         }
         const bool prefer_zero = zero_fill && (r == 1 || r == 2);
-        if (zero_fill && !fail_cache) {
+        if (new_policy_profile) {
+            // New policy chooses admissions by reuse value and upload cost,
+            // rather than the legacy miss-count timing table. A costly upload
+            // must retain cached hits while leaving misses on the CPU.
+            sched->moe_ffn->upload_policy_us = prefer_zero ? 1e6 : 0;
+        }
+        if (zero_fill && old_profiler && !fail_cache) {
             for (auto & timing : sched->moe_ffn->timings) {
                 for (size_t m = 1; m < timing.misses.size(); ++m) for (size_t q = 0; q <= m; ++q) {
                     timing.misses[m][q].count = 3;
@@ -1140,10 +1148,14 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
         auto & state = *sched->moe_ffn;
         const auto old_fills = state.fills, old_evictions = state.evictions, old_weights = state.host_bytes;
         const auto old_gpu_refs = state.gpu_refs, old_cpu_refs = state.cpu_refs;
+        const auto old_rejections = state.admission_rejected;
+        uint64_t old_cpu_samples = 0;
+        for (const auto & width : state.cpu_samples)
+            for (const auto & sample : width) old_cpu_samples += sample.count;
         uint64_t old_zero_samples = 0;
         for (const auto & timing : state.timings)
             for (const auto & samples : timing.misses) old_zero_samples += samples[0].count;
-        if (verify_batch) {
+        if (state.new_policy && !fail_cache && !prefer_zero) {
             std::fill(state.cpu_cost.begin(), state.cpu_cost.end(), 1000.0);
             std::fill(state.cpu_exposed_cost.begin(), state.cpu_exposed_cost.end(), 1000.0);
             std::fill(state.cpu_marginal_cost.begin(), state.cpu_marginal_cost.end(), 1000.0);
@@ -1251,13 +1263,14 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             check(state.fills == old_fills && state.evictions == old_evictions && state.host_bytes == old_weights,
                     "zero fills preserves cache entries and uploads no expert weights");
             check(state.cpu_refs > old_cpu_refs, "zero fills executes misses on CPU");
+            check(state.admission_rejected > old_rejections, "new policy rejects unprofitable admissions");
             if (r == 1) check(state.gpu_refs == old_gpu_refs, "all-miss zero-fill route executes entirely on CPU");
             if (r == 2) {
                 check(state.gpu_refs > old_gpu_refs, "zero fills still executes existing cache hits on GPU");
-                uint64_t zero_samples = 0;
-                for (const auto & timing : state.timings)
-                    for (const auto & samples : timing.misses) zero_samples += samples[0].count;
-                check(zero_samples > old_zero_samples, "periodic recheck measures the zero-fill candidate");
+                uint64_t cpu_samples = 0;
+                for (const auto & width : state.cpu_samples)
+                    for (const auto & sample : width) cpu_samples += sample.count;
+                check(cpu_samples > old_cpu_samples, "CPU cost profiling continues while admissions are unprofitable");
             }
         }
         if (prefer_zero && old_profiler) {
@@ -1299,8 +1312,15 @@ static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant =
             if (bad) fprintf(stderr, "complete FFN combined=%d fail=%d mixed_quant=%d route=%d layer=%d bad=%zu\n", combined, fail_cache, mixed_quant, r, layer, bad);
             check(bad == 0, "complete FFN rows match their native CPU or CUDA branch");
         }
-        if (fail_cache && r == 0) check(ggml_backend_sched_moe_resident_needs_rebuild(sched),
-                "complete cache allocation failure requests a fresh graph");
+        if (fail_cache && r == 0) {
+            if (state.new_policy) {
+                check(state.disabled && !state.cache && state.gpu_refs == 0 && state.cpu_refs > 0,
+                        "new-policy cache allocation failure preserves the complete CPU fallback");
+            } else {
+                check(ggml_backend_sched_moe_resident_needs_rebuild(sched),
+                        "legacy cache allocation failure requests a fresh graph");
+            }
+        }
         ggml_backend_sched_reset(sched); ggml_free(ctx);
     }
     if (verify_batch) {
