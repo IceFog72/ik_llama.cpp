@@ -1644,6 +1644,17 @@ static void test_new_profiler_placement() {
     if (!failures) fprintf(stderr, "VERIFIED new-placement\n");
 }
 
+static void test_scan_diagnostic(bool enabled) {
+    auto * cpu = ggml_backend_cpu_init();
+    auto * sched = ggml_backend_sched_new(&cpu, nullptr, 1, 64, false);
+    if (enabled) ggml_backend_sched_set_moe_resident(sched, -1);
+    ggml_cgraph graph{};
+    ggml_backend_sched_moe_ffn_scan(sched, &graph);
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(cpu);
+    fprintf(stderr, "VERIFIED %s\n", enabled ? "quiet-enabled" : "quiet-default");
+}
+
 static void test_cpu_worker_pass() {
     ggml_backend_sched_moe_ffn f;
     f.new_policy = true;
@@ -1675,6 +1686,8 @@ int main(int argc, char ** argv) {
         test_new_profiler_placement();
         return failures ? 1 : 0;
     }
+    if (argc > 1 && strcmp(argv[1], "--quiet-default") == 0) { test_scan_diagnostic(false); return 0; }
+    if (argc > 1 && strcmp(argv[1], "--quiet-enabled") == 0) { test_scan_diagnostic(true); return 0; }
     if (argc > 1 && strcmp(argv[1], "--pageable-prefetch") == 0) {
 #ifdef GGML_USE_CUDA
         test_complete_ffn(false, false, false, false, false, true, false, 2, false, true, prefetch_banks::pageable);

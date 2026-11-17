@@ -5325,7 +5325,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         delete sched->moe_ffn;
         sched->moe_ffn = nullptr;
     }
-    if (sched->moe_ffn_candidates || sched->moe_ffn_reject_n[sched->MOE_FFN_R_GUARD]) {
+    if (sched->moe_resident_slots != 0 &&
+            (sched->moe_ffn_candidates || sched->moe_ffn_reject_n[sched->MOE_FFN_R_GUARD])) {
         static const char * const reject_names[] = {
             "scan-guard", "op-not-pair", "op-wiring", "op-layout", "placement",
             "act-ids-null", "act-ids-dtype", "act-batch", "ids-batch", "ids-width",
