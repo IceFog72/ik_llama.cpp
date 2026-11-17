@@ -30,9 +30,64 @@ static void resident_history(ggml_backend_sched_t sched) {
     }
 }
 
+static bool resident_histogram_prepare(ggml_backend_sched_t sched) {
+    auto & f = *sched->moe_ffn;
+    if (!f.histogram) {
+        f.histogram = ggml_backend_buft_alloc_buffer(sched->bufts[0], f.popularity.size() * sizeof(uint32_t));
+        if (!f.histogram) return false;
+        ggml_backend_buffer_clear(f.histogram, 0);
+    }
+    return true;
+}
+
+// The histogram address stays stable because CUDA captures can retain it.
+// Only a completed pinned snapshot is read by the host during normal decode.
+static void resident_history_poll(ggml_backend_sched_t sched, bool wait = false) {
+    auto & f = *sched->moe_ffn;
+    if (!f.histogram_pending) return;
+    if (wait) ggml_backend_event_synchronize(f.histogram_ready);
+    else if (!ggml_backend_cuda_moe_event_ready(f.histogram_ready)) return;
+    f.histogram_pending = false;
+    if (f.histogram_count != f.popularity.size() || f.histogram_experts != sched->moe_resident_n_expert) return;
+    const auto * counts = static_cast<const uint32_t *>(ggml_backend_buffer_get_base(f.histogram_host));
+    const double age = double(f.policy_clock - f.histogram_clock) / double(f.history_layers);
+    const double session_decay = std::exp2(-age / 128.0), recent_decay = std::exp2(-age / 8.0);
+    for (size_t i = 0; i < f.histogram_count; ++i) {
+        if (!counts[i]) continue;
+        const int layer = int(i / f.histogram_experts), expert = int(i % f.histogram_experts);
+        f.popularity[i] = f.session_score(layer, expert, f.histogram_experts) + counts[i] * session_decay;
+        f.recent_popularity[i] = f.recent_score(layer, expert, f.histogram_experts) + counts[i] * recent_decay;
+        f.observed_at[i] = f.policy_clock;
+    }
+    ++f.histogram_merges;
+}
+
+static void resident_history_snapshot(ggml_backend_sched_t sched) {
+    auto & f = *sched->moe_ffn;
+    resident_history_poll(sched);
+    if (f.histogram_pending || !f.histogram_dirty || !f.histogram) return;
+    const size_t count = f.popularity.size(), bytes = count * sizeof(uint32_t);
+    if (!ggml_backend_sched_moe_decode_buffer(f.histogram_host, ggml_backend_cuda_host_buffer_type(), 2 * bytes)) return;
+    auto * gpu = sched->backends[0];
+    if (!f.histogram_ready && !(f.histogram_ready = ggml_backend_event_new(gpu))) return;
+    auto * host = static_cast<uint32_t *>(ggml_backend_buffer_get_base(f.histogram_host));
+    // The second region is never a DMA destination. It remains immutable until
+    // the event retires both the readback and the counter reset on this stream.
+    std::memset(host + count, 0, bytes);
+    auto histogram = resident_vector(f.histogram, GGML_TYPE_I32, count);
+    ggml_backend_tensor_get_async(gpu, &histogram, host, 0, bytes);
+    ggml_backend_tensor_set_async(gpu, &histogram, host + count, 0, bytes);
+    ggml_backend_event_record(f.histogram_ready);
+    f.histogram_count = count; f.histogram_experts = sched->moe_resident_n_expert;
+    f.histogram_clock = f.policy_clock;
+    f.histogram_pending = true; f.histogram_dirty = false;
+    ++f.histogram_snapshots;
+}
+
 static void ggml_backend_sched_moe_new_collect(ggml_backend_sched_t sched) {
     auto & f = *sched->moe_ffn;
     resident_history(sched);
+    resident_history_poll(sched, true);
     if (!f.histogram_dirty || !f.histogram) return;
     ggml_backend_synchronize(sched->backends[0]);
     std::vector<uint32_t> counts(f.popularity.size());
@@ -71,11 +126,7 @@ static void ggml_backend_sched_moe_new_observe(ggml_backend_sched_t sched,
     resident_history(sched);
     // Prefill routing is summarized on-device; no per-prompt-token readback.
     if (ggml_backend_is_cuda(backend)) {
-        if (!f.histogram) {
-            f.histogram = ggml_backend_buft_alloc_buffer(sched->bufts[0], f.popularity.size() * sizeof(uint32_t));
-            if (!f.histogram) return;
-            ggml_backend_buffer_clear(f.histogram, 0);
-        }
+        if (!resident_histogram_prepare(sched)) return;
         auto * counts = static_cast<uint32_t *>(ggml_backend_buffer_get_base(f.histogram));
         ggml_backend_cuda_moe_profile(backend, counts, sched->moe_resident_layers, sched->moe_resident_n_expert);
         f.profile_backend = backend;
@@ -950,7 +1001,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         const auto status = resident_gpu_ffn(f, t, gpu);
         f.gpu_enqueue_us += ggml_time_us() - started;
         if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }
-        if (f.histogram) {
+        if (resident_histogram_prepare(sched)) {
             auto * counts = static_cast<uint32_t *>(ggml_backend_buffer_get_base(f.histogram));
             ggml_backend_cuda_moe_histogram(gpu, t.up->src[3], counts + size_t(t.layer) * experts, experts);
             f.histogram_dirty = true;
@@ -1122,6 +1173,8 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     return resident_finish_ffn(sched);
 }
 #else
+static void resident_history_poll(ggml_backend_sched_t, bool = false) {}
+static void resident_history_snapshot(ggml_backend_sched_t) {}
 static ggml_status resident_finish_ffn(ggml_backend_sched_t) { return GGML_STATUS_SUCCESS; }
 static void ggml_backend_sched_moe_new_collect(ggml_backend_sched_t) {}
 static void ggml_backend_sched_moe_new_observe(ggml_backend_sched_t, const ggml_tensor *, ggml_backend_t) {}

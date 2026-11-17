@@ -1565,6 +1565,12 @@ struct ggml_backend_sched_moe_ffn {
     std::vector<group> groups;
     bool new_policy = false, virtual_cache = false, histogram_dirty = false, mapping_dirty = false;
     ggml_backend_buffer_t histogram = nullptr, slot_map = nullptr, packed_output = nullptr;
+    ggml_backend_buffer_t histogram_host = nullptr;
+    ggml_backend_event_t histogram_ready = nullptr;
+    bool histogram_pending = false;
+    size_t histogram_count = 0;
+    int histogram_experts = 0;
+    uint64_t histogram_clock = 0, histogram_snapshots = 0, histogram_merges = 0;
     // Device join: pinned words polled by the GPU gate. gate_words[0] is the
     // released value (written by the CPU worker), gate_words[1] the timeout flag.
     ggml_backend_buffer_t gate_buffer = nullptr;
@@ -1606,6 +1612,10 @@ struct ggml_backend_sched_moe_ffn {
     uint64_t token_layers = 0, batch2_layers = 0, batch3_layers = 0, batch4_layers = 0;
     void report_new(const char * reason) const {
         if (!new_policy || !layers) return;
+        if (histogram_snapshots) fprintf(stderr,
+                "ggml_backend_sched: moe-resident new decode history snapshots=%llu merged=%llu pending=%d\n",
+                (unsigned long long)histogram_snapshots, (unsigned long long)histogram_merges,
+                int(histogram_pending));
         const double refs = double(cpu_refs + gpu_refs);
         fprintf(stderr, "ggml_backend_sched: moe-resident new stats reason=%s layers=%llu gpu_share=%.1f%% all_hit=%llu empty_gpu=%llu router_wait=%.1f us/layer cpu_wait=%.1f us/layer gpu_enqueue=%.1f us/layer mapping_wait=%.1f us/layer promotions=%llu rejected=%llu map_uploads=%llu mapped_routes=%llu dma_routes=%llu h2d_weights=%llu h2d_results=%llu cache=%zu MiB cpu_team=native cpu_only=%llu admission=%.1f us/layer upload_host=%.1f us/layer ffn_host=%.1f us/layer\n",
                 reason, (unsigned long long)layers, refs ? 100.0 * gpu_refs / refs : 0.0,
@@ -2034,6 +2044,7 @@ struct ggml_backend_sched_moe_ffn {
         wake.notify_one();
         if (worker.joinable()) worker.join();
         wait_io();
+        if (histogram_pending) ggml_backend_event_synchronize(histogram_ready);
         finish_upload();
         {
             std::lock_guard<std::mutex> lock(upload_mutex);
@@ -2046,9 +2057,9 @@ struct ggml_backend_sched_moe_ffn {
 #ifdef GGML_USE_CUDA
         if (profile_backend) ggml_backend_cuda_moe_profile(profile_backend, nullptr, 0, 0);
 #endif
-        for (auto event : {router_ready, upload_ready, upload_fence, upload_started}) ggml_backend_event_free(event);
+        for (auto event : {router_ready, upload_ready, upload_fence, upload_started, histogram_ready}) ggml_backend_event_free(event);
         if (uploader) ggml_backend_free(uploader);
-        for (auto buffer : {histogram, slot_map, packed_output, upload_staging}) ggml_backend_buffer_free(buffer);
+        for (auto buffer : {histogram, histogram_host, slot_map, packed_output, upload_staging}) ggml_backend_buffer_free(buffer);
         ggml_backend_event_free(completion);
         for (auto buffer : {activation, intermediate, output, ids, device_ids, device_cpu})
             ggml_backend_buffer_free(buffer);
@@ -4815,6 +4826,7 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+    if (sched->moe_ffn && sched->moe_ffn->new_policy) resident_history_poll(sched);
     // The scheduler owns this invocation, including every failure/abort return.
     // Teams remain separate across contexts and sleep between invocations.
     struct cpu_pass {
@@ -5241,6 +5253,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (status != GGML_STATUS_SUCCESS) return status;
     }
 
+    if (sched->moe_ffn && sched->moe_ffn->new_policy && !sched->moe_ffn->graph_tasks.empty())
+        resident_history_snapshot(sched);
     return GGML_STATUS_SUCCESS;
 }
 

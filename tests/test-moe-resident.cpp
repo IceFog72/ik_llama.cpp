@@ -874,6 +874,8 @@ static void test_cuda_copy() {
 }
 #endif
 
+#include "test-moe-resident-fixture.inc"
+
 #ifdef GGML_USE_CUDA
 enum class prefetch_banks { disabled, pinned, pageable };
 static void test_complete_ffn(bool combined, bool fail_cache, bool mixed_quant = false, bool zero_fill = false, bool old_profiler = false, bool skip_growth = false, bool grouping = true, int verification_tokens = 0, bool overlap = false, bool prediction = false, prefetch_banks prefetch = prefetch_banks::disabled) {
@@ -1702,6 +1704,14 @@ static void test_cpu_worker_pass() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--resident-history") == 0) {
+#ifdef GGML_USE_CUDA
+        test_fully_resident_history();
+#else
+        check(false, "resident history needs a CUDA build");
+#endif
+        return failures ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "--new-placement") == 0) {
         test_new_profiler_placement();
         return failures ? 1 : 0;
