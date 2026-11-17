@@ -1270,11 +1270,12 @@ struct ggml_backend_sched_moe_decode {
 // Native team for the opt-in complete-FFN executor. Job metadata is protected by
 // one mutex; all graph workers join before stack-owned graph state is released.
 // Adjacent decode jobs are short enough that parking the whole CPU team at
-// every layer can expose OS wake-up latency. Spin only for a bounded hot gap;
-// the caller still takes its ownership mutex and uses a predicate wait after
-// the deadline. No job descriptor is read through this advisory atomic.
+// every layer can expose OS wake-up latency. A compute pass keeps its team
+// hot until return. Other callers retain a bounded hot gap. The ownership
+// mutex and predicate wait still protect every job descriptor.
 template <typename T>
-static void ggml_moe_wait_hot(const std::atomic<T> & value, T previous) {
+static void ggml_moe_wait_hot(const std::atomic<T> & value, T previous,
+        const std::atomic<bool> * pass_hot = nullptr) {
     if (value.load(std::memory_order_acquire) != previous) return;
     const int64_t deadline = ggml_time_us() + 500;
     do {
@@ -1286,10 +1287,11 @@ static void ggml_moe_wait_hot(const std::atomic<T> & value, T previous) {
             std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
         }
-    } while (ggml_time_us() < deadline);
+    } while (pass_hot ? pass_hot->load(std::memory_order_acquire) : ggml_time_us() < deadline);
 }
 
 class ggml_moe_cpu_workers {
+    std::atomic<bool> pass_hot{false};
     std::mutex mutex;
     std::condition_variable posted, enabled, done;
     std::vector<std::thread> threads;
@@ -1301,6 +1303,11 @@ class ggml_moe_cpu_workers {
     int active = 0, pending = 0;
     bool stopping = false;
 public:
+    void set_hot_pass(bool hot) { pass_hot.store(hot, std::memory_order_release); }
+    template <typename T>
+    void wait_hot(const std::atomic<T> & value, T previous) {
+        ggml_moe_wait_hot(value, previous, &pass_hot);
+    }
     static void execute(void * pool, ggml_compute_worker_fn fn, void * job, int n_threads) {
         static_cast<ggml_moe_cpu_workers *>(pool)->run(fn, job, n_threads);
     }
@@ -1324,7 +1331,7 @@ public:
                             enabled.wait(lock, [&] { return stopping || ith < active; });
                             if (stopping) break;
                         }
-                        ggml_moe_wait_hot(advertised, seen);
+                        wait_hot(advertised, seen);
                         std::unique_lock<std::mutex> lock(mutex);
                         posted.wait(lock, [&] { return stopping || generation != seen; });
                         if (stopping) break;
@@ -1353,6 +1360,7 @@ public:
         worker = nullptr; data = nullptr;
     }
     ~ggml_moe_cpu_workers() {
+        set_hot_pass(false);
         {
             std::lock_guard<std::mutex> lock(mutex);
             GGML_ASSERT(pending == 0);
@@ -1979,7 +1987,7 @@ struct ggml_backend_sched_moe_ffn {
                 for (;;) {
                     if (hot_policy) {
                         lock.unlock();
-                        ggml_moe_wait_hot(busy, false);
+                        cpu_workers.wait_hot(busy, false);
                         lock.lock();
                     }
                     wake.wait(lock, [this] { return stop || busy; });
@@ -2019,6 +2027,7 @@ struct ggml_backend_sched_moe_ffn {
         return status;
     }
     ~ggml_backend_sched_moe_ffn() {
+        cpu_workers.set_hot_pass(false);
         finish();
         { std::lock_guard<std::mutex> lock(mutex); stop = true; }
         wake.notify_one();
@@ -4802,6 +4811,16 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+    // The scheduler owns this invocation, including every failure/abort return.
+    // Teams remain separate across contexts and sleep between invocations.
+    struct cpu_pass {
+        ggml_moe_cpu_workers * team;
+        explicit cpu_pass(ggml_backend_sched_moe_ffn * f)
+            : team(f && f->new_policy ? &f->cpu_workers : nullptr) {
+            if (team) team->set_hot_pass(!f->graph_tasks.empty());
+        }
+        ~cpu_pass() { if (team) team->set_hot_pass(false); }
+    } hot(sched->moe_ffn);
 
     for (auto & item : sched->needs_sync) item = true;
 

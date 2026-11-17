@@ -1533,6 +1533,7 @@ static void test_resident_occupied_cache_economics() {
 
 static void test_cpu_worker_handoffs() {
     ggml_moe_cpu_workers workers;
+    workers.set_hot_pass(true);
     struct job {
         int threads;
         std::atomic<int> calls[16]{};
@@ -1582,7 +1583,38 @@ static void test_cpu_worker_handoffs() {
 
 }
 
+static void test_cpu_worker_pass() {
+    ggml_backend_sched_moe_ffn f;
+    f.new_policy = true;
+    f.cpu_workers.set_hot_pass(true);
+    f.cpu_workers.run([](void *, int) {}, nullptr, 2);
+    auto usage = [](int milliseconds) {
+        const auto cpu = std::clock();
+        const auto wall = ggml_time_us();
+        std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+        return (1e6 * double(std::clock() - cpu) / CLOCKS_PER_SEC) / (ggml_time_us() - wall);
+    };
+    const double hot = usage(80);
+    fprintf(stderr, "resident pass CPU/wall hot=%.3f\n", hot);
+    check(hot > 0.25, "active pass keeps workers hot beyond a 500 us layer gap");
+    ggml_backend_sched sched{};
+    sched.n_copies = 1;
+    sched.moe_ffn = &f;
+    check(ggml_backend_sched_compute_splits(&sched) == GGML_STATUS_SUCCESS, "empty compute pass succeeds");
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const double idle = usage(80);
+    fprintf(stderr, "resident pass CPU/wall idle=%.3f\n", idle);
+    check(idle < 0.20, "compute pass return parks the CPU team");
+    f.cpu_workers.set_hot_pass(false);
+    if (!failures) fprintf(stderr, "VERIFIED worker-pass\n");
+}
+
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--worker-pass") == 0) {
+        test_cpu_worker_pass();
+        test_cpu_worker_handoffs();
+        return failures ? 1 : 0;
+    }
     test_resident_reuse_value();
     test_resident_occupied_cache_economics();
     test_cpu_worker_handoffs();
