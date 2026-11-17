@@ -171,6 +171,10 @@ if (NOT WIN32)
     target_link_libraries(test-moe-resident PRIVATE ggml Threads::Threads)
     llama_test(test-moe-resident)
 
+    llama_build(test-moe-resident-params.cpp)
+    llama_test(test-moe-resident-params
+        ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-spm.gguf)
+
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API
     #llama_target_and_test(test-sampling.cpp)
     #llama_target_and_test(test-grammar-parser.cpp)

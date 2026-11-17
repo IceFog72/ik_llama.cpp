@@ -955,7 +955,7 @@ bool gpt_params_parse_ex(int argc, char ** argv, gpt_params & params) {
     if (params.moe_resident_device_join && (params.moe_resident != -1 || !params.moe_resident_zero_fill)) {
         throw std::invalid_argument("error: --moe-resident-device-join requires auto residency and --moe-resident-profiler new\n");
     }
-    if (params.moe_resident_ubatch && params.moe_resident > 0) {
+    if (params.moe_resident_ubatch && params.moe_resident != -1) {
         throw std::invalid_argument("error: --moe-resident-ubatch requires auto residency\n");
     }
     if (params.fit && params.moe_cache_size > 0) {

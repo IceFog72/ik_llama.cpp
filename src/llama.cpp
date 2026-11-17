@@ -9749,7 +9749,7 @@ struct llama_context * llama_init_from_model(
                  struct llama_model * model,
         struct llama_context_params   params) {
 
-    if (params.moe_resident_ubatch && params.moe_resident > 0) {
+    if (params.moe_resident_ubatch && params.moe_resident != -1) {
         LLAMA_LOG_ERROR("%s: adaptive residency workspace requires auto residency\n", __func__);
         return nullptr;
     }
