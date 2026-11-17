@@ -1704,6 +1704,14 @@ static void test_cpu_worker_pass() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--ring-order") == 0) {
+#ifdef GGML_USE_CUDA
+        test_late_ring_cpu_overlap();
+#else
+        check(false, "ring ordering needs a CUDA build");
+#endif
+        return failures ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "--resident-history") == 0) {
 #ifdef GGML_USE_CUDA
         test_fully_resident_history();

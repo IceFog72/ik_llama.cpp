@@ -725,15 +725,19 @@ static void resident_ring_promote(ggml_backend_sched_t sched, size_t group, size
     f.mapping_dirty = true;
 }
 
-// At each layer: install this layer's completed forecasts, retire all others.
-static void resident_ring_service(ggml_backend_sched_t sched, int layer, ggml_backend_t gpu) {
+// Publish this layer's forecasts in the mapping and retire all others.
+// Mapping publication does not read weights. The caller queues these waits
+// after CPU input readback, but before any GPU weight readers.
+static std::vector<ggml_backend_event_t> resident_ring_service(
+        ggml_backend_sched_t sched, int layer, ggml_backend_t gpu) {
     auto & f = *sched->moe_ffn;
+    std::vector<ggml_backend_event_t> waits;
     for (size_t gi = 0; gi < f.rings.size(); ++gi) for (size_t i = 0; i < f.rings[gi].size(); ++i) {
         auto & r = f.rings[gi][i];
         if (r.layer < 0) continue;
         if (r.layer == layer) {
             if (!r.installed && r.ready) {
-                if (!ggml_backend_cuda_moe_event_ready(r.ready)) { ggml_backend_event_wait(gpu, r.ready); ++f.ring_late; }
+                if (!ggml_backend_cuda_moe_event_ready(r.ready)) { waits.push_back(r.ready); ++f.ring_late; }
                 r.installed = true; ++f.ring_installed; f.mapping_dirty = true;
             }
             continue;
@@ -743,6 +747,7 @@ static void resident_ring_service(ggml_backend_sched_t sched, int layer, ggml_ba
         if (r.installed) f.mapping_dirty = true;
         r.layer = r.expert = -1; r.installed = r.used = false;
     }
+    return waits;
 }
 
 // Upload up to N predicted, non-resident experts of the next layer from pinned
@@ -951,7 +956,8 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
             ggml_backend_cuda_moe_event_ready(f.upload_ready)) {
         f.publish_upload();
     }
-    if (cache && !f.rings.empty()) resident_ring_service(sched, t.layer, gpu);
+    const auto ring_waits = cache && !f.rings.empty()
+            ? resident_ring_service(sched, t.layer, gpu) : std::vector<ggml_backend_event_t>{};
     if (cache && f.mapping_dirty) {
         const int64_t started = ggml_time_us();
         f.wait_io(); // mapping is a reusable asynchronous DMA source
@@ -996,6 +1002,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
             size_t(t.layer) * experts : nullptr;
     if (complete) {
         // A fully resident layer needs neither host routing nor activation I/O.
+        for (auto event : ring_waits) ggml_backend_event_wait(gpu, event);
         ggml_backend_cuda_moe_route(gpu, t.up->src[3], device_map, &t.device_ids, experts);
         const int64_t started = ggml_time_us();
         const auto status = resident_gpu_ffn(f, t, gpu);
@@ -1044,6 +1051,9 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         ggml_backend_event_record(f.upload_fence);
         t.upload_fenced = true;
     }
+    // Router/activation copies and their event precede late forecast waits.
+    // CPU misses can run while the GPU waits for its own expert weights.
+    for (auto event : ring_waits) ggml_backend_event_wait(gpu, event);
     // The readback event deliberately precedes cached-expert execution. Queue
     // GPU hits using the device lookup before blocking the host: CPU input
     // readiness must not wait for those hits to finish. Neither the lookup nor

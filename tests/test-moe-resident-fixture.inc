@@ -21,6 +21,7 @@ struct resident_cuda_fixture {
         ggml_backend_sched_set_moe_resident_model_info(sched, layer + 1, experts, top_k);
         ggml_backend_sched_set_moe_resident_zero_fill(sched, true);
         ggml_backend_sched_set_moe_resident(sched, -1);
+        if (ring_entries) ggml_backend_sched_set_moe_resident_prefetch(sched, ring_entries / 2);
         sources = ggml_init({2 * 1024 * 1024, nullptr, true});
         auto allocate = [&](ggml_tensor * tensor) {
             const auto type = ggml_backend_cuda_host_buffer_type();
@@ -172,5 +173,67 @@ static void test_fully_resident_history() {
     check(ggml_backend_sched_graph_compute_async(fixture.sched, fixture.graph) == GGML_STATUS_SUCCESS,
             "teardown can own a queued asynchronous history snapshot");
     if (!failures) fprintf(stderr, "VERIFIED resident-history\n");
+}
+
+static void test_late_ring_cpu_overlap() {
+    resident_cuda_fixture fixture(1, 2);
+    auto & f = fixture.state();
+    fixture.set_route(0, 2);
+    check(ggml_backend_sched_graph_compute(fixture.sched, fixture.graph) == GGML_STATUS_SUCCESS,
+            "partial-layer warmup succeeds before delaying the upload");
+    fixture.set_route(1, 2);
+    const auto expected_cpu = fixture.reference(fixture.cpu);
+    const auto expected_gpu = fixture.reference(fixture.gpu);
+    const auto previous_cpu = f.cpu_finished_us;
+    const auto old_cpu_refs = f.cpu_refs, old_gpu_refs = f.gpu_refs;
+    f.prefetcher = ggml_backend_cuda_init(0, nullptr, &f);
+    GGML_ASSERT(f.prefetcher);
+    auto * signal = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_host_buffer_type(), 2 * sizeof(uint32_t));
+    GGML_ASSERT(signal);
+    fixture.buffers.push_back(signal);
+    auto * words = static_cast<uint32_t *>(ggml_backend_buffer_get_base(signal));
+    words[0] = words[1] = 0;
+    auto & ring = f.rings[0][0];
+    ring.layer = fixture.layer; ring.expert = 1;
+    ring.ready = ggml_backend_event_new(f.prefetcher);
+    GGML_ASSERT(ring.ready);
+    std::atomic<int64_t> released{0};
+    std::thread release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        released.store(ggml_time_us());
+        __atomic_store_n(words, 1, __ATOMIC_RELEASE);
+    });
+    check(ggml_backend_cuda_moe_gate(f.prefetcher, words, 1, words + 1),
+            "ring test queues a real delayed upload");
+    auto & task = *f.tasks[fixture.layer];
+    const auto & group = f.groups[task.group];
+    for (int b = 0; b < 3; ++b) {
+        auto destination = *task.banks[b];
+        resident_bank(f, task.group, b, destination);
+        ggml_backend_tensor_set_async(f.prefetcher, &destination,
+                static_cast<const uint8_t *>(task.banks[b]->data) + task.banks[b]->nb[2],
+                group.slots.size() * group.strides[b], task.banks[b]->nb[2]);
+        ring.data[b] = task.banks[b]->data;
+    }
+    ggml_backend_event_record(ring.ready);
+    check(ggml_backend_sched_graph_compute(fixture.sched, fixture.graph) == GGML_STATUS_SUCCESS,
+            "partial layer with a late ring upload succeeds");
+    release.join();
+    check(f.cpu_finished_us > previous_cpu && f.cpu_finished_us < released.load(),
+            "CPU misses finish before the late ring upload is released");
+    check(f.ring_late > 0 && f.ring_hits > 0 && words[1] == 0,
+            "the delayed upload is consumed without a gate timeout");
+    check(f.cpu_refs - old_cpu_refs == 1 && f.gpu_refs - old_gpu_refs == 1,
+            "the late-upload layer executes one CPU row and one GPU row");
+    fprintf(stderr, "ring overlap CPU finished minus release=%lld us\n",
+            (long long)(f.cpu_finished_us - released.load()));
+    std::vector<float> actual(expected_cpu.size());
+    ggml_backend_tensor_get(fixture.output, actual.data(), 0, ggml_nbytes(fixture.output));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const float expected = i < fixture.width ? expected_gpu[i] : expected_cpu[i];
+        check(std::fabs(actual[i] - expected) <= 1e-5f + 1e-5f * std::fabs(expected),
+                "late ring rows match their native GPU and CPU references");
+    }
+    if (!failures) fprintf(stderr, "VERIFIED ring-order\n");
 }
 #endif
