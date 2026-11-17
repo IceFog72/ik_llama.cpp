@@ -1603,6 +1603,47 @@ static void test_cpu_worker_handoffs() {
 
 }
 
+static void test_new_profiler_placement() {
+#ifdef GGML_USE_CUDA
+    auto * cuda = ggml_backend_cuda_init(0, nullptr, nullptr);
+    check(cuda != nullptr, "placement test initializes CUDA");
+    if (!cuda) return;
+    history_fixture fixture(4);
+    auto & sched = fixture.sched;
+    sched.n_backends = 1;
+    sched.backends[0] = cuda;
+    sched.moe_resident_slots = -1;
+    ggml_tensor bank{}, op{};
+    ggml_set_name(&bank, "blk.2.ffn_up_exps.weight");
+    op.op = GGML_OP_MUL_MAT_ID;
+    op.src[0] = &bank;
+    ggml_backend_sched_moe_resident_hybrid_set_layer(&sched, 2, true);
+    sched.moe_resident_zero_fill = true;
+    check(!ggml_backend_sched_force_moe_offload(&sched, cuda, &op),
+            "new profiler leaves non-FFN placement to backend calibration");
+    ggml_backend_sched_moe_ffn f;
+    sched.moe_ffn = &f;
+    f.graph_tasks[&op] = nullptr;
+    check(ggml_backend_sched_force_moe_offload(&sched, cuda, &op),
+            "eligible complete FFNs still force resident placement");
+    sched.moe_ffn = nullptr;
+    sched.moe_resident_zero_fill = false;
+    check(ggml_backend_sched_force_moe_offload(&sched, cuda, &op),
+            "old profiler preserves its explicit hybrid plan");
+    sched.moe_resident_zero_fill = true;
+    sched.moe_resident_slots = 2;
+    check(ggml_backend_sched_force_moe_offload(&sched, cuda, &op),
+            "positive slot API preserves explicit placement");
+    sched.moe_resident_slots = 0;
+    check(!ggml_backend_sched_force_moe_offload(&sched, cuda, &op),
+            "disabled residency preserves baseline placement");
+    ggml_backend_free(cuda);
+#else
+    check(false, "placement regression needs a CUDA build");
+#endif
+    if (!failures) fprintf(stderr, "VERIFIED new-placement\n");
+}
+
 static void test_cpu_worker_pass() {
     ggml_backend_sched_moe_ffn f;
     f.new_policy = true;
@@ -1630,6 +1671,10 @@ static void test_cpu_worker_pass() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc > 1 && strcmp(argv[1], "--new-placement") == 0) {
+        test_new_profiler_placement();
+        return failures ? 1 : 0;
+    }
     if (argc > 1 && strcmp(argv[1], "--pageable-prefetch") == 0) {
 #ifdef GGML_USE_CUDA
         test_complete_ffn(false, false, false, false, false, true, false, 2, false, true, prefetch_banks::pageable);

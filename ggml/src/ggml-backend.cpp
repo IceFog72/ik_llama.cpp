@@ -2473,6 +2473,9 @@ static bool ggml_backend_sched_force_moe_offload(
         return false;
     }
     if (ggml_backend_sched_moe_ffn_node(sched, tensor)) return true;
+    // The new executor owns decode placement. Larger/non-eligible graphs use
+    // the backend's calibrated offload threshold, not the old layer plan.
+    if (sched->moe_resident_slots < 0 && sched->moe_resident_zero_fill) return false;
     // Positive N keeps the pre-B4 meaning: the user explicitly requested a
     // resident pool size, so every supported MoE op may be offloaded. Only
     // `auto` uses the CPU/GPU hybrid layer plan below.
