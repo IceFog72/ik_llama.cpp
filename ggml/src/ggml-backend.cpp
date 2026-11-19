@@ -1563,6 +1563,68 @@ struct ggml_backend_sched_moe_ffn {
         uint64_t victim_epoch = UINT64_MAX;
     };
     std::vector<group> groups;
+#ifdef GGML_USE_CUDA
+    static bool timeline_enabled() {
+        static const bool enabled = [] {
+            const char * env = std::getenv("GGML_MOE_RESIDENT_TIMELINE");
+            return env && std::atoi(env) != 0;
+        }();
+        return enabled;
+    }
+    struct timeline {
+        struct sample {
+            ggml_backend_event_t routed = nullptr, wait_begin = nullptr, wait_end = nullptr,
+                    hits_end = nullptr, joined = nullptr;
+            int layer = -1;
+            bool has_wait = false, has_hits = false;
+            int64_t pre_router = 0, router_wait = 0, router_done = 0, submitted = 0, finished = 0;
+            double segment = 0;
+            int64_t between = 0;
+            bool chained = false;
+
+            void record(ggml_backend_event_t & event, ggml_backend_t gpu) {
+                if (!event) event = ggml_backend_cuda_moe_timed_event(gpu);
+                ggml_backend_event_record(event);
+            }
+            ~sample() {
+                for (auto event : {routed, wait_begin, wait_end, hits_end, joined}) ggml_backend_event_free(event);
+            }
+        } samples[2];
+        int index = 0;
+        bool adjacent = false;
+        uint64_t layers = 0, pre_router = 0, router_wait = 0, dispatch = 0, wake = 0,
+                cpu_compute = 0, join_react = 0, post_join = 0, between = 0;
+        uint64_t segment_samples = 0, ring_samples = 0, hits_samples = 0;
+        double gpu_segment = 0, ring_stall = 0, gpu_hits = 0;
+
+        void harvest_previous() {
+            auto & prev = samples[index ^ 1];
+            if (prev.layer < 0) return;
+            if (prev.has_wait) {
+                ring_stall += ggml_backend_cuda_moe_elapsed_us(prev.wait_begin, prev.wait_end);
+                ++ring_samples;
+            }
+            if (prev.has_hits) {
+                gpu_hits += ggml_backend_cuda_moe_elapsed_us(prev.has_wait ? prev.wait_end : prev.routed, prev.hits_end);
+                ++hits_samples;
+            }
+            prev.layer = -1;
+        }
+
+        void report() const {
+            if (!layers) return;
+            fprintf(stderr, "ggml_backend_sched: moe-resident new timeline layers=%llu pre_router=%.1f router_wait=%.1f dispatch=%.1f wake=%.1f cpu_compute=%.1f join_react=%.1f post_join=%.1f between=%.1f ring_stall=%.1f gpu_segment=%.1f gpu_hits=%.1f segment_n=%llu ring_n=%llu hits_n=%llu\n",
+                    (unsigned long long)layers, double(pre_router) / layers, double(router_wait) / layers,
+                    double(dispatch) / layers, double(wake) / layers, double(cpu_compute) / layers,
+                    double(join_react) / layers, double(post_join) / layers,
+                    segment_samples ? double(between) / segment_samples : 0.0, ring_stall / layers,
+                    segment_samples ? gpu_segment / segment_samples : 0.0, hits_samples ? gpu_hits / hits_samples : 0.0,
+                    (unsigned long long)segment_samples, (unsigned long long)ring_samples, (unsigned long long)hits_samples);
+        }
+    };
+    std::unique_ptr<timeline> tl;
+    int64_t cpu_begin_us = 0;
+#endif
     bool new_policy = false, virtual_cache = false, histogram_dirty = false, mapping_dirty = false;
     ggml_backend_buffer_t histogram = nullptr, slot_map = nullptr, packed_output = nullptr;
     ggml_backend_buffer_t histogram_host = nullptr;
@@ -1638,6 +1700,9 @@ struct ggml_backend_sched_moe_ffn {
                 "ggml_backend_sched: moe-resident new overlap deferred_layers=%llu gpu_splits=%llu join_wait=%.1f us/deferred-layer\n",
                 (unsigned long long)deferred_layers, (unsigned long long)overlapped_gpu_splits,
                 double(deferred_join_us) / deferred_layers);
+#ifdef GGML_USE_CUDA
+        if (tl) tl->report();
+#endif
         if (early_gpu_layers) fprintf(stderr,
                 "ggml_backend_sched: moe-resident new early_gpu layers=%llu empty_routes=%llu\n",
                 (unsigned long long)early_gpu_layers, (unsigned long long)early_gpu_empty_layers);
@@ -2005,6 +2070,10 @@ struct ggml_backend_sched_moe_ffn {
                     if (stop) break;
                     auto * current = job;
                     lock.unlock();
+#ifdef GGML_USE_CUDA
+                    // Published with cpu_finished_us when the worker settles the job.
+                    if (hot_policy && timeline_enabled()) cpu_begin_us = ggml_time_us();
+#endif
                     auto result = new_policy
                             ? ggml_backend_cpu_graph_compute_executor(cpu, &current->host_graph,
                                     ggml_moe_cpu_workers::execute, &cpu_workers)
@@ -5325,6 +5394,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         ggml_backend_sched_synchronize(sched);
         auto & f = *sched->moe_ffn;
         f.finish_upload();
+#ifdef GGML_USE_CUDA
+        if (f.tl) f.tl->harvest_previous();
+#endif
         f.report_new("shutdown");
         fprintf(stderr, "ggml_backend_sched: moe-resident complete-ffn slots=%zu cache=%zu MiB budget=%zu MiB reserve=%zu MiB layers=%llu hits=%llu fills=%llu evictions=%llu cpu_refs=%llu gpu_refs=%llu h2d_weights=%llu h2d_results=%llu d2d_weights=%llu\n",
                 f.slot_count(), f.allocation_bytes / (1024 * 1024), f.budget_bytes / (1024 * 1024), f.reserve_bytes / (1024 * 1024),

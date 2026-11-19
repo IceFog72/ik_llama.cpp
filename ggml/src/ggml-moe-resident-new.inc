@@ -864,9 +864,13 @@ static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
         resident_publish_gated(f, t, gpu, gpu_count);
         return GGML_STATUS_SUCCESS;
     }
+    auto * tl = f.tl.get();
+    auto * sample = tl && !call.gated ? &tl->samples[tl->index] : nullptr;
+    int64_t joined = 0;
     if (cpu_count || !gpu_count) {
         const int64_t join_started = ggml_time_us();
         const auto cpu_status = f.finish();
+        if (sample && sample->submitted) joined = ggml_time_us();
         // Device join: the GPU, not the host, waited from publication to CPU completion.
         const int64_t exposed = std::max<int64_t>(1, call.gated
                 ? f.cpu_finished_us - call.published_us : ggml_time_us() - join_started);
@@ -930,6 +934,28 @@ static ggml_status resident_finish_ffn(ggml_backend_sched_t sched) {
     f.batch2_layers += tokens == 2;
     f.batch3_layers += tokens == 3;
     f.batch4_layers += tokens == 4;
+    if (joined) {
+        sample->record(sample->joined, gpu);
+        sample->finished = ggml_time_us();
+        sample->layer = t.layer;
+        ++tl->layers;
+        tl->pre_router += sample->pre_router;
+        tl->router_wait += sample->router_wait;
+        tl->dispatch += sample->submitted - sample->router_done;
+        tl->wake += std::max<int64_t>(0, f.cpu_begin_us - sample->submitted);
+        tl->cpu_compute += f.cpu_finished_us - f.cpu_begin_us;
+        tl->join_react += joined - f.cpu_finished_us;
+        tl->post_join += sample->finished - joined;
+        if (sample->chained) {
+            tl->between += sample->between;
+            tl->gpu_segment += sample->segment;
+            ++tl->segment_samples;
+        }
+        tl->index ^= 1;
+        tl->adjacent = true;
+    } else if (tl) {
+        tl->adjacent = false;
+    }
     f.host_layer_us += ggml_time_us() - host_started;
     if (f.layers % (64ull * sched->moe_resident_layers) == 0) f.report_new("periodic");
     call.owner = nullptr;
@@ -1001,6 +1027,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     const auto * device_map = cache ? static_cast<const int32_t *>(ggml_backend_buffer_get_base(f.slot_map)) +
             size_t(t.layer) * experts : nullptr;
     if (complete) {
+        if (f.tl) f.tl->adjacent = false;
         // A fully resident layer needs neither host routing nor activation I/O.
         for (auto event : ring_waits) ggml_backend_event_wait(gpu, event);
         ggml_backend_cuda_moe_route(gpu, t.up->src[3], device_map, &t.device_ids, experts);
@@ -1042,6 +1069,17 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
             ggml_backend_sched_moe_decode_buffer(f.pregate_host, ggml_backend_cuda_host_buffer_type(), ggml_nbytes(t.pregate));
     if (forecast) ggml_backend_tensor_get_async(gpu, t.pregate, ggml_backend_buffer_get_base(f.pregate_host), 0, ggml_nbytes(t.pregate));
     ++f.fallback_routes;
+    if (!f.tl && !sched->moe_resident_device_join && f.timeline_enabled())
+        f.tl = std::make_unique<ggml_backend_sched_moe_ffn::timeline>();
+    auto * tl = f.tl.get();
+    auto * sample = tl ? &tl->samples[tl->index] : nullptr;
+    if (sample) {
+        sample->has_wait = !ring_waits.empty();
+        sample->has_hits = false;
+        sample->submitted = 0;
+        // Readiness already fences this timed marker and the previous layer.
+        sample->record(sample->routed, gpu);
+    }
     ggml_backend_event_record(f.router_ready);
     if (!f.upload.pending && f.upload_fence) {
         // All previous readers precede input readiness. Current GPU hits
@@ -1053,7 +1091,9 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
     }
     // Router/activation copies and their event precede late forecast waits.
     // CPU misses can run while the GPU waits for its own expert weights.
+    if (sample && sample->has_wait) sample->record(sample->wait_begin, gpu);
     for (auto event : ring_waits) ggml_backend_event_wait(gpu, event);
+    if (sample && sample->has_wait) sample->record(sample->wait_end, gpu);
     // The readback event deliberately precedes cached-expert execution. Queue
     // GPU hits using the device lookup before blocking the host: CPU input
     // readiness must not wait for those hits to finish. Neither the lookup nor
@@ -1065,12 +1105,29 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
         status = resident_gpu_ffn(f, t, gpu);
         f.gpu_enqueue_us += ggml_time_us() - started;
         if (status != GGML_STATUS_SUCCESS) { ggml_backend_synchronize(gpu); return status; }
+        if (sample) {
+            sample->record(sample->hits_end, gpu);
+            sample->has_hits = true;
+        }
         ++f.early_gpu_layers;
     }
     if (!has_resident) ++f.empty_gpu_layers;
     const int64_t router_started = ggml_time_us();
     ggml_backend_event_synchronize(f.router_ready);
-    f.router_wait_us += ggml_time_us() - router_started;
+    const int64_t router_done = ggml_time_us();
+    f.router_wait_us += router_done - router_started;
+    if (sample) {
+        sample->pre_router = router_started - host_started;
+        sample->router_wait = router_done - router_started;
+        sample->router_done = router_done;
+        const auto & prev = tl->samples[tl->index ^ 1];
+        sample->chained = tl->adjacent && prev.layer >= 0 && prev.layer + 1 == t.layer;
+        if (sample->chained) {
+            sample->between = host_started - prev.finished;
+            sample->segment = ggml_backend_cuda_moe_elapsed_us(prev.joined, sample->routed);
+        }
+        tl->harvest_previous();
+    }
     f.pending = false; // the prior result's DMA precedes this routing event
     t.route_experts.assign(ids, ids + k);
     f.cpu_ids.assign(ids, ids + k); f.gpu_ids.assign(size_t(k), -1);
@@ -1143,6 +1200,7 @@ static ggml_status ggml_backend_sched_moe_new_compute(ggml_backend_sched_t sched
             if (++f.gate_value == 0) ++f.gate_value; // 0 means host join
             t.gate_value = f.gate_value;
         }
+        if (sample && !t.gate_value) sample->submitted = ggml_time_us();
         f.submit(t);
     }
     // Policy learning is not an input to this invocation's arithmetic. Run it
