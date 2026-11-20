@@ -137,6 +137,12 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_vec_f32(ctx, dst);
             return;
         }
+        // With GQA the vec kernel reads every K/V row once per Q head. The tile kernel packs 4 or 8 Q heads per K/V head.
+        if (cc == CC_PASCAL && Q->ne[1] == 1 && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0) && V->type == K->type &&
+            ggml_cuda_fattn_tile_new_is_supported(ctx, dst)) {
+            ggml_cuda_flash_attn_ext_tile_new(ctx, dst);
+            return;
+        }
         if (precision == GGML_PREC_DEFAULT) {
             if (Q->ne[1] <= 8) {
                 // P100 (sm_60/CC_PASCAL): the fp16 vec kernel accumulates the online-softmax
@@ -167,7 +173,11 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     int gqa_ratio = Q->ne[2] / K->ne[2];
 
     if (new_mma_available(cc) && K->ne[0] == 128 && V->ne[0] == 128 && Q->ne[0] == 128 && Q->ne[1] == 1 &&
-            (gqa_ratio == 12 || gqa_ratio == 6 || gqa_ratio == 10)) {
+            (gqa_ratio == 12 || gqa_ratio == 6 || gqa_ratio == 10 || gqa_ratio == 5)) {
+        ggml_cuda_flash_attn_ext_mma_new(ctx, dst);
+        return;
+    }
+    if (new_mma_available(cc) && K->ne[0] == 128 && V->ne[0] == 128 && Q->ne[0] == 128 &&  gqa_ratio == 5) {
         ggml_cuda_flash_attn_ext_mma_new(ctx, dst);
         return;
     }
@@ -179,7 +189,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const bool gqa_opt_applies = ((Q->ne[2] / K->ne[2]) % 2 == 0) && mask; // The mma-based kernels have GQA-specific optimizations
     // So, not sure why in mainline they thought that for CC_ADA_LOVELACE or when KV cache is not f16 the vector kernels are faster.
-    // On my GPU (RTX-4080) MMA is efinitely faster for GQA, both for f16 and for quantized KV cache.
+    // On my GPU (RTX-4080) MMA is definitely faster for GQA, both for f16 and for quantized KV cache.
     //const bool mma_needs_data_conversion = K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16;
     //const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && cc < CC_ADA_LOVELACE && !mma_needs_data_conversion;
     const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && !(Q->ne[1] == 1 && n_swa > 0 && K->ne[0] == V->ne[0]);
@@ -190,7 +200,7 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     }
 
     //
-    // It turns out the new new MMA implementation is slower than the
+    // It turns out the new MMA implementation is slower than the
     // previous MMA implementation.
     // Hence, we use it only for DeepSeek with MLA enabled, where head sizes are 576, 512,
     // so no other implementation works.
@@ -274,7 +284,7 @@ bool ggml_cuda_fattn_is_supported(ggml_backend_cuda_context & ctx, const ggml_te
 
     const bool gqa_opt_applies = ((Q->ne[2] / K->ne[2]) % 2 == 0) && mask; // The mma-based kernels have GQA-specific optimizations
     // So, not sure why in mainline they thought that for CC_ADA_LOVELACE or when KV cache is not f16 the vector kernels are faster.
-    // On my GPU (RTX-4080) MMA is efinitely faster for GQA, both for f16 and for quantized KV cache.
+    // On my GPU (RTX-4080) MMA is definitely faster for GQA, both for f16 and for quantized KV cache.
     //const bool mma_needs_data_conversion = K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16;
     //const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && cc < CC_ADA_LOVELACE && !mma_needs_data_conversion;
     const bool mma_faster_for_bs1 = new_mma_available(cc) && gqa_opt_applies && !(Q->ne[1] == 1 && n_swa > 0 && K->ne[0] == V->ne[0]);

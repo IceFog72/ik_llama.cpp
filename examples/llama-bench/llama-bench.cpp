@@ -2330,6 +2330,7 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
                 return 1;
             }
+            fp8_auto_warning(lmodel, mparams.fp8_precision);
             prev_inst = &inst;
             if (!params.extra.prompt_file.empty() && !params.extra.prompt_is_binary) {
                 text = common_tokenize(lmodel, params.extra.prompt, true);
@@ -2364,13 +2365,16 @@ int main(int argc, char ** argv) {
 
         // warmup run
         if (params.warmup || params.extra.batch_warmup) {
+            llama_set_warmup(ctx, !params.extra.batch_warmup);
             if (t.n_prompt > 0) {
                 //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
                 test_prompt(ctx, params.extra.batch_warmup ? std::min(t.n_ubatch, t.n_prompt) : 1, 0, t.n_batch, t.n_threads.second, text);
             }
             if (params.warmup && t.n_gen > 0) {
+                llama_set_warmup(ctx, true);
                 test_gen(ctx, 1, 0, t.n_threads.first, text);
             }
+            llama_set_warmup(ctx, false);
         }
 
         for (int i = 0; i < params.reps; i++) {

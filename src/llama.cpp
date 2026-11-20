@@ -809,7 +809,7 @@ bool llama_context::update_cache_copies() {
         const int32_t cache_head = kv_self.is_compacted(il) ? (int32_t) kv_self.head_swa : (int32_t) kv_self.head;
         auto kl = (ggml_split_tensor_t *)kv_self.k_l[il]->extra;
         if (kl) {
-            GGML_ASSERT(model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN);
+            GGML_ASSERT(model.split_mode == LLAMA_SPLIT_MODE_GRAPH);
             GGML_ASSERT(model.splits.size() > 1);
             auto vl = !kv_self.v_l.empty() && kv_self.v_l[il] ? (ggml_split_tensor_t *)kv_self.v_l[il]->extra : nullptr;
             GGML_ASSERT(kl && (kv_self.v_l.empty() || !kv_self.v_l[il] || vl));
@@ -870,7 +870,7 @@ static std::vector<llama_context *> & llama_all_contexts() {
 llama_context::llama_context(const llama_model & model)
     : model(model) , sampling(llama_n_vocab(&model)) , t_start_us(model.t_start_us) , t_load_us(model.t_load_us) {
     const auto & hparams = model.hparams;
-    if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && model.splits.size() > 1) {
+    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH && model.splits.size() > 1) {
         cache_copies.resize(2*model.splits.size()*hparams.n_layer);
     } else {
         cache_copies.resize(2*hparams.n_layer);
@@ -938,6 +938,12 @@ bool llama_context::sched_copy_moe_cache(ggml_backend_t backend, const ggml_tens
         ggml_tensor * dst, ggml_cgraph * graph, ggml_backend_sched_copy_phase phase, void * user_data) {
     auto * ctx = static_cast<llama_context *>(user_data);
     return ctx->moe_cache && ctx->moe_cache->copy(backend, src, dst, graph, phase);
+}
+
+size_t llama_context::sched_copy_moe_cache_expert_range(ggml_backend_t backend, const ggml_tensor * src,
+        ggml_tensor * dst, int32_t first_expert, size_t max_experts, int64_t n_tokens, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    return ctx->moe_cache ? ctx->moe_cache->copy_expert_range(backend, src, dst, first_expert, max_experts, n_tokens) : 0;
 }
 
 static int llama_openpangu_chunked_graph_nodes(const llama_model & model, const llama_cparams & cparams, int n_tokens, int n_kv);
@@ -1030,6 +1036,12 @@ static inline uint32_t llama_kv_k_row_embd(
         uint32_t              il) {
     if (model.arch == LLM_ARCH_OPENPANGU) {
         return hparams.n_lora_kv + hparams.n_rot;
+    }
+    // hybrid arches keep the recurrent state out of the per-token K rows: the conv window has its
+    // own allocation in the k-side slot (see llama_kv_cache_init), so adding n_embd_k_s() here
+    // would size every attention layer's K rows as if they held the whole recurrent state
+    if (llm_arch_is_hybrid(model.arch)) {
+        return hparams.n_embd_k_gqa(il);
     }
     return hparams.n_embd_k_gqa(il) + hparams.n_embd_k_s();
 }
@@ -1336,7 +1348,7 @@ static bool llama_kv_cache_init(
 
     bool split_cache   = false;
     bool replicate_mla = false;
-    if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && !is_mla_attn && offload && !is_dsv4_k_only) {
+    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH && !is_mla_attn && offload && !is_dsv4_k_only) {
         cache.split_k_l.reserve(n_layer);
         cache.split_v_l.reserve(n_layer);
         if (llama_model_has_recurrent(&model)) {
@@ -1344,7 +1356,7 @@ static bool llama_kv_cache_init(
         }
         split_cache = true;
     }
-    if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && is_mla_attn && offload) {
+    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH && is_mla_attn && offload) {
         cache.replicated_k_l.reserve(n_layer);
         if (llama_model_has_recurrent(&model)) {
             cache.split_s_l.reserve(n_layer);
@@ -1452,6 +1464,12 @@ static bool llama_kv_cache_init(
 
     std::vector<size_t> mem_split(model.splits.size(), 0);
 
+    if ((model.arch == LLM_ARCH_NEMOTRON_H || model.arch == LLM_ARCH_NEMOTRON_H_MOE) && cparams.n_seq_max > 1) {
+        LLAMA_LOG_ERROR("%s: %s keeps one recurrent state per context, so it supports a single sequence "
+                "(n_seq_max = %u). Use one context per sequence.\n",
+                __func__, llama_model_arch_string(&model), cparams.n_seq_max);
+        return false;
+    }
     const uint32_t qnext_state_slots = llama_qwen3next_state_slots(cparams, kv_size);
     if (llm_arch_is_hybrid(model.arch) && qnext_state_slots < std::max<uint32_t>(1, cparams.n_seq_max)) {
         LLAMA_LOG_WARN("%s: reducing qwen3next state slots from %u to %u to fit KV cache size\n",
@@ -1483,6 +1501,32 @@ static bool llama_kv_cache_init(
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
         ggml_tensor * s = nullptr;
+        // standard Mamba-2 layout: a rolling conv state exists (LFM2/LFM2MOE are recurrent
+        // too, but their state is the shortconv tail, so they fall through below)
+        if (qnext_recurrent && !hparams.use_qnext_state_layout && hparams.n_embd_k_s() > 0) {
+            // standard Mamba-2 layout (Nemotron-H and friends): the rolling conv state
+            // lives in the k-side slot, the recurrent SSM state in the s slot
+            const uint32_t embd_r = hparams.n_embd_k_s();
+            const uint32_t embd_s = hparams.n_embd_v_s();
+            GGML_ASSERT(embd_r > 0 && embd_s > 0);
+
+            ggml_tensor * kc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd_r, qnext_state_slots);
+            ggml_format_name(kc, "cache_k_l%d", i);
+            cache.k_l.push_back(kc);
+            cache.conv_state_position_strict = true;
+            cache.conv_state_width = embd_r;
+
+            s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, embd_s, qnext_state_slots);
+            ggml_format_name(s, "cache_s_l%d", i);
+            cache.s_l[i] = s;
+
+            if (needs_v_cache && !is_dsv4_k_only && model.arch != LLM_ARCH_OPENPANGU) {
+                cache.v_l.push_back(nullptr);
+            }
+            LLAMA_LOG_DEBUG("=== Created recurrent cache (conv) %s [%ld x %ld], (ssm) %s [%ld x %ld]\n",
+                    kc->name, kc->ne[0], kc->ne[1], s->name, s->ne[0], s->ne[1]);
+            continue;
+        }
         if (qnext_recurrent) {
             // a PLE layer keeps its convolution history in the tail of the same row, so the
             // delta-net slice it opens with keeps the offsets every other layer uses
@@ -1576,7 +1620,11 @@ static bool llama_kv_cache_init(
         else {
             // Qwen 3 MTP layer always need KV cache in the MTP context
             const bool is_mtp_layer = (cparams.mtp_op_type != MTP_OP_NONE && i >= (int)n_mtp_first_layer);
-            if (!hparams.has_kv(i) && !is_mtp_layer) {
+            // Nemotron-H: only the attention layers have KV heads — plain FFN layers
+            // must not get a (zero-width) standard cache
+            const bool nemotron   = model.arch == LLM_ARCH_NEMOTRON_H || model.arch == LLM_ARCH_NEMOTRON_H_MOE;
+            const bool layer_has_kv = hparams.has_kv(i) && (!nemotron || hparams.n_head_kv(i) != 0);
+            if (!layer_has_kv && !is_mtp_layer) {
                 cache.k_l.push_back(nullptr);
                 if (!is_dsv4_k_only) {
                     cache.v_l.push_back(nullptr);
@@ -2099,6 +2147,7 @@ bool llama_kv_cache::checkpoint_alloc_shadows(llama_ckpt_data ckpt_type, bool co
         ggml_tensor * primary;
         uint32_t      il;
         int           split_idx; // -1 for non-split
+        bool          is_conv;   // k-side row (rolling conv window) instead of the SSM state
     };
 
     std::map<ggml_backend_buffer_type_t, std::vector<tensor_entry>> buft_entries;
@@ -2114,11 +2163,28 @@ bool llama_kv_cache::checkpoint_alloc_shadows(llama_ckpt_data ckpt_type, bool co
             for (int d = 0; d < split_info->n_device; ++d) {
                 if (split_info->splits[d] == nullptr) continue;
                 ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(split_info->splits[d]->buffer);
-                buft_entries[buft].push_back({split_info->splits[d], il, d});
+                buft_entries[buft].push_back({split_info->splits[d], il, d, false});
             }
         } else {
             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(s_l[il]->buffer);
-            buft_entries[buft].push_back({s_l[il], il, -1});
+            buft_entries[buft].push_back({s_l[il], il, -1, false});
+        }
+    }
+
+    // the standard Mamba-2 layout also keeps the rolling conv window in k_l
+    ckpt.k_l_shadow.assign(n_layer, nullptr);
+    if (!conv_state_position_strict) {
+        // the conv window only lives in k_l in the standard Mamba-2 layout
+        ckpt.k_l_shadow.clear();
+    } else {
+        for (uint32_t il = 0; il < n_layer && il < (uint32_t) k_l.size(); ++il) {
+            // only the recurrent layers' slots hold the conv window; the attention layers' k_l rows
+            // are their K cache and must not be duplicated (that would shadow the whole KV cache)
+            if (k_l[il] == nullptr || k_l[il]->extra != nullptr || k_l[il]->ne[0] != (int64_t) conv_state_width) {
+                continue;
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(k_l[il]->buffer);
+            buft_entries[buft].push_back({k_l[il], il, -1, true});
         }
     }
 
@@ -2142,7 +2208,9 @@ bool llama_kv_cache::checkpoint_alloc_shadows(llama_ckpt_data ckpt_type, bool co
             } else {
                 shadow = ggml_dup_tensor(ctx, entry.primary);
             }
-            if (entry.split_idx >= 0) {
+            if (entry.is_conv) {
+                ggml_format_name(shadow, "shadow_k_l%d", entry.il);
+            } else if (entry.split_idx >= 0) {
                 ggml_format_name(shadow, "shadow_s_l%d_d%d", entry.il, entry.split_idx);
             } else {
                 ggml_format_name(shadow, "shadow_s_l%d", entry.il);
@@ -2164,7 +2232,9 @@ bool llama_kv_cache::checkpoint_alloc_shadows(llama_ckpt_data ckpt_type, bool co
         ckpt.shadow_bufs.push_back(buf);
 
         for (const auto & entry : entries) {
-            if (entry.split_idx < 0) {
+            if (entry.is_conv) {
+                ckpt.k_l_shadow[entry.il] = entry.primary;
+            } else if (entry.split_idx < 0) {
                 ckpt.s_l_shadow[entry.il] = entry.primary;
             }
         }
@@ -2259,6 +2329,21 @@ bool llama_kv_cache::checkpoint_save(ggml_backend_sched_t sched, llama_ckpt_data
         }
     }
 
+    // the rolling conv window (standard Mamba-2 layout) lives in k_l, so shadow it as well
+    for (uint32_t il = 0; il < n_layer && il < (uint32_t) ckpt.k_l_shadow.size(); ++il) {
+        if (ckpt.k_l_shadow[il] == nullptr || il >= (uint32_t) k_l.size() || k_l[il] == nullptr) {
+            continue;
+        }
+        auto src_backend = ggml_backend_sched_get_tensor_backend(sched, k_l[il]);
+        if (src_backend == nullptr) {
+            sync_sched_once();
+            ggml_backend_tensor_copy(k_l[il], ckpt.k_l_shadow[il]);
+        } else {
+            ggml_backend_tensor_copy_async(src_backend, src_backend, k_l[il], ckpt.k_l_shadow[il]);
+            backends_to_sync.insert(src_backend);
+        }
+    }
+
     for (auto backend : backends_to_sync) {
         ggml_backend_synchronize(backend);
     }
@@ -2324,6 +2409,21 @@ bool llama_kv_cache::checkpoint_restore(ggml_backend_sched_t sched, llama_ckpt_d
                 ggml_backend_tensor_copy_async(dst_backend, dst_backend, ckpt.s_l_shadow[il], s_l[il]);
                 backends_to_sync.insert(dst_backend);
             }
+        }
+    }
+
+    for (uint32_t il = 0; il < n_layer && il < (uint32_t) ckpt.k_l_shadow.size(); ++il) {
+        if (ckpt.k_l_shadow[il] == nullptr || il >= (uint32_t) k_l.size() || k_l[il] == nullptr) {
+            continue;
+        }
+        GGML_ASSERT(ggml_nbytes(ckpt.k_l_shadow[il]) == ggml_nbytes(k_l[il]));
+        auto dst_backend = ggml_backend_sched_get_tensor_backend(sched, k_l[il]);
+        if (dst_backend == nullptr) {
+            sync_sched_once();
+            ggml_backend_tensor_copy(ckpt.k_l_shadow[il], k_l[il]);
+        } else {
+            ggml_backend_tensor_copy_async(dst_backend, dst_backend, ckpt.k_l_shadow[il], k_l[il]);
+            backends_to_sync.insert(dst_backend);
         }
     }
 
@@ -2857,6 +2957,11 @@ static void llama_kv_cache_seq_add(
     // re-positioned: rope is baked into the cached k_pe rows and the side state is keyed
     // by absolute position. Fail loudly instead of corrupting.
     GGML_ASSERT(!cache.s_l_position_strict && "K-shift/context shift is not supported for this model's position-indexed KV cache");
+    // a recurrent layer keeps an absolute-position history (conv window + SSM state) that a
+    // cell shift cannot move; the common/server layers already refuse this, so only the raw C
+    // API can get here
+    GGML_ASSERT(!cache.conv_state_position_strict &&
+            "K-shift/context shift is not supported for the Mamba-2 recurrent state");
     // a compacted layer holds window rows rather than one row per context cell, so the cells this
     // would re-position do not describe it
     GGML_ASSERT(!cache.any_compacted() && "K-shift/context shift is not supported for a compacted KV cache (--swa-compress)");
@@ -3463,9 +3568,7 @@ static void llm_prepare_mla(llama_model & model, int mla) {
 
             // Per-head split wk_b/wv_b under -sm graph/attn so each rank's batched matmul
             // reads only its share of heads (split_dim=2), mirroring prepare_split_tensors.
-            const bool tp_replicate =
-                (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN)
-                && l.wo && l.wo->extra;
+            const bool tp_replicate = model.split_mode == LLAMA_SPLIT_MODE_GRAPH && l.wo && l.wo->extra;
 
             auto materialize = [&](ggml_tensor * source,
                                    std::shared_ptr<ggml_tensor> & computed,
@@ -3583,7 +3686,7 @@ static void llm_prepare_mla(llama_model & model, int mla) {
             // with the wk_b synthesis above and skipping it breaks absorb on some
             // quant combinations. Second pass below gates the mla=1 saving for
             // GGUFs that ship wk_b directly.
-            if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) {
+            if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH) {
                 ggml_graph_clear(graph);
                 auto wk_b_pp = ggml_cast(ctx, wk_b_f32, new_type);
                 wk_b_pp->data = (char *)wk_b->data + ggml_nbytes(wk_b);
@@ -3629,7 +3732,7 @@ static void llm_prepare_mla(llama_model & model, int mla) {
     // Second pass: for layers where wk_b came from the GGUF directly, produce
     // wk_b_pp here. Only under -sm graph/attn AND mla > 1; mla=1 skips pp_opt.
     int n_computed = 0;
-    if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && mla > 1) {
+    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH && mla > 1) {
         int n_pp_to_compute = 0;
         for (auto & l : model.layers) {
             if (l.wk_b && !l.wk_b_pp) ++n_pp_to_compute;
@@ -3829,14 +3932,18 @@ static void llm_prepare_mla(llama_model & model, int mla) {
     // preparation of wkv_b impossible. It also has the benefit that wkv_b will get automatically
     // run-time repacked if the rtr option is set.
     //
-    const int32_t n_head        = hparams.n_head(0);
     std::vector<uint8_t> work_data;
     LLAMA_LOG_INFO("============ %s: need to compute %d wkv_b tensors\n", __func__, n_to_compute);
+    // only require uniform head counts among the expanded layers
+    int32_t n_head = -1;
     for (int il = 1; il < n_layer; ++il) {
-        // Somehow the number of heads is being defined as being per layer. Not sure why this is the
-        // case, but for now we do not support strange models that have different numbers of heads
-        // in different model layers.
-        if ((int)hparams.n_head(il) != n_head) throw std::runtime_error("Unsupported configuration");
+        const auto & l = model.layers[il];
+        if (l.wkv_b || !l.wk_b || !l.wv_b) continue;
+        if (n_head < 0) {
+            n_head = (int32_t) hparams.n_head(il);
+        } else if ((int32_t) hparams.n_head(il) != n_head) {
+            throw std::runtime_error("Unsupported configuration");
+        }
     }
 
     size_t context_size = ggml_tensor_overhead()*16*n_layer;
@@ -4353,6 +4460,7 @@ static bool is_model_split_supported(const llama_model & model) {
         LLM_ARCH_QWEN3,
         LLM_ARCH_QWEN3VL,
         LLM_ARCH_HUNYUAN_MOE,
+        LLM_ARCH_HY_V3,
         LLM_ARCH_OPENAI_MOE,
         LLM_ARCH_ERNIE4_5_MOE,
         LLM_ARCH_MINIMAX_M2,
@@ -4453,7 +4561,7 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             ow_size += size;
             continue;
         }
-        if (model.arch == LLM_ARCH_GEMMA4) {
+        if (model.arch == LLM_ARCH_GEMMA4 || model.arch == LLM_ARCH_RAON1_NANO) {
             if (name == "per_layer_token_embd.weight" ||
                 name == "per_layer_model_proj.weight" ||
                 name == "per_layer_proj_norm.weight") {
@@ -4690,7 +4798,7 @@ static bool llm_load_tensors(
         }
     }
 
-    if (split_mode == LLAMA_SPLIT_MODE_GRAPH || split_mode == LLAMA_SPLIT_MODE_ATTN) {
+    if (split_mode == LLAMA_SPLIT_MODE_GRAPH) {
         const bool unsupported_gemma_split = model.arch == LLM_ARCH_GEMMA4 && hparams.n_embd_per_layer > 0;
 
         if (unsupported_gemma_split) {
@@ -4723,7 +4831,7 @@ static bool llm_load_tensors(
             }
         }
     }
-    if ((split_mode == LLAMA_SPLIT_MODE_GRAPH || split_mode == LLAMA_SPLIT_MODE_ATTN) &&
+    if (split_mode == LLAMA_SPLIT_MODE_GRAPH &&
         (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT)) {
         auto & all_models = llama_all_loaded_models();
         bool has_target_gemma = false;
@@ -4842,7 +4950,7 @@ static bool llm_load_tensors(
     }
 
     int device_count = model.splits.size();
-    if (device_count < 2 && (model.split_mode == LLAMA_SPLIT_MODE_ATTN || model.split_mode == LLAMA_SPLIT_MODE_GRAPH)) {
+    if (device_count < 2 && model.split_mode == LLAMA_SPLIT_MODE_GRAPH) {
         throw std::runtime_error("It is not possible to use split mode 'graph' with less than 2 devices");
     }
     if (fit && device_count > 1) {
@@ -4860,7 +4968,6 @@ static bool llm_load_tensors(
     }
 
     model.default_layer_device = std::vector<int32_t>(hparams.n_layer+1, device_count-1);
-    int act_gpu_layers = std::min(n_gpu_layers, (int)n_layer + 1);
     std::vector<llama_model_tensor_buft_override> overrides;
     // device_count comes from model.splits (at least 1), but device_mem below is sized by
     // model.devices, which is empty on a CPU-only run of a CUDA build (no GPU present or
@@ -4941,7 +5048,7 @@ static bool llm_load_tensors(
         if (fit && required_mem > available_mem) {
             auto buft = ggml_backend_cpu_buffer_type();
             if (has_experts) {
-            if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) {
+            if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH) {
                 auto cur_mem = required_mem;
                 int n_override = 0;
                 for (int il = 0; il < n_layer; ++il) {
@@ -5113,7 +5220,7 @@ static bool llm_load_tensors(
         }
     } else {
         ggml_backend_buffer_type_t split_buft;
-        if ((split_mode == LLAMA_SPLIT_MODE_GRAPH || split_mode == LLAMA_SPLIT_MODE_ATTN) && model.splits.size() > 1) {
+        if (split_mode == LLAMA_SPLIT_MODE_GRAPH && model.splits.size() > 1) {
             split_buft = llama_default_buffer_type_split(model, model.devices[main_gpu]);
             model.split_buft = split_buft;
         } else {
@@ -5123,14 +5230,7 @@ static bool llm_load_tensors(
         // assign the repeating layers
         for (int i = i_gpu_start; i < n_layer; ++i) {
             auto buft_layer = llama_default_buffer_type_offload(model, model.devices[model.default_layer_device[i]]);
-            if (split_mode == LLAMA_SPLIT_MODE_ATTN) {
-                int layer_gpu = std::upper_bound(model.splits.begin(), model.splits.begin() + device_count,
-                        float(i - i_gpu_start)/act_gpu_layers) - model.splits.begin();
-                model.buft_layer[i] = { split_buft, llama_default_buffer_type_offload(model, model.devices[layer_gpu]) };
-                LLAMA_LOG_INFO("Layer %d: assigning buft_layer to GPU %d\n", i, layer_gpu);
-            } else {
-                model.buft_layer[i] = { split_buft, buft_layer };
-            }
+            model.buft_layer[i] = { split_buft, buft_layer };
         }
         // assign the output layer
         if (n_gpu_layers > n_layer) {
@@ -5550,8 +5650,7 @@ static bool llm_load_tensors(
 
     if (model.is_mla_model()) {
         // -sm graph/attn needs wk_b->extra populated; run prepare even under dry-run.
-        const bool graph_mode = (model.split_mode == LLAMA_SPLIT_MODE_GRAPH ||
-                                 model.split_mode == LLAMA_SPLIT_MODE_ATTN);
+        const bool graph_mode = model.split_mode == LLAMA_SPLIT_MODE_GRAPH;
         if (!dry_run || graph_mode) {
             llm_prepare_mla(model, mla_attn);
         }
@@ -5703,7 +5802,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
                 params.repack_tensors, params.use_thp, params.merge_qkv, params.merge_up_gate_exps,
                 params.defer_experts,
                 params.kv_overrides, params.tensor_buft_overrides,
-                params.ngram_file ? params.ngram_file : "", params.nvfp4_precision);
+                params.ngram_file ? params.ngram_file : "", params.nvfp4_precision, params.fp8_precision);
 
         model.hparams.vocab_only = params.vocab_only;
 
@@ -5791,6 +5890,7 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             throw std::runtime_error("MTP companion GGUF cannot be used as the target model, pass it with -md/--draft");
         }
 
+        model.fp8_w8a8 = ml.fp8_w8a8;
         // ---- populate reload registry ONLY when hot-swap is requested ----
         if (std::getenv("LLAMA_HOTSWAP_ENABLED") != nullptr) {
             model.reload = std::make_unique<reload_info>(ml);
@@ -6162,7 +6262,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         int32_t * dst_win_blk   = (int32_t *) qsa.win_blocks->data;
         int32_t * dst_win_cells = (int32_t *) qsa.win_cells->data;
         int32_t * dst_win_pos   = (int32_t *) qsa.win_pos->data;
-        float   * dst_bias      = (float   *) qsa.bias->data;
+        ggml_half * dst_bias    = (ggml_half *) qsa.bias->data;
 
         // the fused indexer op takes a per-head weight; this architecture sums the heads plain
         if (qsa.head_w) {
@@ -6249,25 +6349,34 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
         // KQ_mask already carries causality, so this holds only the per-block part: -inf for an
         // unpoolable block, a boost for the incomplete block the query sits in
+        const ggml_half h_boost = ggml_fp32_to_fp16(65504.f);
+        const ggml_half h_inf   = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_half h_zero  = ggml_fp32_to_fp16(0.0f);
+        std::vector<ggml_half> base_bias(n_kv);
+        for (int32_t j = 0; j < n_kv; ++j) {
+            base_bias[j] = blk_of[j] < 0 ? h_inf : h_zero;
+        }
         auto fill_bias = [&](int32_t i0, int32_t i1) {
             for (int32_t i = i0; i < i1; ++i) {
                 // n_kv times n_tokens reaches 2^31 at the model's full context, so index wide
-                float * cur_bias = dst_bias + (size_t) i*n_kv;
+                ggml_half * cur_bias = dst_bias + (size_t) i*n_kv;
 
                 if (i >= batch.n_tokens) {
-                    std::fill(cur_bias, cur_bias + n_kv, 0.0f);
+                    std::fill(cur_bias, cur_bias + n_kv, h_zero);
                     continue;
                 }
 
                 const llama_pos q          = batch.pos[i];
                 const llama_pos tail_start = (q + 1)/r*r;
 
+                const llama_pos * pos_j  = cell_pos.data();
+                const ggml_half * base_j = base_bias.data();
                 for (int32_t j = 0; j < n_kv; ++j) {
-                    const llama_pos p = cell_pos[j];
+                    const llama_pos p = pos_j[j];
 
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_bias[j] = (p >= tail_start && p <= q) ? 65504.f // max. fp16 value in case math is done with fp16 precision
-                                : (blk_of[j] < 0 ? -INFINITY : 0.0f);
+                    cur_bias[j] = (p >= tail_start && p <= q) ? h_boost // max. fp16 value in case math is done with fp16 precision
+                                : base_j[j];
                 }
             }
         };
@@ -6671,10 +6780,55 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                     }
                 };
                 std::vector<std::thread> workers(n_thread-1);
-                int it = 0;
-                for (auto& w : workers) w = std::thread(compute, it++);
-                compute(it);
-                for (auto& w : workers) w.join();
+                auto run = [](std::vector<std::thread> & workers, auto && fn) {
+                    int it = 0;
+                    for (auto& w : workers) w = std::thread(fn, it++);
+                    fn(it);
+                    for (auto& w : workers) w.join();
+                };
+                if (!hparams.use_alibi && cparams.flash_attn && data_f16 && !data_swa_f16) {
+                    std::vector<llama_seq_id> seqs;
+                    std::vector<int32_t> tok_seq(n_tokens);
+                    for (int j = 0; j < n_tokens; ++j) {
+                        const llama_seq_id s = batch.seq_id[j][0];
+                        auto f = std::find(seqs.begin(), seqs.end(), s);
+                        tok_seq[j] = int32_t(f - seqs.begin());
+                        if (f == seqs.end()) {
+                            seqs.push_back(s);
+                        }
+                    }
+                    const llama_pos p_none = std::numeric_limits<llama_pos>::max();
+                    std::vector<llama_pos> vis(seqs.size()*n_kv);
+                    auto fill_vis = [&](int ith) {
+                        const int64_t first = int64_t(ith)*npt;
+                        const int64_t last  = std::min(n_kv, first + npt);
+                        for (size_t s = 0; s < seqs.size(); ++s) {
+                            llama_pos * v = vis.data() + s*n_kv;
+                            for (int64_t i = first; i < last; ++i) {
+                                const auto & cell = mask_kv_self.cells[i];
+                                v[i] = cell.has_seq_id(seqs[s]) ? cell.pos : p_none;
+                            }
+                        }
+                    };
+                    const int tpt = (n_tokens + n_thread - 1)/n_thread;
+                    auto fill_rows = [&](int ith) {
+                        const ggml_half h_inf  = ggml_fp32_to_fp16(-INFINITY);
+                        const ggml_half h_zero = ggml_fp32_to_fp16(0.f);
+                        const int j1 = std::min(int(n_tokens), (ith + 1)*tpt);
+                        for (int j = ith*tpt; j < j1; ++j) {
+                            const llama_pos pos = batch.pos[j];
+                            const llama_pos * v = vis.data() + size_t(tok_seq[j])*n_kv;
+                            ggml_half * dst = data_f16 + int64_t(j)*n_kv;
+                            for (int64_t i = 0; i < n_kv; ++i) {
+                                dst[i] = v[i] > pos ? h_inf : h_zero;
+                            }
+                        }
+                    };
+                    run(workers, fill_vis);
+                    run(workers, fill_rows);
+                } else {
+                    run(workers, compute);
+                }
                 int64_t n_tokens_padded = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
                 if (n_tokens_padded > n_tokens) {
                     if (data) {
@@ -7155,6 +7309,18 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         }
     }
 
+    if (lctx.inp_ssm_ids) {
+        // Mamba-2 / Nemotron-H: ids[i] is the source state slot of output sequence i.
+        // The recurrent state cache has exactly one slot (single-sequence path).
+        GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_ssm_ids->buffer));
+        int32_t * data = (int32_t *) lctx.inp_ssm_ids->data;
+        const int64_t n_seqs = lctx.inp_ssm_ids->ne[0];
+
+        for (int64_t s = 0; s < n_seqs; ++s) {
+            data[s] = (int32_t) s;
+        }
+    }
+
     if (lctx.inp_ple_rows) {
         const auto & hp = lctx.model.hparams;
 
@@ -7405,7 +7571,8 @@ static size_t llama_output_reserve(llama_context & lctx, size_t n_outputs) {
 static void llama_graph_compute(
         llama_context & lctx,
           ggml_cgraph * gf,
-                  int   n_threads) {
+                  int   n_threads,
+                 bool   single_token_decode = false) {
 #ifdef GGML_USE_METAL
     if (ggml_backend_is_metal(lctx.backend_metal)) {
         ggml_backend_metal_set_n_cb(lctx.backend_metal, n_threads);
@@ -7418,7 +7585,10 @@ static void llama_graph_compute(
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
     }
 
-    ggml_backend_sched_graph_compute_async(lctx.sched, gf);
+    const bool periodic_tg_eligible = single_token_decode && !lctx.cparams.warmup && lctx.moe_cache;
+    if (lctx.moe_cache) lctx.moe_cache->begin_compute(periodic_tg_eligible);
+    const ggml_status status = ggml_backend_sched_graph_compute_async(lctx.sched, gf);
+    lctx.periodic_tg_completion.arm(periodic_tg_eligible, status == GGML_STATUS_SUCCESS);
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(lctx.sched));
 }
@@ -7440,6 +7610,7 @@ static void llama_graph_compute_sched(
         ggml_backend_cpu_set_moe_expert_prefetch(lctx.backend_cpu, lctx.cparams.prefetch_experts);
     }
 
+    if (lctx.moe_cache && sched == lctx.sched) lctx.moe_cache->begin_compute(false);
     ggml_backend_sched_graph_compute_async(sched, gf);
 }
 
@@ -8023,6 +8194,10 @@ static int llama_decode_internal(
                         lctx.swa_window_view.w_view,
                         lctx.swa_window_view.win_off,
                         seq_fingerprint, state_hash, gf});
+                // a graph that re-pools every QSA block must not be reused by the next tokens
+                if (lctx.qsa_pooled_stale) {
+                    prev.reset();
+                }
             }
         } else {
             //printf("Reusing graph with type = %d, n_kv = %d, n_tokens = %d\n", cparams.mtp_op_type, (int)prev->n_kv, (int)prev->n_tokens);
@@ -8123,7 +8298,7 @@ static int llama_decode_internal(
             ggml_backend_sched_moe_resident_set_tokens(lctx.sched,
                     single_sequence ? u_batch.token : nullptr, single_sequence ? u_batch.n_tokens : 0);
         }
-        llama_graph_compute(lctx, gf, n_threads);
+        llama_graph_compute(lctx, gf, n_threads, n_tokens_all == 1);
 
         if (llm_arch_is_dsv4(lctx.model.arch) &&
             llama_dsv4_per_step_capture_active(lctx, { LLAMA_CHECKPOINT_SPEC, 0, 0 }) &&
@@ -9186,6 +9361,7 @@ struct llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.ngram_file                  =*/ nullptr,
         /*.nvfp4_precision             =*/ LLAMA_NVFP4_PRECISION_AUTO,
+        /*.fp8_precision               =*/ LLAMA_FP8_PRECISION_AUTO,
         /*.vocab_only                  =*/ false,
         /*.use_mmap                    =*/ true,
         /*.use_mlock                   =*/ false,
@@ -9240,6 +9416,7 @@ struct llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_policy            =*/ LLAMA_MOE_CACHE_POLICY_LRU,
+        /*.moe_cache_cpu_share         =*/ 0.0f,
         /*.idx_type_k                  =*/ GGML_TYPE_F16,
         /*.type_reduce                 =*/ GGML_TYPE_F16,
         /*.type_graph_attn             =*/ GGML_TYPE_F16,
@@ -9266,7 +9443,8 @@ struct llama_context_params llama_context_default_params() {
         /*.dsa                         =*/ false,
         /*.fused_idx_topk              =*/ true,
         /*.swa_compress                =*/ false,
-        /*.dsv41_replay_keep           =*/ 0,
+        /*.force_experts_offload_device=*/ false,
+        /*.dsv41_replay_keep           =*/ 256,
         /*.dsv4_legacy_state           =*/ false,
         /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
@@ -9765,6 +9943,12 @@ struct llama_context * llama_init_from_model(
         LLAMA_LOG_ERROR("%s: invalid MoE cache policy value %d\n", __func__, (int) params.moe_cache_policy);
         return nullptr;
     }
+    if (!std::isfinite(params.moe_cache_cpu_share) || params.moe_cache_cpu_share < 0.0f ||
+            params.moe_cache_cpu_share > 1.0f) {
+        LLAMA_LOG_ERROR("%s: invalid MoE cache CPU share %.9g (expected finite value in [0,1])\n",
+                __func__, (double) params.moe_cache_cpu_share);
+        return nullptr;
+    }
 
     if (!model) {
         LLAMA_LOG_ERROR("%s: model cannot be NULL\n", __func__);
@@ -9805,6 +9989,11 @@ struct llama_context * llama_init_from_model(
         // openPangu attention prepends 128 learned param_sink K/V entries, which the manual
         // (soft_max) attention path handles; the FA kernel has no way to include them.
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with OpenPangu param_sink attention - forcing off\n", __func__);
+        params.flash_attn = false;
+    }
+
+    if (params.flash_attn && model->hparams.f_max_alibi_bias > 0) {
+        LLAMA_LOG_WARN("%s: flash_attn is not supported with Alibi bias - forcing off\n", __func__);
         params.flash_attn = false;
     }
 
@@ -9929,10 +10118,11 @@ struct llama_context * llama_init_from_model(
     cparams.dsa              = params.dsa;
     cparams.fused_idx_topk   = params.fused_idx_topk;
     cparams.swa_compress     = params.swa_compress;
+    cparams.force_experts_offload_device = params.force_experts_offload_device;
     cparams.dsv41_replay_keep = params.dsv41_replay_keep;
     if (cparams.dsv41_replay_keep > 0) {
         if (model->arch != LLM_ARCH_DEEPSEEK41) {
-            LLAMA_LOG_WARN("%s: --dsv41-replay-keep is only implemented for DeepSeek-V4.1; ignoring\n", __func__);
+            //LLAMA_LOG_WARN("%s: --dsv41-replay-keep is only implemented for DeepSeek-V4.1; ignoring\n", __func__);
             cparams.dsv41_replay_keep = 0;
         } else if (!cparams.swa_compress) {
             LLAMA_LOG_WARN("%s: --dsv41-replay-keep requires --swa-compress; ignoring\n", __func__);
@@ -9957,8 +10147,7 @@ struct llama_context * llama_init_from_model(
     // The DSA lightning indexer is built only in the layer-mode (non-TP) attention path. Under
     // -sm graph / -sm attn the model runs the tensor-parallel attention path, which has no indexer,
     // so --dsa would silently run dense MLA. Warn instead of degrading silently.
-    if (cparams.dsa && model->arch != LLM_ARCH_MINIMAX_M3 &&
-            (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN)) {
+    if (cparams.dsa && model->arch != LLM_ARCH_MINIMAX_M3 && model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
         LLAMA_LOG_WARN("%s: --dsa is not active under -sm graph/attn (tensor-parallel attention has no indexer); running dense MLA\n", __func__);
     }
     cparams.prefetch_experts = params.prefetch_experts;
@@ -9994,6 +10183,7 @@ struct llama_context * llama_init_from_model(
     cparams.mtp              = params.mtp;
     cparams.moe_cache_size   = params.moe_cache_size;
     cparams.moe_cache_policy = params.moe_cache_policy;
+    cparams.moe_cache_cpu_share = params.moe_cache_cpu_share;
     cparams.worst_graph_tokens = params.worst_case_tokens;
     cparams.dflash_query_capacity = params.dflash_query_capacity;
 
@@ -10042,7 +10232,6 @@ struct llama_context * llama_init_from_model(
     if (cparams.moe_resident_ubatch &&
             (cparams.n_seq_max != 1 ||
              params.cb_eval || model->split_mode == LLAMA_SPLIT_MODE_GRAPH ||
-             model->split_mode == LLAMA_SPLIT_MODE_ATTN ||
              cparams.n_ubatch > uint32_t(INT_MAX) ||
              cparams.moe_resident_ubatch > cparams.n_ubatch ||
              (cparams.moe_resident_ubatch_auto &&
@@ -10133,6 +10322,7 @@ struct llama_context * llama_init_from_model(
         model->arch != LLM_ARCH_GEMMA4_ASSISTANT &&
         model->arch != LLM_ARCH_OPENPANGU &&
         model->arch != LLM_ARCH_QWEN4EXP &&
+        model->arch != LLM_ARCH_RAON1_NANO &&
         cparams.mtp != 0) {
         cparams.mtp = 0;
     }
@@ -10153,6 +10343,7 @@ struct llama_context * llama_init_from_model(
     LLAMA_LOG_INFO("%s: fused_mmad    = %d\n",     __func__, cparams.fused_mmad);
     LLAMA_LOG_INFO("%s: rope_cache    = %d\n",     __func__, cparams.rope_cache);
     LLAMA_LOG_INFO("%s: graph_reuse   = %d\n",     __func__, cparams.graph_reuse);
+    LLAMA_LOG_INFO("%s: feod          = %d\n",     __func__, cparams.force_experts_offload_device);
     if (model->arch == LLM_ARCH_GLM_DSA) {
         LLAMA_LOG_INFO("%s: dsa           = %d\n",     __func__, cparams.dsa);
         LLAMA_LOG_INFO("%s: dsa_idx_topk  = %d\n",     __func__, cparams.fused_idx_topk);
@@ -10273,7 +10464,7 @@ struct llama_context * llama_init_from_model(
             }
         }
 #elif defined(GGML_USE_VULKAN)
-        if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH || model->split_mode == LLAMA_SPLIT_MODE_ATTN) {
+        if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH) {
             LLAMA_LOG_ERROR("%s: split mode 'graph' or 'attn' not supported. Failed to initialize Vulkan backend\n", __func__);
             llama_free(ctx);
             return nullptr;
@@ -10585,8 +10776,11 @@ struct llama_context * llama_init_from_model(
             if (cparams.moe_cache_size > 0) {
                 try {
                     ctx->moe_cache = std::make_unique<llama_moe_cache>(*model, ctx->backends, backend_buft,
-                            cparams.moe_cache_size, cparams.moe_cache_policy);
+                            cparams.moe_cache_size, cparams.moe_cache_policy, cparams.moe_cache_cpu_share);
                     ggml_backend_sched_set_copy_callback(ctx->sched, llama_context::sched_copy_moe_cache, ctx);
+                    ggml_backend_sched_set_expert_range_copy_callback(ctx->sched,
+                            llama_context::sched_copy_moe_cache_expert_range,
+                            ctx->moe_cache->copy_expert_range_min_tokens(), ctx);
                 } catch (const std::exception & e) {
                     LLAMA_LOG_ERROR("%s: failed to initialize MoE cache: %s\n", __func__, e.what());
                     llama_free(ctx);
@@ -10652,6 +10846,9 @@ struct llama_context * llama_init_from_model(
                     ggml_backend_sched_set_moe_resident_adaptive(ctx->sched, cparams.moe_resident_ubatch != 0);
                     if (ctx->moe_cache) {
                         ggml_backend_sched_set_copy_callback(ctx->sched, llama_context::sched_copy_moe_cache, ctx);
+                        ggml_backend_sched_set_expert_range_copy_callback(ctx->sched,
+                                llama_context::sched_copy_moe_cache_expert_range,
+                                ctx->moe_cache->copy_expert_range_min_tokens(), ctx);
                     }
                     gf_success = ggml_backend_sched_reserve(ctx->sched, gf);
                 }
@@ -10990,12 +11187,16 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_REFACT:
         case LLM_ARCH_BLOOM:
         case LLM_ARCH_MAMBA:
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_JINA_BERT_V2:
         case LLM_ARCH_T5:
         case LLM_ARCH_T5ENCODER:
         case LLM_ARCH_JAIS:
         case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_GLM5NEXT_DASHED:
+        case LLM_ARCH_RAON1_NANO:
+        case LLM_ARCH_RAON1:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
@@ -11070,12 +11271,14 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_ORION:
         case LLM_ARCH_DOTS1:
         case LLM_ARCH_HUNYUAN_MOE:
+        case LLM_ARCH_HY_V3:
         case LLM_ARCH_OPENAI_MOE:
         case LLM_ARCH_BAILINGMOE2:
         case LLM_ARCH_MINIMAX_M2:
         case LLM_ARCH_MINIMAX_M3:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_SEED_OSS:
+        case LLM_ARCH_STEP5:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_GEMMA4:
@@ -11099,9 +11302,6 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN4EXP:
             return LLAMA_ROPE_TYPE_IMROPE;
-
-        case LLM_ARCH_RAON1:
-            return LLAMA_ROPE_TYPE_NONE;
 
         // all model arches should be listed explicitly here
         case LLM_ARCH_UNKNOWN:
@@ -11137,6 +11337,10 @@ int32_t llama_n_layer(const struct llama_model * model) {
 
 float llama_rope_freq_scale_train(const struct llama_model * model) {
     return model->hparams.rope_freq_scale_train;
+}
+
+bool llama_model_fp8_w8a8(const struct llama_model * model) {
+    return model->fp8_w8a8;
 }
 
 int32_t llama_model_meta_val_str(const struct llama_model * model, const char * key, char * buf, size_t buf_size) {
@@ -11272,7 +11476,7 @@ static bool llama_control_vector_init(struct llama_control_vector & cvec, const 
     // split mode graph: one more copy of every layer on each device, so apply_to can
     // steer a device's partial before the reduce (see llama_control_vector::apply_to_reduce)
     std::vector<ggml_backend_buffer_type_t> dev_buft;
-    if ((model.split_mode == LLAMA_SPLIT_MODE_GRAPH || model.split_mode == LLAMA_SPLIT_MODE_ATTN) && model.splits.size() > 1) {
+    if (model.split_mode == LLAMA_SPLIT_MODE_GRAPH && model.splits.size() > 1) {
         for (size_t id = 0; id < model.splits.size(); ++id) {
             dev_buft.push_back(llama_default_buffer_type_offload(model, model.devices[id]));
         }
@@ -11500,6 +11704,16 @@ static bool spec_ckpt_try_per_step(llama_kv_cache & kv, const llama_model & mode
         return false;
     }
 
+    // The standard Mamba-2 layout (Nemotron-H) keeps the rolling conv window in the k-side cache,
+    // not packed in front of the SSM state in s_l, which is the layout the per-step snapshots
+    // assume: restoring one would write the conv block into the front of the SSM state and leave
+    // the window itself untouched. Decline so the chain falls through to a state path that
+    // handles the two caches separately.
+    if (!model.hparams.use_qnext_state_layout && model.hparams.n_embd_k_s() > 0) {
+        kv.save_per_step_ssm = false;
+        return false;
+    }
+
 
     // Split recurrent tensors are supported as long as each layer exposes
     // concrete backend buffers for the per-step tensors. CPU-only and mixed
@@ -11539,6 +11753,7 @@ static bool spec_ckpt_try_per_step(llama_kv_cache & kv, const llama_model & mode
 
 static size_t llama_spec_ckpt_cpu_state_reserve(llama_context * ctx, llama_seq_id seq_id) {
     const auto & kv_self = ctx->kv_self;
+    const auto & hparams = ctx->model.hparams;
 
     if (ctx->model.arch == LLM_ARCH_OPENPANGU) {
         return llama_state_seq_get_size(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -11566,6 +11781,18 @@ static size_t llama_spec_ckpt_cpu_state_reserve(llama_context * ctx, llama_seq_i
 
     const uint32_t qnext_state = llama_kv_has_qnext_state_storage(kv_self) ? 1 : 0;
     size += sizeof(qnext_state);
+    if (qnext_state != 0) {
+        // standard Mamba-2 layers serialise their rolling conv state (k_l) as one more block
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            const bool has_conv = il < kv_self.k_l.size() && kv_self.k_l[il] != nullptr &&
+                il < hparams.n_layer && hparams.is_recurrent(il) &&
+                !hparams.use_qnext_state_layout && hparams.n_embd_k_s() > 0;
+            size += sizeof(int32_t) + sizeof(uint64_t) + sizeof(uint32_t);
+            if (has_conv) {
+                size += ggml_nbytes(kv_self.k_l[il]);
+            }
+        }
+    }
 
     if (qnext_state != 0) {
         for (uint32_t il = 0; il < n_layer; ++il) {
@@ -11638,6 +11865,8 @@ int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, 
             : spec_ckpt_try_per_step(kv, ctx->model, ckpt_type, max_tokens);
     };
     const auto prepare_gpu_fallback = [&]() {
+        // the standard Mamba-2 layout keeps the conv window in k_l; checkpoint_alloc_shadows
+        // mirrors that row too when conv_state_position_strict is set
         return is_dsv4
             ? llama_dsv4_spec_ckpt_prepare(ctx, ckpt_type, LLAMA_SPEC_CKPT_GPU_FALLBACK, max_tokens)
             : kv.checkpoint_alloc_shadows(ckpt_type);
@@ -11666,8 +11895,12 @@ int llama_spec_ckpt_init(struct llama_context * ctx, llama_ckpt_data ckpt_type, 
         if (prepare_gpu_fallback()) {
             resolved = LLAMA_SPEC_CKPT_GPU_FALLBACK;
         } else if (mode == LLAMA_SPEC_CKPT_GPU_FALLBACK) {
-            LLAMA_LOG_ERROR("%s: failed to preallocate gpu-fallback checkpoint shadows at startup; --spec-ckpt-mode=%s requires startup allocation\n",
-                    __func__, llama_spec_ckpt_mode_name(mode));
+            if (ckpt_type.type == LLAMA_CHECKPOINT_REWIND) {
+                LLAMA_LOG_ERROR("%s: request-time ban rewind checkpoint allocation failed\n", __func__);
+            } else {
+                LLAMA_LOG_ERROR("%s: failed to preallocate gpu-fallback checkpoint shadows at startup; --spec-ckpt-mode=%s requires startup allocation\n",
+                        __func__, llama_spec_ckpt_mode_name(mode));
+            }
             return (int)LLAMA_SPEC_CKPT_NONE;
         } else {
             LLAMA_LOG_WARN("%s: auto checkpoint mode could not preallocate gpu-fallback checkpoint shadows; falling back to cpu\n",
@@ -11739,6 +11972,9 @@ bool llama_rewind_ckpt_save(struct llama_context * ctx, llama_ckpt_data ckpt_typ
     auto success = llama_spec_ckpt_save(ctx, ckpt_type, seq_id);
     if (!success) {
         llama_spec_ckpt_discard(ctx, ckpt_type);
+        if (ckpt_type.type == LLAMA_CHECKPOINT_REWIND) {
+            ctx->kv_self.ckpt_rewind_map.erase(ckpt_type.pos1);
+        }
     }
     return success;
 }
@@ -11779,6 +12015,13 @@ llama_pos llama_rewind_ckpt_pos(struct llama_context * ctx, llama_ckpt_data ckpt
         if (it->first > ckpt_type.pos1) {
             break;
         } else {
+            if (llm_arch_is_dsv4(ctx->model.arch)) {
+                const auto & ckpt = *it->second;
+                if (!ckpt.dsv4_shadow_saved && !ckpt.dsv4_per_step_saved && ckpt.dsv4_state_data.empty()) {
+                    ++it;
+                    continue;
+                }
+            }
             pos = it->first;
             ++it;
         }
@@ -11804,7 +12047,9 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
             }
             const llama_pos accepted_pos = n_past + accepted_step;
-            if (seq_id >= 0 && (uint32_t)seq_id < kv.size) {
+            // only a recurrent cache keeps a sequence's state in cells[seq_id]; in a hybrid cache that
+            // cell is an attention cell of some other position
+            if (kv.recurrent && seq_id >= 0 && (uint32_t)seq_id < kv.size) {
                 kv.cells[seq_id].pos = accepted_pos;
             }
             llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
@@ -12200,7 +12445,11 @@ struct llama_data_write {
             // a compacted layer holds the only copy of its window, so partial state has to carry it.
             // the openPangu layout is excluded: it records no live_swa(), and seq_rm can move head_swa
             // between save and restore, so writer and reader would disagree on the row count.
-            const bool has_k_cache = kv_self.k_l[il] != nullptr && (need_kv || (!openpangu_partial && kv_self.is_compacted((int) il)));
+            // a recurrent layer of the standard Mamba-2 layout keeps its rolling conv window in
+            // k_l, so that slot is not a K cache; tie this to the layout, not to the arch
+            const bool has_k_cache = kv_self.k_l[il] != nullptr &&
+                !(hparams.is_recurrent((uint32_t) il) && !hparams.use_qnext_state_layout && hparams.n_embd_k_s() > 0) &&
+                (need_kv || (!openpangu_partial && kv_self.is_compacted((int) il)));
 
             // Write key type
             const int32_t k_type_i = has_k_cache ? (int32_t) kv_self.k_l[il]->type : -1;
@@ -12352,6 +12601,42 @@ struct llama_data_write {
 
                 if (has_s_cache && s_rows > 0) {
                     write_tensor_data(kv_self.s_l[il], s_offset, s_rows * s_size_row, il);
+                }
+            }
+        }
+
+        // standard-layout recurrent layers (Nemotron-H): the rolling conv state lives in k_l
+        if (qnext_state != 0) {
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                const bool has_conv_cache = il < kv_self.k_l.size() && kv_self.k_l[il] != nullptr &&
+                    il < (uint32_t) hparams.n_layer && hparams.is_recurrent(il) &&
+                    !hparams.use_qnext_state_layout && hparams.n_embd_k_s() > 0;
+
+                const int32_t c_type_i = has_conv_cache ? (int32_t) kv_self.k_l[il]->type : -1;
+                write(&c_type_i, sizeof(c_type_i));
+
+                const uint64_t c_size_row = has_conv_cache ? ggml_row_size(kv_self.k_l[il]->type, kv_self.k_l[il]->ne[0]) : 0;
+                write(&c_size_row, sizeof(c_size_row));
+
+                uint32_t c_rows = 0;
+                size_t c_offset = 0;
+                if (has_conv_cache) {
+                    const uint32_t n_slots = (uint32_t) kv_self.k_l[il]->ne[1];
+                    if (seq_id == -1) {
+                        c_rows = n_slots;
+                    } else if (llama_kv_qnext_seq_id_in_range(kv_self, seq_id) && (uint32_t) seq_id < kv_self.size) {
+                        llama_seq_id src_seq_id = kv_self.cells[seq_id].src;
+                        if (llama_kv_qnext_seq_id_in_range(kv_self, src_seq_id)) {
+                            c_rows = 1;
+                            c_offset = (size_t) src_seq_id * c_size_row;
+                        }
+                    }
+                }
+
+                write(&c_rows, sizeof(c_rows));
+
+                if (has_conv_cache && c_rows > 0) {
+                    write_tensor_data(kv_self.k_l[il], c_offset, c_rows * c_size_row, il);
                 }
             }
         }
@@ -13008,7 +13293,11 @@ struct llama_data_read {
             const uint32_t n_embd_k_gqa = llama_kv_k_row_embd(ctx->model, hparams, il);
             const uint32_t n_embd_head_qk_rope = hparams.n_rot;
             const uint32_t kv_lora_rank = hparams.n_lora_kv;
-            const bool has_k_cache = kv_self.k_l[il] != nullptr && (need_kv || (!openpangu_partial && kv_self.is_compacted((int) il)));
+            // a recurrent layer of the standard Mamba-2 layout keeps its rolling conv window in
+            // k_l, so that slot is not a K cache; tie this to the layout, not to the arch
+            const bool has_k_cache = kv_self.k_l[il] != nullptr &&
+                !(hparams.is_recurrent((uint32_t) il) && !hparams.use_qnext_state_layout && hparams.n_embd_k_s() > 0) &&
+                (need_kv || (!openpangu_partial && kv_self.is_compacted((int) il)));
 
 
             // Read type of key
@@ -13250,6 +13539,66 @@ struct llama_data_read {
                     } else {
                         ggml_backend_tensor_set(kv_self.s_l[il], read(s_data_size), s_dst_offset, s_data_size);
                     }
+                }
+            }
+        }
+
+        // standard-layout recurrent layers (Nemotron-H): the rolling conv state lives in k_l
+        if (qnext_state_ref != 0) {
+            for (uint32_t il = 0; il < n_layer; ++il) {
+                const bool has_conv_cache = il < kv_self.k_l.size() && kv_self.k_l[il] != nullptr &&
+                    il < (uint32_t) hparams.n_layer && hparams.is_recurrent(il) &&
+                    !hparams.use_qnext_state_layout && hparams.n_embd_k_s() > 0;
+
+                int32_t c_type_i_ref = 0;
+                read_to(&c_type_i_ref, sizeof(c_type_i_ref));
+                if (!has_conv_cache) {
+                    if (c_type_i_ref != -1) {
+                        LLAMA_LOG_ERROR("%s: missing conv state cache for layer %d\n", __func__, il);
+                        return false;
+                    }
+                } else {
+                    const int32_t c_type_i = (int32_t) kv_self.k_l[il]->type;
+                    if (c_type_i != c_type_i_ref) {
+                        LLAMA_LOG_ERROR("%s: mismatched conv state type (%d != %d, layer %d)\n", __func__, c_type_i, c_type_i_ref, il);
+                        return false;
+                    }
+                }
+
+                uint64_t c_size_row_ref = 0;
+                read_to(&c_size_row_ref, sizeof(c_size_row_ref));
+
+                const uint64_t c_size_row = has_conv_cache ? ggml_row_size(kv_self.k_l[il]->type, kv_self.k_l[il]->ne[0]) : 0;
+                if (c_size_row != c_size_row_ref) {
+                    LLAMA_LOG_ERROR("%s: mismatched conv state row size (%zu != %zu, layer %d)\n",
+                            __func__, (size_t) c_size_row, (size_t) c_size_row_ref, il);
+                    return false;
+                }
+
+                uint32_t c_rows_ref = 0;
+                read_to(&c_rows_ref, sizeof(c_rows_ref));
+
+                uint32_t c_rows = 0;
+                uint32_t c_dst_row = 0;
+                if (has_conv_cache) {
+                    const uint32_t n_slots = (uint32_t) kv_self.k_l[il]->ne[1];
+                    if (seq_id == -1) {
+                        c_rows = n_slots;
+                    } else if (llama_kv_qnext_seq_id_in_range(kv_self, seq_id)) {
+                        c_rows = 1;
+                        c_dst_row = (uint32_t) seq_id;
+                    }
+                }
+
+                if (c_rows_ref != c_rows) {
+                    LLAMA_LOG_ERROR("%s: mismatched conv state row count (%u != %u, layer %d)\n", __func__, c_rows, c_rows_ref, il);
+                    return false;
+                }
+
+                if (c_rows > 0) {
+                    const size_t c_data_size = c_rows * c_size_row;
+                    const size_t c_dst_offset = (size_t) c_dst_row * c_size_row;
+                    ggml_backend_tensor_set(kv_self.k_l[il], read(c_data_size), c_dst_offset, c_data_size);
                 }
             }
         }
@@ -14157,6 +14506,10 @@ void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn) {
     ctx->cparams.causal_attn = causal_attn;
 }
 
+void llama_set_warmup(struct llama_context * ctx, bool warmup) {
+    ctx->cparams.warmup = warmup;
+}
+
 struct llama_batch llama_batch_get_one(
              llama_token * tokens,
                  int32_t   n_tokens,
@@ -14268,6 +14621,12 @@ void llama_moe_resident_begin_generation(struct llama_context * ctx) {
 
 void llama_synchronize(struct llama_context * ctx) {
     ggml_backend_sched_synchronize(ctx->sched);
+
+    const bool periodic_tg_sync_eligible = ctx->n_queued_tokens == 1 &&
+            !ctx->cparams.warmup && ctx->moe_cache != nullptr;
+    if (ctx->periodic_tg_completion.consume(periodic_tg_sync_eligible)) {
+        ctx->moe_cache->periodic_tg_token_complete();
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats

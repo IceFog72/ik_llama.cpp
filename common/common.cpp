@@ -2162,6 +2162,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cont_batching = false;
         return true;
     }
+    if (arg == "--fp8-precision") {
+        CHECK_ARG
+        const std::string value = argv[i];
+        if (value == "auto") params.fp8_precision = LLAMA_FP8_PRECISION_AUTO;
+        else if (value == "w8a16") params.fp8_precision = LLAMA_FP8_PRECISION_W8A16;
+        else if (value == "w8a8") params.fp8_precision = LLAMA_FP8_PRECISION_W8A8;
+        else invalid_param = true;
+        return true;
+    }
     if (arg == "--nvfp4-precision") {
         CHECK_ARG
         const std::string value = argv[i];
@@ -2210,6 +2219,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "--swa-compress") {
         params.swa_compress = true;
+        return true;
+    }
+    if (arg == "-feod" || arg == "--force-expert-offload-device") {
+        params.feod = true;
         return true;
     }
     if (arg == "--dsv41-replay-keep") {
@@ -2407,7 +2420,7 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         }
         else if (arg_next == "attn") {
-            params.split_mode = LLAMA_SPLIT_MODE_ATTN;
+            LLAMA_LOG_WARN("XXXXXXXXXXXXXXXXXXXXXXXXXXXX Split mode 'attn' has been deprecated\n");
         }
         else if (arg_next == "graph") {
             params.split_mode = LLAMA_SPLIT_MODE_GRAPH;
@@ -2555,6 +2568,19 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
             fprintf(stderr, "error: Invalid value for --moe-cache-policy: %s (expected lru or classlru)\n", argv[i]);
             invalid_param = true;
         }
+        return true;
+    }
+    if (arg == "--moe-cache-cpu-share") {
+        CHECK_ARG
+        const char * value = argv[i];
+        char * end = nullptr;
+        const double share = std::strtod(value, &end);
+        if (end == value || *end != '\0' || !std::isfinite(share) || share < 0.0 || share > 1.0) {
+            fprintf(stderr, "error: Invalid value for --moe-cache-cpu-share: %s (expected finite value in [0,1])\n", value);
+            invalid_param = true;
+            return true;
+        }
+        params.moe_cache_cpu_share = share;
         return true;
     }
     if (arg == "--fit") {
@@ -3511,6 +3537,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ub,   --ubatch-size N",        "physical maximum batch size (default: %d)", params.n_ubatch });
     options.push_back({ "*",           "       --keep N",               "number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep });
     options.push_back({ "*",           "       --chunks N",             "max number of chunks to process (default: %d, -1 = all)", params.n_chunks });
+    options.push_back({ "*", "--fp8-precision (auto|w8a16|w8a8)", "FP8 prefill precision (default: auto = w8a8 if the file declares 8-bit activations or has FP8 input scales, else w8a16). w8a8: dynamic E4M3 activations on CUDA Ada and Blackwell, lower accuracy." });
     options.push_back({ "*", "--nvfp4-precision (auto|w4a4|int8)", "NVFP4 matmul precision on Blackwell (default: auto). w4a4: 4-bit activations, fastest, lower accuracy. int8: 8-bit activations, more accurate. auto: w4a4 when the model has input scales, unless it is marked W4A16 or has imatrix data; older ggml-org/llama.cpp W4A16 conversions may need int8." });
     options.push_back({ "*",           "-no-fa, --no-flash-attn",       "disable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fa, --flash-attn (auto|on|off|0|1)", "set Flash Attention (default: %s)", params.flash_attn ? "on" : "off" });
@@ -3519,6 +3546,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "-no-fidx, --no-fused-indexer-topk", "disable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --swa-compress",         "allocate sliding-window layers at window size instead of n_ctx (default: %s)", params.swa_compress ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-feod, --force-expert-offload-device", "force offload of experts left in RAM to the default layer device (default: %s)", params.feod ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --dsv41-replay-keep N", "DeepSeek-V4.1 prefill: run the decoder layers on the last N prompt tokens only; requires --swa-compress (default: %d, 0 = off)", params.dsv41_replay_keep });
     options.push_back({ "*",           "-dsv4ls, --dsv4-legacy-state",   "write DeepSeek-V4 state in the legacy full-slice layout, byte-identical to main (default: %d)", params.dsv4_legacy_state });
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
@@ -3755,6 +3783,7 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ncmoe, --n-cpu-moe N",          "keep MoE weights of the first N layers in CPU memory"});
     options.push_back({ "*",           "       --moe-cache-mib N",       "Total GPU cache budget in MiB for CPU-resident MoE experts, split across GPUs (default: 0, disabled)"});
     options.push_back({ "*",           "       --moe-cache-policy NAME", "MoE cache replacement policy: lru (default) or classlru"});
+    options.push_back({ "*",           "       --moe-cache-cpu-share N", "fixed fraction of unique MoE cache misses assigned to CPU (default: 0, range: 0..1)"});
     options.push_back({ "*",           "-thp,   --transparent-huge-pages", "use transparent huge pages on Linux"});
     options.push_back({ "*",           "-dexp,  --defer-experts",        "defer expert mmap residency on Linux to reduce model load time"});
     options.push_back({ "*",           "-dple,  --defer-ple",            "keep sparse tables (PLE, engram) on the file instead of resident in memory (Linux, Windows)"});
@@ -4562,6 +4591,12 @@ static void llama_init_sampler_from_model(const llama_model * model, common_para
     get_float("general.sampling.mirostat_eta",     sparams.mirostat_eta,    COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+void fp8_auto_warning(const llama_model * model, llama_fp8_precision precision) {
+    if (precision == LLAMA_FP8_PRECISION_AUTO && llama_model_fp8_w8a8(model)) {
+        fprintf(stderr, "warning: --fp8-precision auto: this file declares 8-bit activations or has FP8 input scales, so its FP8 tensors use W8A8 where a fast path exists. Use --fp8-precision w8a16 for exact-mode results\n");
+    }
+}
+
 struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     llama_init_result iparams;
 
@@ -4668,6 +4703,8 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
     if (params.warmup) {
         LOG("warming up the model with an empty run\n");
 
+        llama_set_warmup(lctx, true);
+
         std::vector<llama_token> tmp;
         llama_token bos = llama_token_bos(model);
         llama_token eos = llama_token_eos(model);
@@ -4692,6 +4729,7 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
         llama_kv_cache_clear(lctx);
         llama_synchronize(lctx);
         llama_reset_timings(lctx);
+        llama_set_warmup(lctx, false);
     }
 
     iparams.model   = model;
@@ -4753,7 +4791,7 @@ static uint32_t moe_resident_ubatch_effective(const gpt_params & params) {
     if (params.moe_resident_ubatch_explicit) return params.moe_resident_ubatch;
     const int n_batch = params.n_ctx > 0 ? std::min(params.n_batch, params.n_ctx) : params.n_batch;
     if (params.moe_resident != -1 || params.n_ubatch_explicit || params.n_parallel != 1 || params.cb_eval ||
-            params.split_mode == LLAMA_SPLIT_MODE_GRAPH || params.split_mode == LLAMA_SPLIT_MODE_ATTN ||
+            params.split_mode == LLAMA_SPLIT_MODE_GRAPH ||
             n_batch < 512 || !llama_supports_gpu_offload()) {
         return 0;
     }
@@ -4830,6 +4868,7 @@ struct llama_model_params common_model_params_to_llama(const gpt_params & params
     mparams.mtp             = params.has_mtp || params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP);
     mparams.dsa             = params.dsa;
     mparams.nvfp4_precision = params.nvfp4_precision;
+    mparams.fp8_precision = params.fp8_precision;
     mparams.flash_attn      = params.flash_attn;
     mparams.defer_experts   = params.defer_experts;
     mparams.defer_ple       = params.defer_ple;
@@ -4894,6 +4933,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.n_ctx             = params.n_ctx;
     cparams.moe_cache_size    = params.moe_cache_size;
     cparams.moe_cache_policy  = params.moe_cache_policy;
+    cparams.moe_cache_cpu_share = (float) params.moe_cache_cpu_share;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_batch           = n_batch;
     cparams.n_ubatch          = n_ubatch;
@@ -4931,6 +4971,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.dsa               = params.dsa;
     cparams.fused_idx_topk    = params.fused_idx_topk;
     cparams.swa_compress      = params.swa_compress;
+    cparams.force_experts_offload_device = params.feod;
     cparams.dsv41_replay_keep = params.dsv41_replay_keep;
     cparams.dsv4_legacy_state = params.dsv4_legacy_state;
     cparams.dsa_top_k         = params.dsa_top_k;

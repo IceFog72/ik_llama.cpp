@@ -68,6 +68,13 @@ static __global__ void mmq_ids_helper(
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+// The fork's mmq_ids_helper uses no shared memory, so batch size does not limit it.
+bool ggml_cuda_can_compute_row_ids(int device, int n_tokens) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(n_tokens);
+    return true;
+}
+
 template <int n_expert_used_template>
 static void launch_mmq_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
@@ -269,6 +276,10 @@ void compute_row_ids(const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst,
             break;
         case  8:
             launch_mmq_ids_helper< 8> (ids, ids_src1, ids_dst, expert_bounds,
+                    ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
+            break;
+        case 10:
+            launch_mmq_ids_helper<10> (ids, ids_src1, ids_dst, expert_bounds,
                     ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
             break;
         case 16:

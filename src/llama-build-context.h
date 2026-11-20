@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <tuple>
+#include <vector>
 
 struct llama_model;
 struct llama_context;
@@ -15,6 +16,26 @@ struct llama_kv_cache;
 
 struct ggml_cgraph;
 struct ggml_tensor;
+
+namespace llm_moe_cache_detail {
+inline bool mark_share_lookup_boundary(ggml_tensor * lookup) {
+    if (!lookup || lookup->op != GGML_OP_GET_ROWS) return false;
+    lookup->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = 0xff;
+    return true;
+}
+
+inline bool share_ops_eligible(ggml_backend_t gpu_backend, ggml_backend_t cpu_backend,
+        const std::vector<ggml_tensor *> & host_ops, const std::vector<ggml_tensor *> & cached_ops) {
+    if (!gpu_backend || !cpu_backend) return false;
+    for (const ggml_tensor * op : host_ops) {
+        if (!op || !ggml_backend_supports_op(cpu_backend, op) || ggml_backend_offload_op(gpu_backend, op)) return false;
+    }
+    for (const ggml_tensor * op : cached_ops) {
+        if (!op || !ggml_backend_supports_op(gpu_backend, op)) return false;
+    }
+    return !host_ops.empty() && !cached_ops.empty();
+}
+}
 
 using llm_build_cb = std::function<void(struct ggml_tensor * cur, const char * name, int nl)>;
 
@@ -323,6 +344,10 @@ struct llm_build_context {
 
     ggml_cgraph * build_mamba();
 
+    ggml_cgraph * build_nemotron_h();
+
+    ggml_tensor * build_nemotron_mamba2(ggml_cgraph * gf, ggml_tensor * cur, ggml_tensor * ssm_ids, int il);
+
     ggml_cgraph * build_command_r();
 
     ggml_cgraph * build_olmo();
@@ -393,6 +418,14 @@ struct llm_build_context {
         int64_t n_stream,
         float norm_rms_eps,
         bool force_contiguous);
+
+    // Per-layer (PLE) input projection, shared with Gemma4. eps_scale scales the RMS eps.
+    ggml_tensor * build_per_layer_inputs(
+        ggml_tensor * inputs_embeds,
+        ggml_tensor * inp_per_layer,
+        int64_t n_embd_per_layer,
+        int64_t n_layer,
+        float eps_scale);
 
     ggml_tensor * build_deepseek2_tp_attention(
             ggml_cgraph * gf, int il,
@@ -469,6 +502,8 @@ struct llm_build_context {
     ggml_cgraph * build_bailingmoe3();
     ggml_cgraph * build_glm5next();
     ggml_cgraph * build_raon1();
+    ggml_cgraph * build_raon1nano();
+    ggml_cgraph * build_raon1nano_mtp();
     ggml_cgraph * build_xing4();
 
     ggml_cgraph * build_glm5next_mtp();
@@ -487,6 +522,8 @@ struct llm_build_context {
     ggml_cgraph * build_seedoss();
 
     ggml_cgraph * build_laguna();
+
+    ggml_cgraph * build_step5();
 
     ggml_cgraph * build_step35();
 

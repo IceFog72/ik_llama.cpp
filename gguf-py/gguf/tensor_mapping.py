@@ -115,6 +115,8 @@ class TensorNameMap:
     }
 
     block_mappings_cfg: dict[MODEL_TENSOR, tuple[str, ...]] = {
+        MODEL_TENSOR.SSM_ALPHA: ('model.layers.{bid}.linear_attn.in_proj_a', 'layers.{bid}.linear_attn.in_proj_a'),
+
         # Attention norm
         MODEL_TENSOR.ATTN_NORM: (
             "gpt_neox.layers.{bid}.input_layernorm",                # gptneox
@@ -165,6 +167,8 @@ class TensorNameMap:
             "transformer.layers.{bid}.attn.qkv_proj",                              # openelm
             "layers.{bid}.attention.wqkv",
             "model.layers.{bid}.self_attn.q_k_v_proj",                             # spark2_5
+            'model.layers.{bid}.linear_attn.in_proj_qkv',
+            'layers.{bid}.linear_attn.in_proj_qkv',
         ),
 
         # Attention query
@@ -246,6 +250,8 @@ class TensorNameMap:
         MODEL_TENSOR.ATTN_GATE: (
             "model.layers.{bid}.self_attn.gate_proj",     # lfm3
             "model.layers.{bid}.self_attn.g_proj",              # laguna
+            'model.layers.{bid}.linear_attn.in_proj_z',
+            'layers.{bid}.linear_attn.in_proj_z',
         ),
 
         # Rotary embeddings
@@ -315,6 +321,7 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.gate.e_score_correction",           # deepseek-v3 dots1
             "model.layers.{bid}.mlp.moe_statics.e_score_correction",    # ernie4.5-moe
             "model.layers.{bid}.mlp.gate.expert_bias",                  # bailingmoe2
+            "model.layers.{bid}.mlp.expert_bias",                       # hy_v3
             "model.layers.{bid}.block_sparse_moe.e_score_correction",   # minimax-m2
             "model.layers.{bid}.mlp.experts.e_score_correction_bias",   # laguna
             "model.layers.{bid}.mlp.experts.e_score_correction",        # laguna
@@ -367,6 +374,7 @@ class TensorNameMap:
             "model.layers.{bid}.block_sparse_moe.shared_experts.up_proj",
             "model.layers.{bid}.mlp.shared_expert.up_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.up_proj", # deepseek2
+            "model.layers.{bid}.mlp.shared_mlp.up_proj",     # hy_v3
         ),
 
         # AWQ-activation gate
@@ -400,6 +408,7 @@ class TensorNameMap:
             "model.layers.{bid}.block_sparse_moe.shared_experts.gate_proj",
             "model.layers.{bid}.mlp.shared_expert.gate_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.gate_proj", # deepseek2
+            "model.layers.{bid}.mlp.shared_mlp.gate_proj",     # hy_v3
         ),
 
         # Feed-forward down
@@ -442,6 +451,7 @@ class TensorNameMap:
             "model.layers.{bid}.block_sparse_moe.shared_experts.down_proj",
             "model.layers.{bid}.mlp.shared_expert.down_proj",  # qwen2moe
             "model.layers.{bid}.mlp.shared_experts.down_proj", # deepseek2
+            "model.layers.{bid}.mlp.shared_mlp.down_proj",     # hy_v3
         ),
 
         MODEL_TENSOR.ATTN_Q_NORM: (
@@ -545,6 +555,8 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_CONV1D: (
             "model.layers.{bid}.conv1d",
             "backbone.layers.{bid}.mixer.conv1d",
+            'model.layers.{bid}.linear_attn.conv1d',
+            'layers.{bid}.linear_attn.conv1d',
         ),
 
         # Raon-1 / Kimi Linear short convolutions and RDA projections
@@ -571,6 +583,8 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_BETA: (
             "model.layers.{bid}.self_attn.b_proj",
             "model.layers.{bid}.attention.b_proj",
+            'model.layers.{bid}.linear_attn.in_proj_b',
+            'layers.{bid}.linear_attn.in_proj_b',
         ),
         MODEL_TENSOR.SSM_RDA: (
             "model.layers.{bid}.self_attn.rda_w_proj",
@@ -579,6 +593,8 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_NORM: (
             "model.layers.{bid}.self_attn.o_norm",
             "model.layers.{bid}.attention.o_norm",
+            'model.layers.{bid}.linear_attn.norm',
+            'layers.{bid}.linear_attn.norm',
         ),
 
         MODEL_TENSOR.SSM_X: (
@@ -591,6 +607,8 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.dt_proj",
             "model.layers.{bid}.self_attn.dt_proj",
             "model.layers.{bid}.attention.dt_proj",
+            'model.layers.{bid}.linear_attn.dt_proj',
+            'layers.{bid}.linear_attn.dt_proj',
         ),
 
         MODEL_TENSOR.SSM_A: (
@@ -598,6 +616,8 @@ class TensorNameMap:
             "backbone.layers.{bid}.mixer.A_log",
             "model.layers.{bid}.self_attn.A_log",
             "model.layers.{bid}.attention.A_log",
+            'model.layers.{bid}.linear_attn.A_log',
+            'layers.{bid}.linear_attn.A_log',
         ),
 
         MODEL_TENSOR.SSM_D: (
@@ -608,6 +628,8 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_OUT: (
             "model.layers.{bid}.out_proj",
             "backbone.layers.{bid}.mixer.out_proj",
+            'model.layers.{bid}.linear_attn.out_proj',
+            'layers.{bid}.linear_attn.out_proj',
         ),
 
         MODEL_TENSOR.ATTN_Q_A: (
@@ -828,6 +850,31 @@ class TensorNameMap:
 
     # architecture-specific block mappings
     arch_block_mappings_cfg: dict[MODEL_ARCH, dict[MODEL_TENSOR, tuple[str, ...]]] = {
+        MODEL_ARCH.QWEN4EXP: {
+            MODEL_TENSOR.HC_ATTN_NORM: ('model.layers.{bid}.attn_hyper_connection.hc_norm',),
+            MODEL_TENSOR.HC_ATTN_DOWN: ('model.layers.{bid}.attn_hyper_connection.input_mix_weight_down',),
+            MODEL_TENSOR.HC_ATTN_UP: ('model.layers.{bid}.attn_hyper_connection.input_mix_weight_up',),
+            MODEL_TENSOR.HC_ATTN_INJECT: ('model.layers.{bid}.attn_hyper_connection.block_inject_weight',),
+            MODEL_TENSOR.HC_FFN_NORM: ('model.layers.{bid}.mlp_hyper_connection.hc_norm',),
+            MODEL_TENSOR.HC_FFN_DOWN: ('model.layers.{bid}.mlp_hyper_connection.input_mix_weight_down',),
+            MODEL_TENSOR.HC_FFN_UP: ('model.layers.{bid}.mlp_hyper_connection.input_mix_weight_up',),
+            MODEL_TENSOR.HC_FFN_INJECT: ('model.layers.{bid}.mlp_hyper_connection.block_inject_weight',),
+            MODEL_TENSOR.HC_HEAD_NORM: ('model.hyper_connection_mixer.hc_norm',),
+            MODEL_TENSOR.HC_HEAD_DOWN: ('model.hyper_connection_mixer.input_mix_weight_down',),
+            MODEL_TENSOR.HC_HEAD_UP: ('model.hyper_connection_mixer.input_mix_weight_up',),
+            MODEL_TENSOR.NEXTN_HC_HEAD_NORM: ('model.layers.{bid}.nextn_hc_head.hc_norm',),
+            MODEL_TENSOR.NEXTN_HC_HEAD_DOWN: ('model.layers.{bid}.nextn_hc_head.input_mix_weight_down',),
+            MODEL_TENSOR.NEXTN_HC_HEAD_UP: ('model.layers.{bid}.nextn_hc_head.input_mix_weight_up',),
+            MODEL_TENSOR.INDEXER_Q_NORM: ('model.layers.{bid}.self_attn.indexer.q_layernorm',),
+            MODEL_TENSOR.INDEX_K_NORM: ('model.layers.{bid}.self_attn.indexer.k_layernorm',),
+            MODEL_TENSOR.PLE_KEY: ('model.layers.{bid}.ple.key_proj',),
+            MODEL_TENSOR.PLE_VALUE: ('model.layers.{bid}.ple.value_proj',),
+            MODEL_TENSOR.PLE_NORM_KEY: ('model.layers.{bid}.ple.norm_key',),
+            MODEL_TENSOR.PLE_NORM_QUERY: ('model.layers.{bid}.ple.norm_query',),
+            MODEL_TENSOR.PLE_NORM_CONV: ('model.layers.{bid}.ple.norm_conv',),
+            MODEL_TENSOR.PLE_CONV1D: ('model.layers.{bid}.ple.conv1d',),
+        },
+
         MODEL_ARCH.ARCTIC: {
             MODEL_TENSOR.FFN_NORM: (
                 "model.layers.{bid}.residual_layernorm",

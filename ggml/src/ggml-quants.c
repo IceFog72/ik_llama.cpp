@@ -4231,9 +4231,7 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
 void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q4_0, vx, bx, GGML_TYPE_Q8_0, vy, by, s, bs, 0, 1)) {
-        return;
-    }
+    GGML_ABORT("fatal error");
 #endif
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -4718,9 +4716,7 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
 void ggml_vec_dot_q4_1_q8_1(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q4_1, vx, bx, GGML_TYPE_Q8_1, vy, by, s, bs, 0, 1)) {
-        return;
-    }
+    GGML_ABORT("fatal error");
 #endif
     const int qk = QK8_1;
     const int nb = n / qk;
@@ -5010,14 +5006,7 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 
 void ggml_vec_dot_q5_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
-#ifdef __AVX2__
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_1;
-#else
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_0;
-#endif
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q5_0, vx, bx, vec_dot_type, vy, by, s, bs, 0, 1)) {
-        return;
-    }
+    GGML_ABORT("fatal error");
 #endif
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -5375,9 +5364,7 @@ void ggml_vec_dot_q5_0_q8_0(int n, float * restrict s, size_t bs, const void * r
 
 void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q5_1, vx, bx, GGML_TYPE_Q8_1, vy, by, s, bs, 0, 1)) {
-        return;
-    }
+    GGML_ABORT("fatal error");
 #endif
     const int qk = QK8_1;
     const int nb = n / qk;
@@ -5754,25 +5741,22 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * restrict s, size_t bs, const void * r
 
 void ggml_vec_dot_q6_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
-#ifdef __AVX2__
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_1;
-#else
-    const enum ggml_type vec_dot_type = GGML_TYPE_Q8_0;
+    GGML_ABORT("fatal error");
 #endif
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q6_0, vx, bx, vec_dot_type, vy, by, s, bs, 0, 1)) {
-        return;
-    }
-#endif
+    UNUSED(n);
+    UNUSED(bs);
+    UNUSED(vx);
+    UNUSED(bx);
+    UNUSED(vy);
+    UNUSED(by);
+    UNUSED(nrc);
     // TODO
     *s = 0;
 }
 
 void ggml_vec_dot_q8_0_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
-    enum ggml_type dot_type = GGML_TYPE_Q8_2_X4;
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_Q8_0, vx, bx, dot_type, vy, by, s, bs, 0, 1)) {
-        return;
-    }
+    GGML_ABORT("fatal error");
 #endif
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -12144,9 +12128,7 @@ void ggml_vec_dot_iq1_m_q8_K  (int n, float * restrict s, size_t bs, const void 
 
 void ggml_vec_dot_iq4_nl_q8_0(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
-    if (iqk_mul_mat(nrc, nrc, n, GGML_TYPE_IQ4_NL, vx, bx, GGML_TYPE_Q8_0, vy, by, s, bs, 0, 1)) {
-        return;
-    }
+    GGML_ABORT("fatal error");
 #endif
     assert(nrc == 1);
     UNUSED(nrc);
@@ -15932,6 +15914,25 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_MXFP4_R8: break;
         case GGML_TYPE_NVFP4: break;
         case GGML_TYPE_NVFP4_KS: break;
+        case GGML_TYPE_F8_E4M3_KS: break;
+        case GGML_TYPE_F8_E4M3_B128:
+            {
+                const uint8_t * q = (const uint8_t *) data;
+                for (size_t i = 0; i < nb; ++i) {
+                    float scale;
+                    memcpy(&scale, q, sizeof(scale));
+                    if (!validate_float(scale, i)) {
+                        return false;
+                    }
+                    for (int j = 0; j < 128; ++j) {
+                        if ((q[sizeof(scale) + j] & 0x7f) == 0x7f) {
+                            fprintf(stderr, "ggml_validate_row_data: found nan value at block %zu\n", i);
+                            return false;
+                        }
+                    }
+                    q += ggml_type_size(type);
+                }
+            } break;
         case GGML_TYPE_Q6_0: break;
         case GGML_TYPE_IQ2_K: break;
         case GGML_TYPE_IQ2_KS: break;

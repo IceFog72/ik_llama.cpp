@@ -235,9 +235,9 @@
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
 #ifndef GGML_MAX_CONTEXTS
-// Maximum number of model contexts (e.g., for model shards).
-// Increase this value using -DGGML_MAX_CONTEXTS=<value> in CMake
-// if you need to load more than 64 model shards.
+// Legacy build setting; this does not limit the number of live ggml_context objects.
+// The llama.cpp Windows model loader uses values above 512 to raise the stdio
+// limit when loading models split into many shards.
 #define GGML_MAX_CONTEXTS       64
 #endif
 #ifndef GGML_MAX_SRC
@@ -377,7 +377,9 @@ extern "C" {
     GGML_API void        ggml_fp32_to_fp16_row(const float *, ggml_fp16_t *, int64_t);
 
     // google brain half-precision bfloat16
+    typedef struct { uint8_t bits; } ggml_fp8_e4m3_t;
     typedef struct { uint16_t bits; } ggml_bf16_t;
+    GGML_API void ggml_fp8_e4m3_to_bf16_row(const ggml_fp8_e4m3_t *, ggml_bf16_t *, int64_t);
     GGML_API ggml_bf16_t ggml_fp32_to_bf16(float);
     GGML_API float       ggml_bf16_to_fp32(ggml_bf16_t);  // consider just doing << 16
     GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t);
@@ -428,6 +430,7 @@ extern "C" {
         GGML_TYPE_NVFP4     = 40,
         GGML_TYPE_Q1_0_G128 = 41,  // Bonsai 1-bit quants
         GGML_TYPE_Q2_0      = 42,  // same type id as mainline GGML_TYPE_Q2_0
+        GGML_TYPE_F8_E4M3   = 43,
         //
         //
         GGML_TYPE_Q8_0_X4 = 97,
@@ -472,6 +475,8 @@ extern "C" {
         GGML_TYPE_TQP6       = 166, // pair trellis K=6, group 128 (Agention; on-disk id 148, remapped at load)
         GGML_TYPE_TQP7       = 167, // pair trellis K=7, group 128 (Agention; on-disk id 149, remapped at load)
         GGML_TYPE_NVFP4_KS   = 168,
+        GGML_TYPE_F8_E4M3_KS = 169,
+        GGML_TYPE_F8_E4M3_B128 = 170,
 
         GGML_TYPE_Q4_0_R8    = 202,
         GGML_TYPE_Q5_0_R4    = 206,
@@ -563,8 +568,8 @@ extern "C" {
         GGML_FTYPE_MOSTLY_IQ4_K   = 132, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ5_K   = 133, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ6_K   = 134, // except 1d tensors
-        // depricated: GGML_FTYPE_MOSTLY_IQ2_TN  = 135, // except 1d tensors
-        // depricated: GGML_FTYPE_MOSTLY_IQ1_TN  = 136, // except 1d tensors
+        // deprecated: GGML_FTYPE_MOSTLY_IQ2_TN  = 135, // except 1d tensors
+        // deprecated: GGML_FTYPE_MOSTLY_IQ1_TN  = 136, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ4_KS  = 137, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ2_KS  = 138, // except 1d tensors
         GGML_FTYPE_MOSTLY_IQ4_KSS = 139, // except 1d tensors
@@ -798,6 +803,7 @@ extern "C" {
         GGML_TENSOR_FLAG_OUTPUT = 2,
         GGML_TENSOR_FLAG_PARAM  = 4,
         GGML_TENSOR_FLAG_LOSS   = 8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_CROSS_SPLIT = 16, // ...has a reader outside the graph that the backend receives
     };
 
     enum ggml_tri_type {
@@ -973,6 +979,7 @@ extern "C" {
 
     GGML_API void ggml_set_input_scale(struct ggml_tensor * tensor, float scale);
     GGML_API float ggml_get_input_scale(const struct ggml_tensor * tensor);
+    GGML_API bool  ggml_mxfp4_to_nvfp4_ks(const void * src, void * dst, int n_per_row);
 
     GGML_API GGML_CALL int64_t ggml_nelements   (const struct ggml_tensor * tensor);
     GGML_API GGML_CALL int64_t ggml_nrows       (const struct ggml_tensor * tensor);
@@ -2506,7 +2513,7 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 c);
 
-    // Overwrite values in a with c for the indeces stored in b
+    // Overwrite values in a with c for the indices stored in b
     GGML_API struct ggml_tensor * ggml_blend(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2657,6 +2664,12 @@ extern "C" {
            struct ggml_tensor  * d,
            bool                  masked);
 
+    // ssm_conv: two layouts, selected by the caller
+    //   legacy (Mamba-1 / GDN / LFM2 / OpenPangu): s = conv state {d_conv-1, d_inner, n_kv},
+    //       x = input {d_inner, n_tokens}, sq = per-token seq slots {n_kv, n_tokens}.
+    //   mamba-2 (Nemotron-H etc.): s = conv_x {d_conv-1 + n_t, d_inner, n_s}, x = NULL,
+    //       c = conv1d.weight, sq = NULL. Returns only the conv result; the caller slides
+    //       the state window in the graph (mirrors upstream llama.cpp).
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2674,6 +2687,31 @@ extern "C" {
             struct ggml_tensor  * B,
             struct ggml_tensor  * C,
             struct ggml_tensor  * sq);
+
+    // Mamba-2 layout (Nemotron-H etc.): x is {head_dim, n_head, n_seq_tokens, n_seqs}, sq is
+    // the {n_seqs} int32 ids tensor and K (>= 1) selects the number of state snapshots kept in
+    // the result. Separate entry point so the legacy signature above stays untouched.
+    GGML_API struct ggml_tensor * ggml_ssm_scan_m2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * B,
+            struct ggml_tensor  * C,
+            struct ggml_tensor  * sq,
+            int64_t               K,
+            struct ggml_tensor  * state_out); // optional: write the final state there (K must be 1)
+
+    // Mamba-2 layout of the 1-D convolution: s is conv_x {d_conv - 1 + n_t, ch, n_s} and c is
+    // the conv weight {d_conv, ch}; returns the convolution of the sliding window. This builds
+    // the same op as the legacy call with x == NULL (the encoding upstream llama.cpp uses for
+    // the Mamba-2 form, and the one the CUDA backend dispatches on); the named entry point just
+    // keeps callers from passing a null argument.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_m2(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * s,
+            struct ggml_tensor  * c);
 
     // partition into non-overlapping windows with padding if needed
     // example:

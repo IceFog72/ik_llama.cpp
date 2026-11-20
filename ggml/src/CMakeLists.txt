@@ -403,7 +403,7 @@ if (GGML_CUDA)
                 set(GGML_EXTRA_INCLUDES ${GGML_EXTRA_INCLUDES} ${NCCL_INCLUDE_DIRS})
                 add_compile_definitions(GGML_USE_NCCL)
             else()
-                message("==================== NCCL NOT found -> building wihout NCCL support")
+                message("==================== NCCL NOT found -> building without NCCL support")
             endif()
         endif()
 
@@ -716,7 +716,7 @@ if (GGML_VULKAN)
         list(APPEND GGML_CDEF_PUBLIC GGML_USE_VULKAN)
 
         # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
-        # Posssibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
+        # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
         if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
             add_compile_definitions(_ITERATOR_DEBUG_LEVEL=0)
         endif()
@@ -1161,6 +1161,8 @@ if (CMAKE_OSX_ARCHITECTURES      STREQUAL "arm64" OR
                 list(APPEND ARCH_FLAGS -march=native)
             endif()
             list(APPEND ARCH_FLAGS -flax-vector-conversions)
+        elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND GGML_NATIVE AND NOT APPLE)
+            list(APPEND ARCH_FLAGS -mcpu=native)
         endif()
     endif()
 elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LWR MATCHES "^(x86_64|i686|amd64|x64|win32)$" OR

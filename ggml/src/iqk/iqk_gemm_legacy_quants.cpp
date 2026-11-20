@@ -2370,7 +2370,7 @@ static void mul_mat_iqX_ks_r16_q8_K(int n, const void * vx, size_t bx, const Dat
 }
 
 struct DequantIQ4KS {
-    using type = block_iq4_ks;
+    using type = block_iq4_ks_r16;
     const __m512i m4 = _mm512_set1_epi8(0xf);
     const __m512i table = load_iq4nl_values_512();
     inline void prepare_block(const type & b, __m512i & iscales, __m512i & imins, __m512i * qx) {
@@ -4521,7 +4521,7 @@ struct DequantizerQ51 final : public BaseLegacyDequantizer<block_q5_1> {
         q[1] = vreinterpretq_s8_u8(vorrq_u8(vreinterpretq_u8_s8(q[1]), vandq_u8(mh, hbits.to_bytes(qh+2))));
     }
     inline void prepare1(int i) {
-        bits.prepare1(x[i].qs, bits.b);
+        prepare1(i, bits.b);
     }
 
     inline float16x8_t new_block(int i) {
@@ -4640,9 +4640,9 @@ inline void mul_mat_qX_Y_q8_Y_1(int n, Dequantizer& deq1, Dequantizer& deq2, Q8&
             q8.process_scales(i, deq1, sc16, acc);
             sum_4(i, deq1, q8, sc16, acc);
         }
-        //for (int i = 4*(nb/4); i < nb; ++i) {
-        //    q8.process_1_block(i, deq1, acc);
-        //}
+        for (int i = 4*(nb/4); i < nb; ++i) {
+            q8.process_1_block(i, deq1, acc);
+        }
 
         info.store(ix, 0, vaddvq_f32(vaddq_f32(acc[0], acc[1])));
     }
@@ -5494,12 +5494,12 @@ static void mul_mat_q2_0_q8_0_x4(int n, const void * vx, size_t bx, const DataIn
             for (int k = 0; k < 4; ++k) qx[k] = vsubq_s8(vandq_u8(vshlq_u8(qx[k], shifts), mask), one);
             for (int iy = 0; iy < nrc_y; ++iy) {
                 auto yb = (const block_q8_0 *)(q8.y[iy] + nb/2);
-                auto y0 = vld1q_s8_x2(yb[2*ib+0].qs);
+                auto y0 = vld1q_s8_x2(yb[0].qs);
                 auto p0 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), qx[0], y0.val[0]), qx[1], y0.val[1]);
-                auto y1 = vld1q_s8_x2(yb[2*ib+1].qs);
+                auto y1 = vld1q_s8_x2(yb[1].qs);
                 auto p1 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), qx[2], y1.val[0]), qx[3], y1.val[1]);
-                auto d1 = dx*GGML_FP16_TO_FP32(yb[2*ib+0].d);
-                auto d2 = dx*GGML_FP16_TO_FP32(yb[2*ib+1].d);
+                auto d1 = dx*GGML_FP16_TO_FP32(yb[0].d);
+                auto d2 = dx*GGML_FP16_TO_FP32(yb[1].d);
                 auto p01 = vpaddq_s32(p0, p1); // 0, 0, 1, 1
                 acc[iy]  = vfmaq_f32(acc[iy], float32x4_t{d1, d1, d2, d2}, vcvtq_f32_s32(p01));
             }

@@ -55,6 +55,10 @@ GGML_API GGML_CALL size_t ggml_backend_cuda_trim_compute(ggml_backend_t backend)
 GGML_API GGML_CALL void ggml_backend_cuda_set_moe_offload_tokens(ggml_backend_t backend, int tokens);
 
 GGML_API GGML_CALL size_t ggml_cuda_quantize(int device, enum ggml_type type, const float * src, void * dst, int64_t nrows, int64_t n_per_row, int64_t nslice, const float * imatrix);
+
+GGML_CALL bool ggml_backend_cuda_copy_all_inputs_to_cpu(ggml_backend_sched_t sched, ggml_backend_t backend, int n_inputs,
+        struct ggml_tensor ** inputs, struct ggml_tensor ** input_copies, const struct ggml_tensor * node0, bool has_lru_cache);
+
 #ifdef  __cplusplus
 }
 #endif

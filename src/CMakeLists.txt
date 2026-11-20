@@ -92,6 +92,7 @@ add_library(llama
             graphs/build_seedoss.cpp
             graphs/build_laguna.cpp
             graphs/build_k2horizon.cpp
+            graphs/build_step5.cpp
             graphs/build_step35.cpp
             graphs/build_qwen.cpp
             graphs/build_qwen2.cpp
@@ -117,6 +118,7 @@ add_library(llama
             graphs/build_gemma4.cpp
             graphs/build_dflash.cpp
             graphs/build_mamba.cpp
+            graphs/build_nemotron_h.cpp
             graphs/build_command_r.cpp
             graphs/build_olmo.cpp
             graphs/build_openelm.cpp
